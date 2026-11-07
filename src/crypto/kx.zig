@@ -1,7 +1,10 @@
 //! Key exchange for the TLS 1.3 key_share extension: X25519, ECDH on P-256
 //! and P-384, ML-KEM-768, and the X25519MLKEM768 hybrid.
 //!
-//! Each key pair owns its secret and wipes it in `deinit`.
+//! Each key pair owns its secret and wipes it in `deinit`. Shared secrets
+//! are returned by value: they go straight into the key schedule, whose
+//! inputs the handshake wipes when it is done, and the stack copies made on
+//! the way are accepted.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -114,12 +117,13 @@ pub const Ecdh = struct {
 
 pub const MlKem768 = struct {
     pub const public_key_length = 1184;
-    pub const secret_key_length = 2400;
     pub const ciphertext_length = 1088;
     pub const shared_secret_length = 32;
 
+    /// The key pair, kept in AWS-LC's object: the 2400-byte decapsulation
+    /// key stays off the stack and is not re-imported for every use.
+    pkey: *c.EVP_PKEY,
     public_key: [public_key_length]u8,
-    secret_key: [secret_key_length]u8,
 
     pub fn generate() err.Error!MlKem768 {
         const ctx = c.EVP_PKEY_CTX_new_id(c.EVP_PKEY_KEM, null) orelse return err.fail();
@@ -128,18 +132,17 @@ pub const MlKem768 = struct {
         if (c.EVP_PKEY_keygen_init(ctx) != 1) return err.fail();
         var pkey: ?*c.EVP_PKEY = null;
         if (c.EVP_PKEY_keygen(ctx, &pkey) != 1) return err.fail();
-        defer c.EVP_PKEY_free(pkey);
+        errdefer c.EVP_PKEY_free(pkey);
 
-        var kp: MlKem768 = undefined;
+        var kp: MlKem768 = .{ .pkey = pkey.?, .public_key = undefined };
         var len: usize = public_key_length;
         if (c.EVP_PKEY_get_raw_public_key(pkey, &kp.public_key, &len) != 1 or len != public_key_length) return err.fail();
-        len = secret_key_length;
-        if (c.EVP_PKEY_get_raw_private_key(pkey, &kp.secret_key, &len) != 1 or len != secret_key_length) return err.fail();
         return kp;
     }
 
+    /// Frees the key pair; AWS-LC wipes the secret.
     pub fn deinit(self: *MlKem768) void {
-        std.crypto.secureZero(u8, &self.secret_key);
+        c.EVP_PKEY_free(self.pkey);
         self.* = undefined;
     }
 
@@ -149,6 +152,7 @@ pub const MlKem768 = struct {
     };
 
     /// The sender's side: a fresh shared secret, encapsulated to `public_key`.
+    /// Fails on an encapsulation key that does not pass FIPS 203's check.
     pub fn encapsulate(public_key: *const [public_key_length]u8) error{ InvalidPublicKey, CryptoFailed }!Encapsulation {
         const pkey = c.EVP_PKEY_kem_new_raw_public_key(c.NID_MLKEM768, public_key, public_key_length) orelse {
             _ = err.take();
@@ -172,9 +176,7 @@ pub const MlKem768 = struct {
     /// Never fails on a malformed ciphertext: ML-KEM then yields an
     /// unrelated secret (implicit rejection), and the handshake fails later.
     pub fn decapsulate(self: *const MlKem768, ciphertext: *const [ciphertext_length]u8) err.Error![shared_secret_length]u8 {
-        const pkey = c.EVP_PKEY_kem_new_raw_secret_key(c.NID_MLKEM768, &self.secret_key, secret_key_length) orelse return err.fail();
-        defer c.EVP_PKEY_free(pkey);
-        const ctx = c.EVP_PKEY_CTX_new(pkey, null) orelse return err.fail();
+        const ctx = c.EVP_PKEY_CTX_new(self.pkey, null) orelse return err.fail();
         defer c.EVP_PKEY_CTX_free(ctx);
 
         var ss: [shared_secret_length]u8 = undefined;

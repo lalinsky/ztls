@@ -8,23 +8,27 @@ const c = @import("c");
 
 pub const Error = error{CryptoFailed};
 
-/// The last error AWS-LC queued on this thread, or 0 if none. Clears the
-/// queue.
+/// The first error AWS-LC queued on this thread (the root cause; later
+/// entries wrap it), or 0 if none. Clears the queue.
 pub fn take() u32 {
-    const code = c.ERR_peek_last_error();
+    const code = c.ERR_peek_error();
     c.ERR_clear_error();
     return code;
 }
 
-/// Clears the queue and returns the generic failure. Used where the cause
-/// is a bug or an exhausted resource rather than something the caller can
-/// act on.
+/// Logs every queued error at debug level, clears the queue and returns the
+/// generic failure. Used where the cause is a bug or an exhausted resource
+/// rather than something the caller can act on.
 pub fn fail() Error {
-    const code = take();
-    if (std.log.logEnabled(.debug, .ztls) and code != 0) {
+    if (std.log.logEnabled(.debug, .ztls)) {
         var buf: [256]u8 = undefined;
-        std.log.scoped(.ztls).debug("AWS-LC: {s}", .{describe(code, &buf)});
+        while (true) {
+            const code = c.ERR_get_error();
+            if (code == 0) break;
+            std.log.scoped(.ztls).debug("AWS-LC: {s}", .{describe(code, &buf)});
+        }
     }
+    c.ERR_clear_error();
     return error.CryptoFailed;
 }
 

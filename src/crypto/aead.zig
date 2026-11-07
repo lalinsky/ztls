@@ -11,6 +11,9 @@ const assert = std.debug.assert;
 const c = @import("c");
 const err = @import("err.zig");
 
+/// Only AEADs whose AWS-LC state is plain inline data (an AES key schedule
+/// and GHASH key, or a ChaCha key) belong here: `Context` relies on that to
+/// be movable and to wipe its key itself. AES-GCM-SIV, for one, is not.
 pub const Algorithm = enum {
     aes_128_gcm,
     aes_256_gcm,
@@ -42,7 +45,8 @@ pub const Nonce = [nonce_length]u8;
 pub const Tag = [tag_length]u8;
 
 /// A keyed context. Plain data with no pointers into itself, so it may be
-/// moved; `deinit` wipes the key schedule.
+/// moved or copied; each copy then holds its own key material and needs its
+/// own `deinit`, which wipes it (AWS-LC's cleanup does not for these AEADs).
 pub const Context = struct {
     ctx: c.EVP_AEAD_CTX,
 
@@ -55,6 +59,7 @@ pub const Context = struct {
 
     pub fn deinit(self: *Context) void {
         c.EVP_AEAD_CTX_cleanup(&self.ctx);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.ctx));
         self.* = undefined;
     }
 
@@ -63,6 +68,7 @@ pub const Context = struct {
     pub fn seal(self: *const Context, nonce: *const Nonce, ad: []const u8, plaintext: []const u8, out: []u8, tag: *Tag) void {
         assert(out.len == plaintext.len);
         assert(samePlaceOrDisjoint(plaintext, out));
+        assert(disjoint(tag, plaintext) and disjoint(tag, out));
         var tag_len: usize = 0;
         const ok = c.EVP_AEAD_CTX_seal_scatter(&self.ctx, out.ptr, tag, &tag_len, tag_length, nonce, nonce_length, plaintext.ptr, plaintext.len, null, 0, ad.ptr, ad.len);
         // Fails only on misuse (nonce or length limits), which the record
@@ -76,6 +82,7 @@ pub const Context = struct {
     pub fn open(self: *const Context, nonce: *const Nonce, ad: []const u8, ciphertext: []const u8, tag: *const Tag, out: []u8) error{AuthenticationFailed}!void {
         assert(out.len == ciphertext.len);
         assert(samePlaceOrDisjoint(ciphertext, out));
+        assert(disjoint(tag, ciphertext) and disjoint(tag, out));
         if (c.EVP_AEAD_CTX_open_gather(&self.ctx, out.ptr, nonce, nonce_length, ciphertext.ptr, ciphertext.len, tag, tag_length, ad.ptr, ad.len) != 1) {
             _ = err.take();
             return error.AuthenticationFailed;
@@ -84,7 +91,10 @@ pub const Context = struct {
 };
 
 fn samePlaceOrDisjoint(a: []const u8, b: []const u8) bool {
-    if (a.ptr == b.ptr) return true;
+    return a.ptr == b.ptr or disjoint(a, b);
+}
+
+fn disjoint(a: []const u8, b: []const u8) bool {
     const a_start = @intFromPtr(a.ptr);
     const b_start = @intFromPtr(b.ptr);
     return a_start + a.len <= b_start or b_start + b.len <= a_start;
