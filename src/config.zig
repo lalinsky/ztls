@@ -79,8 +79,11 @@ pub const CertKeyPair = struct {
 };
 
 /// A server's own choice of certificate. Called during the handshake on
-/// the connection's task, so it must not block or yield; the result must
-/// outlive the handshake.
+/// the connection's task, so it must not block or yield. The pair it
+/// returns must outlive the handshake, and the slices in `Hello` are
+/// valid only during the call. Returning a pair whose key the client
+/// cannot verify fails the handshake (handshake_failure) rather than
+/// falling back to `certificates`; returning null falls back.
 pub const SelectCertificate = struct {
     context: ?*anyopaque = null,
     callback: *const fn (context: ?*anyopaque, hello: Hello) ?*const CertKeyPair,

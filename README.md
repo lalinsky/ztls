@@ -28,6 +28,7 @@ CMake, Perl or Go.
 - KeyUpdate in both directions; close_notify; precise errors.
 
 Not yet: session resumption, 0-RTT, post-handshake client authentication.
+A peer that only speaks TLS 1.2 gets a protocol_version alert.
 
 ## Using it
 
@@ -105,6 +106,12 @@ buffer of its own: what is written goes into the next record's plaintext
 inside the transport buffer and is sealed there.
 
 The `Connection` must not move once readers or writers exist.
+
+The handshake keeps its working buffers on the stack of the task that runs
+it (its own are around 16 KiB; AWS-LC's ML-KEM adds its own on top) and
+reassembles the peer's messages through the `allocator` in the options, up
+to `max_handshake_message_len` (64 KiB by default) for the certificate
+chain. Budget 64 KiB of stack for a task that runs handshakes.
 
 ### Errors
 

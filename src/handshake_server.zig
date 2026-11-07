@@ -92,6 +92,10 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     var session_id_buf: [32]u8 = undefined;
     @memcpy(session_id_buf[0..hello.session_id.len], hello.session_id);
     const session_id = session_id_buf[0..hello.session_id.len];
+    // Kept across a retry to check the second hello against.
+    var server_name_buf: [255]u8 = undefined;
+    const server_name_len = if (hello.server_name) |name| name.len else 0;
+    if (hello.server_name) |name| @memcpy(server_name_buf[0..name.len], name);
 
     var retried = false;
     if (hello.shareFor(choices.group) == null) {
@@ -109,6 +113,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
         // The second hello may differ only in its key share (§4.1.2).
         if (second.suite != choices.suite or second.group != choices.group or second.scheme != choices.scheme) return error.TlsIllegalParameter;
         if (!std.mem.eql(u8, hello.session_id, session_id) or hello.has_cookie) return error.TlsIllegalParameter;
+        if (!std.mem.eql(u8, hello.server_name orelse "", server_name_buf[0..server_name_len])) return error.TlsIllegalParameter;
         if (hello.key_shares_len != 1 or hello.shareFor(choices.group) == null) return error.TlsIllegalParameter;
         choices = second;
         h.hashMessage(msg);
@@ -300,11 +305,17 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                 var list = try data.vector(u16);
                 while (!list.eof()) {
                     const name_type = try list.decode(u8);
-                    const name = try list.vectorBytes(u16);
-                    if (name_type == 0) {
-                        if (name.len == 0 or hello.server_name != null) return error.TlsIllegalParameter;
-                        hello.server_name = name;
-                    }
+                    var name = try list.vectorBytes(u16);
+                    if (name_type != 0) continue;
+                    if (hello.server_name != null) return error.TlsIllegalParameter;
+                    // A host name only (RFC 6066 §3): no IP literal, no NUL,
+                    // not empty, at most 255 bytes; one trailing dot is
+                    // tolerated, as some clients send a FQDN.
+                    if (name.len > 0 and name[name.len - 1] == '.') name = name[0 .. name.len - 1];
+                    if (name.len == 0 or name.len > 255) return error.TlsIllegalParameter;
+                    if (std.mem.indexOfScalar(u8, name, 0) != null) return error.TlsIllegalParameter;
+                    if (std.Io.net.IpAddress.parse(name, 0)) |_| return error.TlsIllegalParameter else |_| {}
+                    hello.server_name = name;
                 }
             },
             .application_layer_protocol_negotiation => {
@@ -426,6 +437,41 @@ test "parsing the example ClientHello" {
     try testing.expectEqual(null, hello.alpn);
     try testing.expect(hello.schemes_len.? > 0);
     try testing.expect(!hello.has_cookie);
+}
+
+test "server names: a trailing dot is dropped, IP literals and NULs are refused" {
+    const Build = struct {
+        fn hello(buf: []u8, name: []const u8) ![]const u8 {
+            var w = codec.Writer.init(buf);
+            try w.enumValue(proto.Version.tls_1_2);
+            const zeros: [32]u8 = @splat(0);
+            try w.slice(&zeros);
+            try w.vector(u8, &.{});
+            try w.vector(u16, &.{ 0x13, 0x01 });
+            try w.vector(u8, &.{0});
+            const ext = try w.beginLength(u16);
+            try w.enumValue(proto.Extension.supported_versions);
+            try w.vector(u16, &.{ 2, 3, 4 });
+            try w.enumValue(proto.Extension.supported_groups);
+            try w.vector(u16, &.{ 0, 2, 0, 0x1d });
+            try w.enumValue(proto.Extension.server_name);
+            const sni = try w.beginLength(u16);
+            const list = try w.beginLength(u16);
+            try w.byte(0);
+            try w.vector(u16, name);
+            try list.end(&w);
+            try sni.end(&w);
+            try ext.end(&w);
+            return w.written();
+        }
+    };
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings("example.com", (try parseClientHello(try Build.hello(&buf, "example.com."))).server_name.?);
+    try testing.expectEqualStrings("example.com", (try parseClientHello(try Build.hello(&buf, "example.com"))).server_name.?);
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try Build.hello(&buf, "10.0.0.1")));
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try Build.hello(&buf, "::1")));
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try Build.hello(&buf, "exa\x00mple.com")));
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try Build.hello(&buf, ".")));
 }
 
 test "ALPN selection follows the server's order and refuses an offer with nothing in common" {
