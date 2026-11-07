@@ -78,12 +78,12 @@ const Choices = struct {
 };
 
 fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
-    const auth = opt.auth orelse return error.TlsInternalError;
     if (opt.cipher_suites.len == 0 or opt.named_groups.len == 0) return error.TlsInternalError;
 
     var msg = try h.nextMessage();
     try h.expect(msg, .client_hello);
     var hello = try parseClientHello(msg.body);
+    const auth = try selectCertificate(&hello, opt);
     var choices = try choose(&hello, opt, auth);
     h.setSuite(choices.suite);
     h.hashMessage(msg);
@@ -144,6 +144,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
         var maybe_peer = try h.parseCertificate(msg.body, "");
         if (maybe_peer) |*peer| {
             defer peer.deinit();
+            h.conn.peer_key_type = peer.public_key.key_type;
             try h.verifyChain(peer, client_auth.root_ca, .client, null, opt.now.toSeconds());
             h.hashMessage(msg);
             msg = try h.nextMessage();
@@ -164,6 +165,29 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     h.conn.read.in_handshake = false;
     h.conn.alpn_protocol = choices.alpn;
     h.conn.strict_close_notify = opt.strict_close_notify;
+}
+
+/// The certificate to present: the application's choice, else the first
+/// of `certificates` for the client's server name that it can verify,
+/// else `auth`.
+fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const config.CertKeyPair {
+    const schemes = hello.schemes[0 .. hello.schemes_len orelse 0];
+    if (opt.select_certificate) |select| {
+        const info: config.SelectCertificate.Hello = .{ .server_name = hello.server_name, .accepts = acceptsKey, .schemes = schemes };
+        if (select.callback(select.context, info)) |pair| return pair;
+    }
+    for (opt.certificates) |pair| {
+        if (handshake.selectScheme(pair.key.key_type, schemes) == null) continue;
+        if (hello.server_name) |name| {
+            if (!pair.leaf.matchesHost(name)) continue;
+        }
+        return pair;
+    }
+    return opt.auth orelse error.TlsUnrecognizedName;
+}
+
+fn acceptsKey(info: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
+    return handshake.selectScheme(key_type, info.schemes) != null;
 }
 
 /// Picks the suite, group, signature scheme and ALPN protocol, or says

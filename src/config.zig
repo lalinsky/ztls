@@ -78,6 +78,27 @@ pub const CertKeyPair = struct {
     }
 };
 
+/// A server's own choice of certificate. Called during the handshake on
+/// the connection's task, so it must not block or yield; the result must
+/// outlive the handshake.
+pub const SelectCertificate = struct {
+    context: ?*anyopaque = null,
+    callback: *const fn (context: ?*anyopaque, hello: Hello) ?*const CertKeyPair,
+
+    /// What the ClientHello says that bears on the choice.
+    pub const Hello = struct {
+        /// The server_name extension's host name, if any.
+        server_name: ?[]const u8,
+        /// Whether the client can verify signatures by a key of this type.
+        accepts: *const fn (hello: *const Hello, key_type: crypto.sig.KeyType) bool,
+        schemes: []const proto.SignatureScheme,
+
+        pub fn acceptsKey(hello: *const Hello, key_type: crypto.sig.KeyType) bool {
+            return hello.accepts(hello, key_type);
+        }
+    };
+};
+
 /// Whether a server asks for a client certificate, and what it accepts.
 pub const ClientAuth = struct {
     /// What a client certificate must chain to.
@@ -134,9 +155,18 @@ pub const Client = struct {
 pub const Server = struct {
     /// For the handshake's working memory; nothing is kept afterwards.
     allocator: Allocator,
-    /// What the server presents. Null for a server with no certificate,
+    /// What the server presents when nothing in `certificates` or from
+    /// `select_certificate` fits. Null for a server with no certificate,
     /// which no client accepts in v1.
     auth: ?*const CertKeyPair,
+    /// Further certificates, picked by the server name the client asks
+    /// for and by the signature algorithms it accepts: the first whose
+    /// leaf is for that name and whose key the client can verify. With
+    /// no server name, the first whose key the client can verify.
+    certificates: []const *const CertKeyPair = &.{},
+    /// Picks the certificate for a connection, before `certificates` and
+    /// `auth` are tried. Null leaves the choice to them.
+    select_certificate: ?SelectCertificate = null,
     client_auth: ?ClientAuth = null,
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
     named_groups: []const proto.NamedGroup = &default_server_named_groups,

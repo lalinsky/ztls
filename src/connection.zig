@@ -72,6 +72,8 @@ pub const Connection = struct {
 
     /// The protocol agreed through ALPN, pointing into the configuration.
     alpn_protocol: ?[]const u8 = null,
+    /// The type of key in the peer's certificate, when it sent one.
+    peer_key_type: ?crypto.sig.KeyType = null,
     /// Treat a transport that ends between records without close_notify as
     /// truncated rather than as a clean end.
     strict_close_notify: bool = false,

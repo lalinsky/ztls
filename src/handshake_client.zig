@@ -137,6 +137,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     // A server's chain is never empty (§4.4.2).
     var peer = (try h.parseCertificate(msg.body, "")) orelse return error.TlsDecodeError;
     defer peer.deinit();
+    h.conn.peer_key_type = peer.public_key.key_type;
     if (!opt.insecure_skip_verify) {
         try h.verifyChain(&peer, opt.root_ca.?, .server, opt.host, opt.now.toSeconds());
     }

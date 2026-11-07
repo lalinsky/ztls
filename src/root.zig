@@ -376,6 +376,74 @@ test "no common ALPN protocol, suite or group ends the handshake" {
     }
 }
 
+test "the server picks its certificate by server name" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+
+    // The application's own choice: the RSA pair for one name only.
+    const Picker = struct {
+        rsa: *const CertKeyPair,
+        calls: usize = 0,
+
+        fn pick(context: ?*anyopaque, hello: config.SelectCertificate.Hello) ?*const CertKeyPair {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            const name = hello.server_name orelse return null;
+            if (std.mem.eql(u8, name, "rsa.example.test") and hello.acceptsKey(self.rsa.key.key_type)) return self.rsa;
+            return null;
+        }
+    };
+    var picker: Picker = .{ .rsa = &pki.server_rsa };
+
+    // Every test certificate is for localhost and *.example.test, so the
+    // key type tells them apart.
+    const Case = struct { host: []const u8, key_type: crypto.sig.KeyType, skip_verify: bool = false };
+    const cases = [_]Case{
+        .{ .host = "rsa.example.test", .key_type = .{ .rsa = 2048 } }, // the callback
+        .{ .host = "www.example.test", .key_type = .{ .ecdsa = .p384 } }, // first of `certificates` for the name
+        .{ .host = "nomatch.invalid", .key_type = .ed25519, .skip_verify = true }, // nothing fits: `auth`
+    };
+    for (cases) |case| {
+        var run: Run = .{ .loopback = undefined };
+        try run.start(io, .{
+            .allocator = testing.allocator,
+            .auth = &pki.server_ed25519,
+            .certificates = &.{ &pki.server_chain, &pki.server_ec },
+            .select_certificate = .{ .context = &picker, .callback = Picker.pick },
+            .now = valid_now,
+        });
+        var t: Transport = .{ .io = io, .stream = try run.loopback.connect() };
+        defer t.deinit();
+        t.setUp();
+        var conn = try client(&t.input.interface, &t.output.interface, .{
+            .allocator = testing.allocator,
+            .host = case.host,
+            .root_ca = &pki.ca,
+            .insecure_skip_verify = case.skip_verify,
+            .now = valid_now,
+        });
+        defer conn.deinit();
+        try testing.expectEqual(case.key_type, conn.peer_key_type.?);
+        try conn.close();
+        const outcome = try run.finish(io);
+        try outcome.handshake;
+    }
+    try testing.expectEqual(cases.len, picker.calls);
+
+    // With no fallback, an unknown name is refused.
+    var run: Run = .{ .loopback = undefined };
+    try run.start(io, .{ .allocator = testing.allocator, .auth = null, .certificates = &.{&pki.server_ec}, .now = valid_now });
+    try testing.expectError(error.TlsAlertUnrecognizedName, clientOnce(&run.loopback, .{
+        .allocator = testing.allocator,
+        .host = "nomatch.invalid",
+        .root_ca = &pki.ca,
+        .now = valid_now,
+    }));
+    const outcome = try run.finish(io);
+    try testing.expectError(error.TlsUnrecognizedName, outcome.handshake);
+}
+
 test "a peer that hangs up during the handshake" {
     const io = testing.io;
     var pki = try Pki.init();

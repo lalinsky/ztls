@@ -49,6 +49,16 @@ pub const Certificate = struct {
         return sig.PublicKey.fromPkey(pkey);
     }
 
+    /// Whether the certificate is for `host`: a DNS subject alternative
+    /// name matches it (wildcards included); the subject common name is
+    /// never consulted.
+    pub fn matchesHost(self: *const Certificate, host: []const u8) bool {
+        const r = c.X509_check_host(self.x509, host.ptr, host.len, c.X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, null);
+        if (r == 1) return true;
+        _ = err.take();
+        return false;
+    }
+
     /// Whether `key` is the private half of the subject's key.
     pub fn matchesPrivateKey(self: *const Certificate, key: *const sig.PrivateKey) bool {
         if (c.X509_check_private_key(self.x509, key.pkey) == 1) return true;
@@ -310,6 +320,16 @@ test "public key and private key matching" {
     const signature = try key.sign(.ecdsa_p256_sha256, "transcript", &sig_buf);
     try public.verify(.ecdsa_p256_sha256, "transcript", signature);
     try testing.expectError(error.SignatureInvalid, public.verify(.ecdsa_p256_sha256, "other", signature));
+}
+
+test "matching a certificate's names" {
+    var cert = try Certificate.parsePem(testing.allocator, pki.server_ec);
+    defer cert.deinit();
+    try testing.expect(cert.matchesHost("localhost"));
+    try testing.expect(cert.matchesHost("www.example.test"));
+    try testing.expect(!cert.matchesHost("example.test"));
+    try testing.expect(!cert.matchesHost("localhost.example.com"));
+    try testing.expect(!cert.matchesHost(""));
 }
 
 test "malformed certificates" {
