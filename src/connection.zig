@@ -26,8 +26,11 @@ pub const output_buffer_len = cipher.max_sealed_record_len + key_update_record_l
 
 const key_update_msg_len = 4 + 1;
 const key_update_record_len = cipher.Keys.sealedLen(key_update_msg_len);
-/// Sealing a record writes past its plaintext: the content type and tag,
-/// and when a KeyUpdate is moved in ahead of it, that record's length too.
+/// Sealing the first `head` bytes of a window writes past them: the
+/// content type and tag land at window[head..head + 17], and when a
+/// KeyUpdate is moved in ahead the plaintext shifts up by 27 first, so the
+/// record ends at window[head + 44]. Exactly that much of what follows is
+/// saved aside by `rebaseInPlace`.
 const seal_spill = cipher.seal_overhead + key_update_record_len;
 /// Records carrying no application data (empty ones, post-handshake
 /// messages) a peer may send in a row before it is cut off.
@@ -89,7 +92,8 @@ pub const Connection = struct {
         keys: ?cipher.Keys = null,
     };
 
-    /// What the two tasks share.
+    /// What the two tasks share. Each state is stored by its own task
+    /// only; the other task just loads it.
     pub const Shared = struct {
         read_state: std.atomic.Value(State) = .init(.open),
         write_state: std.atomic.Value(State) = .init(.open),
@@ -202,11 +206,11 @@ pub const Connection = struct {
     }
 
     /// The transport ran out between records (clean, unless strict) or
-    /// inside one (truncated). A clean end closes both directions: there
-    /// is nowhere left to send anything.
+    /// inside one (truncated). A clean end is a half-close like
+    /// close_notify: the peer may still be reading, so the write direction
+    /// goes on until the transport says otherwise.
     fn inputEnded(c: *Connection) ReadRecordError {
         if (c.input.bufferedLen() != 0 or c.strict_close_notify) return error.TlsConnectionTruncated;
-        _ = c.shared.write_state.cmpxchgStrong(.open, .closed, .monotonic, .monotonic);
         return error.EndOfStream;
     }
 
@@ -237,10 +241,11 @@ pub const Connection = struct {
                     c.shared.read_state.store(.closed, .release);
                     return error.EndOfStream;
                 },
-                error.ReadFailed => {
-                    c.failRead(error.ReadFailed);
-                    return error.ReadFailed;
-                },
+                // The transport's failure, often a cancellation or a
+                // timeout, and not the connection's: nothing was consumed,
+                // so a partial record stays buffered and the read may be
+                // retried.
+                error.ReadFailed => return error.ReadFailed,
                 else => |e| {
                     c.failRead(e);
                     return e;
@@ -303,7 +308,9 @@ pub const Connection = struct {
 
     /// Handshake messages after the handshake: KeyUpdate, and
     /// NewSessionTicket, which v1 drops. Each must be whole within its
-    /// record, and KeyUpdate must be the record's last message (§4.6.3).
+    /// record (every known stack sends them so; a ticket split across
+    /// records would be an interop failure rather than a violation), and
+    /// KeyUpdate must be the record's last message (§4.6.3).
     fn handlePostHandshake(c: *Connection, payload: []const u8) Error!void {
         var d = codec.Decoder.init(payload);
         while (!d.eof()) {
@@ -330,7 +337,8 @@ pub const Connection = struct {
         conn: *Connection,
         interface: Io.Reader,
         /// Why the last read failed. `ReadFailed` means the transport
-        /// reader failed, and its own error says how.
+        /// reader failed, and its own error says how; that one does not
+        /// end the connection, and the read may be retried.
         err: ?Error = null,
 
         fn init(c: *Connection, buffer: []u8) Reader {
@@ -463,7 +471,9 @@ pub const Connection = struct {
     /// Whether a KeyUpdate has to go out before the next record, claiming
     /// the peer's request if there is one. The claim happens before the
     /// update is sent, so a request arriving in between stays set and is
-    /// answered before the record after this one.
+    /// answered before the record after this one. A request is answered
+    /// only when something is written, which §4.6.3 allows: a connection
+    /// that never writes again never answers, and the peer is not blocked.
     fn claimKeyUpdate(c: *Connection) bool {
         const requested = c.shared.key_update_requested.load(.monotonic) and
             c.shared.key_update_requested.swap(false, .monotonic);
@@ -489,8 +499,10 @@ pub const Connection = struct {
     }
 
     /// The write side's state, with the read side's failure delivered
-    /// first: its alert goes out and this direction fails too.
+    /// first: its alert goes out and this direction fails too. Only after
+    /// the handshake; the handshake sends its own alerts.
     fn checkWritable(c: *Connection) Error!void {
+        assert(c.write.keys != null);
         switch (c.shared.write_state.load(.monotonic)) {
             .open => {},
             .closed => return error.TlsConnectionFailed,
@@ -500,6 +512,8 @@ pub const Connection = struct {
             const read_error: Error = @errorCast(@errorFromInt(c.shared.read_error.load(.monotonic)));
             const alert = c.shared.pending_alert.swap(0, .monotonic);
             if (alert != 0) {
+                // This may land on an in-place writer's window; nothing
+                // from it is sent anyway, the direction fails here.
                 c.writeRecord(.alert, &@as(proto.Alert, @enumFromInt(alert)).encode()) catch {};
                 c.output.flush() catch {};
             }
@@ -646,7 +660,8 @@ pub const Connection = struct {
             if (w.len == 0) {
                 c.flushWrite() catch |err| return self.fail(err);
                 w = c.payloadWindow();
-                assert(w.len > 0);
+                // Flushed, `output` has room for a whole record.
+                assert(w.len == cipher.max_plaintext_len);
             }
             return w;
         }
@@ -687,10 +702,22 @@ pub const Connection = struct {
         /// window.
         fn rebaseInPlace(w: *Io.Writer, preserve: usize, minimum_len: usize) Io.Writer.Error!void {
             const self: *Writer = @fieldParentPtr("interface", w);
+            const c = self.conn;
             while (w.buffer.len - w.end < minimum_len) {
                 const keep = @min(preserve, w.end);
                 const head = w.end - keep;
-                if (head == 0) return self.fail(error.TlsInternalError);
+                if (head == 0) {
+                    // Nothing to seal: the window is short because `output`
+                    // holds earlier records. Send those and move what is
+                    // buffered to the front of the full window that frees.
+                    const tail = w.buffer[0..w.end];
+                    c.flushWrite() catch |err| return self.fail(err);
+                    const fresh = c.payloadWindow();
+                    if (fresh.len - w.end < minimum_len) return self.fail(error.TlsInternalError);
+                    @memmove(fresh[0..tail.len], tail);
+                    w.buffer = fresh;
+                    continue;
+                }
                 const tail = w.buffer[head..w.end];
                 var spill: [seal_spill]u8 = undefined;
                 const saved = @min(keep, spill.len);
@@ -734,8 +761,10 @@ pub const Connection = struct {
     /// A cleartext writer whose buffer is the next record's plaintext in
     /// `output`, so what is written is copied once, to where it is sealed.
     /// While it is in use nothing else may write to `output`, except
-    /// `close` after its last flush. Its buffer moves with each record and
-    /// must not be replaced. One per connection, for the writing task.
+    /// `close` after its last flush, and the transport writer must leave
+    /// `output`'s unused capacity alone while draining (std's socket
+    /// writers do). Its buffer moves with each record and must not be
+    /// replaced. One per connection, for the writing task.
     pub fn inPlaceWriter(c: *Connection) Writer {
         assert(c.write.keys != null);
         return Writer.initInPlace(c);
@@ -1093,9 +1122,9 @@ test "transport ending without close_notify: clean at a record boundary, truncat
                 try testing.expectEqual(error.TlsConnectionTruncated, r.err.?);
             } else {
                 try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
-                // Nowhere to send close_notify: close does nothing.
-                try testing.expectEqual(State.closed, end.conn.shared.write_state.load(.monotonic));
-                try end.conn.close();
+                // A half-close: writing goes on until the transport objects.
+                try testing.expectEqual(State.open, end.conn.shared.write_state.load(.monotonic));
+                end.conn.close() catch |err| try testing.expectEqual(error.WriteFailed, err);
             }
             try peer.await(io);
         }

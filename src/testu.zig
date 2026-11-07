@@ -50,9 +50,24 @@ pub const Loopback = struct {
     server: std.Io.net.Server,
 
     pub fn init(io: std.Io) !Loopback {
+        if (runningUnderWine()) return error.SkipZigTest;
         const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
         return .{ .io = io, .server = try address.listen(io, .{}) };
     }
+
+    /// Wine's socket layer cannot run std.Io's Windows networking; real
+    /// Windows can, and CI covers it. Wine's ntdll exports a symbol of its
+    /// own that real Windows does not.
+    fn runningUnderWine() bool {
+        if (@import("builtin").os.tag != .windows) return false;
+        const ntdll = windows.GetModuleHandleW(std.unicode.utf8ToUtf16LeStringLiteral("ntdll.dll")) orelse return false;
+        return windows.GetProcAddress(ntdll, "wine_get_version") != null;
+    }
+
+    const windows = struct {
+        extern "kernel32" fn GetModuleHandleW(module_name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn GetProcAddress(module: *anyopaque, proc_name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    };
 
     pub fn deinit(l: *Loopback) void {
         l.server.deinit(l.io);
