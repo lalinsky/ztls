@@ -38,6 +38,8 @@ const ClientHello = struct {
     alpn: ?[]const u8 = null,
     has_cookie: bool = false,
 
+    // Comfortably above what any client sends (one to three shares, a
+    // dozen groups and schemes); extras are dropped.
     const max_key_shares = 8;
     const max_groups = 32;
     const max_schemes = 64;
@@ -293,6 +295,10 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
     }
     if (!supports_1_3) return error.TlsProtocolVersion;
     if (hello.key_shares_len == 0 and hello.groups_len == 0) return error.TlsMissingExtension;
+    // A share may only be offered for a group in supported_groups (§4.2.8).
+    for (hello.key_shares[0..hello.key_shares_len]) |ks| {
+        if (!hello.supportsGroup(ks.group)) return error.TlsIllegalParameter;
+    }
     return hello;
 }
 

@@ -268,7 +268,8 @@ pub const Handshake = struct {
             const pending = h.inbox.items[h.inbox_pos..];
             if (pending.len >= 4) {
                 const len = std.mem.readInt(u24, pending[1..4], .big);
-                if (len > h.max_message_len) return error.TlsInternalError;
+                // Bigger than we take; the peer's doing, so it hears so.
+                if (len > h.max_message_len) return error.TlsIllegalParameter;
                 if (pending.len >= 4 + len) {
                     const raw = pending[0 .. 4 + len];
                     h.inbox_pos += raw.len;
@@ -300,7 +301,7 @@ pub const Handshake = struct {
             switch (record.content_type) {
                 .handshake => {
                     if (record.payload.len == 0) return error.TlsUnexpectedMessage;
-                    if (h.inbox.items.len + record.payload.len > h.max_message_len + 4 + cipher.max_plaintext_len) return error.TlsInternalError;
+                    if (h.inbox.items.len + record.payload.len > h.max_message_len + 4 + cipher.max_plaintext_len) return error.TlsIllegalParameter;
                     try h.inbox.appendSlice(h.allocator, record.payload);
                     return;
                 },
@@ -466,7 +467,11 @@ pub const Handshake = struct {
         };
     }
 
+    /// A key change must fall on a record boundary (§5.1): a message
+    /// already received under the old keys that would be read under the
+    /// new ones is a violation.
     pub fn installReadKeys(h: *Handshake, secret: Secret) Error!void {
+        if (h.inbox_pos != h.inbox.items.len) return error.TlsUnexpectedMessage;
         if (h.conn.read.keys) |*old| old.deinit();
         h.conn.read.keys = cipher.Keys.init(h.suite, secret) catch return error.TlsInternalError;
     }
@@ -740,6 +745,36 @@ test "certificate, certificate verify and finished round-trip through records" {
     var received_hash: [crypto.hash.max_digest_length]u8 = undefined;
     try testing.expectEqualSlices(u8, sender.transcriptHash(&sent_hash), receiver.transcriptHash(&received_hash));
     try testing.expectError(error.EndOfStream, receiver.nextMessage());
+}
+
+test "a handshake message that spans a key change is refused" {
+    // ServerHello and EncryptedExtensions in one plaintext record: the
+    // second must not be read under the handshake keys.
+    var record: [64]u8 = undefined;
+    var w = codec.Writer.init(&record);
+    try w.enumValue(proto.ContentType.handshake);
+    try w.enumValue(proto.Version.tls_1_2);
+    const len = try w.beginLength(u16);
+    try w.enumValue(proto.HandshakeType.server_hello);
+    try w.vector(u24, "x"); // the contents do not matter here
+    try w.enumValue(proto.HandshakeType.encrypted_extensions);
+    try w.vector(u24, &.{ 0, 0 });
+    try len.end(&w);
+
+    var input: Io.Reader = .fixed(w.written());
+    var input_buffer: [@import("connection.zig").input_buffer_len]u8 = undefined;
+    var limited = input.limited(.unlimited, &input_buffer);
+    var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_buffer);
+    var conn = Connection.init(&limited.interface, &output);
+    var h = Handshake.init(&conn, testing.allocator, 1024);
+    defer h.deinit();
+    h.setSuite(.aes_128_gcm_sha256);
+
+    const msg = try h.nextMessage();
+    try h.expect(msg, .server_hello);
+    const secrets = h.deriveHandshakeSecrets("shared");
+    try testing.expectError(error.TlsUnexpectedMessage, h.installReadKeys(secrets.server));
 }
 
 test "an empty certificate and the request context" {

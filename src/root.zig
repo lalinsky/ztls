@@ -33,6 +33,11 @@ pub const output_buffer_len = connection.output_buffer_len;
 /// Runs the client side of a handshake over `input` and `output`, the
 /// transport's ciphertext reader and writer. On failure the peer is told
 /// why when that is something we found.
+///
+/// The Connection comes back by value; its readers and writers point at
+/// it, so it must not move once they exist. The copy the handshake made
+/// on its stack keeps the keys as residue; that is accepted, like the
+/// shared secrets on the way to the key schedule.
 pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Error!Connection {
     var conn = Connection.init(input, output);
     errdefer conn.deinit();

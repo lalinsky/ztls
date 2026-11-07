@@ -26,10 +26,15 @@ pub fn run(conn: *Connection, options: config.Client) Error!void {
 const ServerHello = struct {
     is_retry: bool,
     suite: proto.CipherSuite,
-    group: proto.NamedGroup,
-    /// Empty in a HelloRetryRequest.
-    share: []const u8,
+    /// The server's share, or in a HelloRetryRequest the group it wants a
+    /// share for; a retry may instead carry only a cookie.
+    key_share: ?KeyShare,
     cookie: ?[]const u8 = null,
+
+    const KeyShare = struct {
+        group: proto.NamedGroup,
+        share: []const u8,
+    };
 };
 
 const CertificateRequest = struct {
@@ -71,17 +76,24 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
         h.setSuite(hello.suite);
         h.transcript.replaceWithMessageHash();
         h.hashMessage(msg);
-        // It must name a group we support and did not already offer a
-        // share for (§4.1.4).
-        if (std.mem.indexOfScalar(proto.NamedGroup, opt.named_groups, hello.group) == null) return error.TlsIllegalParameter;
-        if (!handshake.groupSupported(hello.group) or shares.has(hello.group)) return error.TlsIllegalParameter;
-        const retry_groups = [_]proto.NamedGroup{hello.group};
-        shares.deinit();
-        shares = try KeyShares.generate(&retry_groups);
+        // A retry must change something (§4.1.4): a group we support and
+        // did not already offer a share for, or a cookie to echo.
+        var retry_groups: [1]proto.NamedGroup = undefined;
+        var share_groups: []const proto.NamedGroup = opt.key_shares;
+        if (hello.key_share) |ks| {
+            if (std.mem.indexOfScalar(proto.NamedGroup, opt.named_groups, ks.group) == null) return error.TlsIllegalParameter;
+            if (!handshake.groupSupported(ks.group) or shares.has(ks.group)) return error.TlsIllegalParameter;
+            retry_groups = .{ks.group};
+            share_groups = &retry_groups;
+            shares.deinit();
+            shares = try KeyShares.generate(share_groups);
+        } else if (hello.cookie == null) {
+            return error.TlsIllegalParameter;
+        }
 
         h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
         sent_ccs = true;
-        try writeClientHello(h, opt, &random, &session_id, &shares, &retry_groups, hello.cookie);
+        try writeClientHello(h, opt, &random, &session_id, &shares, share_groups, hello.cookie);
         try h.flush();
 
         msg = try h.nextMessage();
@@ -95,10 +107,11 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     }
     h.hashMessage(msg);
 
-    if (!shares.has(hello.group)) return error.TlsIllegalParameter;
+    const key_share = hello.key_share orelse return error.TlsMissingExtension;
+    if (!shares.has(key_share.group)) return error.TlsIllegalParameter;
     var secret_buf: [KeyShares.max_secret_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &secret_buf);
-    const shared_secret = try shares.sharedSecret(hello.group, hello.share, &secret_buf);
+    const shared_secret = try shares.sharedSecret(key_share.group, key_share.share, &secret_buf);
     var hs = h.deriveHandshakeSecrets(shared_secret);
     defer hs.wipe();
     try h.installReadKeys(hs.server);
@@ -270,9 +283,8 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: *const [32
     var extensions = try d.vector(u16);
     try d.expectEof();
 
-    var hello: ServerHello = .{ .is_retry = is_retry, .suite = suite, .group = undefined, .share = &.{} };
+    var hello: ServerHello = .{ .is_retry = is_retry, .suite = suite, .key_share = null };
     var saw_versions = false;
-    var saw_key_share = false;
     while (!extensions.eof()) {
         const extension = try extensions.decode(proto.Extension);
         var data = try extensions.vector(u16);
@@ -283,10 +295,9 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: *const [32
                 if (try data.decode(proto.Version) != .tls_1_3) return error.TlsIllegalParameter;
             },
             .key_share => {
-                if (saw_key_share) return error.TlsIllegalParameter;
-                saw_key_share = true;
-                hello.group = try data.decode(proto.NamedGroup);
-                if (!is_retry) hello.share = try data.vectorBytes(u16);
+                if (hello.key_share != null) return error.TlsIllegalParameter;
+                const group = try data.decode(proto.NamedGroup);
+                hello.key_share = .{ .group = group, .share = if (is_retry) &.{} else try data.vectorBytes(u16) };
             },
             .cookie => {
                 if (!is_retry or hello.cookie != null) return error.TlsIllegalParameter;
@@ -299,7 +310,6 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: *const [32
     }
     // Without supported_versions this would be a TLS 1.2 ServerHello.
     if (!saw_versions) return error.TlsProtocolVersion;
-    if (!saw_key_share) return error.TlsMissingExtension;
     return hello;
 }
 
@@ -393,7 +403,7 @@ test "a ServerHello must echo the session id and name TLS 1.3" {
 
     const hello = try parseServerHello(w.written(), opt, &session_id);
     try testing.expect(hello.is_retry);
-    try testing.expectEqual(proto.NamedGroup.secp256r1, hello.group);
+    try testing.expectEqual(proto.NamedGroup.secp256r1, hello.key_share.?.group);
     try testing.expectEqual(null, hello.cookie);
 
     session_id[0] = 8;
