@@ -1,0 +1,24 @@
+name: test
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        zig: [0.16.0, 0.17.0]
+    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.os }}, zig ${{ matrix.zig }})
+    steps:
+      # Test data is embedded byte for byte; CRLF checkouts would change it.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ matrix.zig }}
+      - run: zig build test --summary all

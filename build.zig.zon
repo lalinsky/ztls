@@ -1,0 +1,15 @@
+.{
+    .name = .ztls,
+    .version = "0.0.0",
+    .fingerprint = 0x767a5b45ceae7391,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .aws_lc = .{ .path = "vendor/aws-lc" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor",
+    },
+}
