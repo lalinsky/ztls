@@ -6,7 +6,9 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 /// A cursor over `bytes` that never reads past the end: every failure is
-/// `TlsDecodeError`.
+/// `TlsDecodeError`, and after one the decoder is spent (a failed `vector`
+/// has consumed its length prefix), so a caller never retries another
+/// shape.
 pub const Decoder = struct {
     bytes: []const u8,
     pos: usize = 0,
@@ -77,12 +79,14 @@ pub const Decoder = struct {
     }
 };
 
-/// Writes into a fixed buffer; the one failure is running out of room.
+/// Writes into a fixed buffer. It fails when the buffer runs out, or when
+/// a length prefix cannot hold what was written under it (a chain or a
+/// list from the configuration that is too long for the wire).
 pub const Writer = struct {
     buffer: []u8,
     end: usize = 0,
 
-    pub const Error = error{OutputBufferUndersize};
+    pub const Error = error{ OutputBufferUndersize, LengthOverflow };
 
     pub fn init(buffer: []u8) Writer {
         return .{ .buffer = buffer };
@@ -130,13 +134,14 @@ pub const Writer = struct {
 
     /// A vector of 16-bit enum values with a 16-bit length prefix.
     pub fn enumList(w: *Writer, values: anytype) Error!void {
-        var len = try w.beginLength(u16);
+        const len = try w.beginLength(u16);
         for (values) |v| try w.enumValue(v);
-        len.end(w);
+        try len.end(w);
     }
 
     /// A vector of bytes with a length prefix of `Len` bits.
     pub fn vector(w: *Writer, comptime Len: type, bytes: []const u8) Error!void {
+        if (bytes.len > std.math.maxInt(Len)) return error.LengthOverflow;
         try w.int(Len, bytes.len);
         try w.slice(bytes);
     }
@@ -147,10 +152,10 @@ pub const Writer = struct {
         return struct {
             start: usize,
 
-            pub fn end(self: @This(), w: *Writer) void {
+            pub fn end(self: @This(), w: *Writer) Error!void {
                 const n = @divExact(@typeInfo(Len).int.bits, 8);
                 const len = w.end - self.start - n;
-                assert(len <= std.math.maxInt(Len));
+                if (len > std.math.maxInt(Len)) return error.LengthOverflow;
                 std.mem.writeInt(Len, w.buffer[self.start..][0..n], @intCast(len), .big);
             }
         };
@@ -238,10 +243,10 @@ test "writer builds the example ServerHello" {
     const ks_len = try w.beginLength(u16);
     try w.enumValue(proto.NamedGroup.x25519);
     try w.vector(u16, &data13.server_pub_key);
-    ks_len.end(&w);
-    ext_len.end(&w);
-    hello_len.end(&w);
-    record_len.end(&w);
+    try ks_len.end(&w);
+    try ext_len.end(&w);
+    try hello_len.end(&w);
+    try record_len.end(&w);
     try testing.expectEqualSlices(u8, &data13.server_hello, w.written());
 }
 
@@ -255,4 +260,14 @@ test "writer refuses what does not fit" {
     try testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, w.written());
     try testing.expectError(error.OutputBufferUndersize, w.byte(0));
     try testing.expectEqual(0, w.unused().len);
+}
+
+test "a length prefix that cannot hold its contents" {
+    var buf: [300]u8 = undefined;
+    var w = Writer.init(&buf);
+    const len = try w.beginLength(u8);
+    _ = try w.writable(256);
+    try testing.expectError(error.LengthOverflow, len.end(&w));
+    w = Writer.init(&buf);
+    try testing.expectError(error.LengthOverflow, w.vector(u8, buf[0..256]));
 }

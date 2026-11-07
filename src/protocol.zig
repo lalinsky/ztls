@@ -233,7 +233,6 @@ pub const Alert = enum(u8) {
             error.TlsConnectionTruncated,
             error.TlsConnectionFailed,
             error.Canceled,
-            error.OutOfMemory,
             => null,
 
             error.TlsUnexpectedMessage => .unexpected_message,
@@ -266,9 +265,12 @@ pub const Alert = enum(u8) {
     }
 
     /// The two-byte alert body. TLS 1.3 peers ignore the level (RFC 8446
-    /// §6), but close_notify is sent as a warning for older ones.
+    /// §6), but the closure alerts are sent as warnings for older ones.
     pub fn encode(alert: Alert) [2]u8 {
-        const level: Level = if (alert == .close_notify) .warning else .fatal;
+        const level: Level = switch (alert) {
+            .close_notify, .user_canceled => .warning,
+            else => .fatal,
+        };
         return .{ @intFromEnum(level), @intFromEnum(alert) };
     }
 
@@ -350,5 +352,6 @@ test "transport failures send no alert, unknown failures send internal_error" {
     try testing.expectEqual(null, Alert.forLocalError(error.ReadFailed));
     try testing.expectEqual(null, Alert.forLocalError(error.Canceled));
     try testing.expectEqual(Alert.internal_error, Alert.forLocalError(error.Unexpected).?);
+    try testing.expectEqual(Alert.internal_error, Alert.forLocalError(error.OutOfMemory).?);
     try testing.expectEqual(Alert.protocol_version, Alert.forLocalError(error.TlsProtocolVersion).?);
 }

@@ -99,18 +99,26 @@ pub const Keys = struct {
     }
 
     /// Moves to the next generation of keys (§7.2), after a KeyUpdate was
-    /// sent or received.
+    /// sent or received. On failure the keys are left as they were.
     pub fn update(keys: *Keys) crypto.err.Error!void {
-        var next = key_schedule.nextTrafficSecret(keys.hash_algorithm, &keys.secret);
-        defer next.wipe();
-        keys.secret.wipe();
-        keys.secret = next;
-        keys.ctx.deinit();
-        try keys.deriveKeys();
+        var next: Keys = .{
+            .algorithm = keys.algorithm,
+            .hash_algorithm = keys.hash_algorithm,
+            .secret = key_schedule.nextTrafficSecret(keys.hash_algorithm, &keys.secret),
+            .ctx = undefined,
+            .iv = undefined,
+        };
+        next.deriveKeys() catch |err| {
+            next.secret.wipe();
+            return err;
+        };
+        keys.deinit();
+        keys.* = next;
     }
 
-    /// How many records one generation of keys may seal before the sender
-    /// must update them (§5.5): a little under 2^24.5 for AES-GCM.
+    /// How many records one generation of keys should seal before the
+    /// sender updates them: for AES-GCM a little under the 2^24.5 that §5.5
+    /// allows, so the update goes out with margin and a seal never fails.
     pub fn recordLimit(keys: *const Keys) u64 {
         return switch (keys.algorithm) {
             .aes_128_gcm, .aes_256_gcm => 1 << 24,
@@ -148,14 +156,21 @@ pub const Keys = struct {
         return header_len + plaintext_len + seal_overhead;
     }
 
+    /// The most inner plaintext (content, type byte and padding) a protected
+    /// record may hold (§5.4), and so the most `open` writes to `out`.
+    pub const max_inner_len = max_plaintext_len + 1;
+
     /// Opens `record` (header, ciphertext and tag) into `out`, which needs
-    /// `record.len - header_len - tag_length` bytes and is either exactly
-    /// `record[header_len..]` or disjoint from it. The content type and any
-    /// padding are stripped from the result.
-    pub fn open(keys: *Keys, record: []const u8, out: []u8) error{ TlsBadRecordMac, TlsDecodeError, TlsUnexpectedMessage, TlsInternalError }!Opened {
+    /// `record.len - header_len - tag_length` bytes (at most
+    /// `max_inner_len`) and is either exactly `record[header_len..]` or
+    /// disjoint from it. The content type and any padding are stripped from
+    /// the result; only handshake, alert and application_data are accepted
+    /// inside a protected record.
+    pub fn open(keys: *Keys, record: []const u8, out: []u8) error{ TlsBadRecordMac, TlsDecodeError, TlsRecordOverflow, TlsUnexpectedMessage, TlsInternalError }!Opened {
         if (record.len < header_len + seal_overhead) return error.TlsDecodeError;
-        if (record.len > max_record_len) return error.TlsDecodeError;
+        if (record.len > max_record_len) return error.TlsRecordOverflow;
         const inner_len = record.len - header_len - aead.tag_length;
+        if (inner_len > max_inner_len) return error.TlsRecordOverflow;
         assert(out.len >= inner_len);
         if (keys.seq == std.math.maxInt(u64)) return error.TlsInternalError;
 
@@ -168,7 +183,13 @@ pub const Keys = struct {
         var i = inner_len;
         while (i > 0) {
             i -= 1;
-            if (out[i] != 0) return .{ .content_type = @enumFromInt(out[i]), .len = i };
+            if (out[i] != 0) {
+                const content_type: proto.ContentType = @enumFromInt(out[i]);
+                return switch (content_type) {
+                    .handshake, .alert, .application_data => .{ .content_type = content_type, .len = i },
+                    else => error.TlsUnexpectedMessage,
+                };
+            }
         }
         return error.TlsUnexpectedMessage;
     }
@@ -286,4 +307,26 @@ test "padding is stripped and an all-zero plaintext is rejected" {
     try testing.expectError(error.TlsUnexpectedMessage, receiver.open(&record, &out));
 
     try testing.expectError(error.TlsDecodeError, receiver.open(record[0 .. header_len + aead.tag_length], &out));
+
+    // change_cipher_spec may not hide inside a protected record.
+    inner = @splat(0);
+    inner[0] = @intFromEnum(proto.ContentType.change_cipher_spec);
+    sender.seq = 2;
+    receiver.seq = 2;
+    const n3 = sender.nonce(sender.seq);
+    sender.ctx.seal(&n3, record[0..header_len], &inner, record[header_len..][0..inner.len], record[header_len + inner.len ..][0..aead.tag_length]);
+    try testing.expectError(error.TlsUnexpectedMessage, receiver.open(&record, &out));
+}
+
+test "oversized records are record_overflow" {
+    const ks = key_schedule.KeySchedule.init(.sha256);
+    var keys = try Keys.init(.aes_128_gcm_sha256, ks.trafficSecret(.server_application, "t"));
+    defer keys.deinit();
+    var out: [max_record_len]u8 = undefined;
+    var record: [max_record_len + 1]u8 = undefined;
+    record[0..header_len].* = header(max_ciphertext_len);
+    try testing.expectError(error.TlsRecordOverflow, keys.open(&record, &out));
+    // Within the body limit but more inner plaintext than §5.4 allows.
+    const too_much = header_len + Keys.max_inner_len + 1 + aead.tag_length;
+    try testing.expectError(error.TlsRecordOverflow, keys.open(record[0..too_much], &out));
 }
