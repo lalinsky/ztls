@@ -15,3 +15,6 @@
 #include <openssl/nid.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <openssl/bytestring.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>

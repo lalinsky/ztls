@@ -18,6 +18,9 @@ pub const hkdf = @import("crypto/hkdf.zig");
 pub const aead = @import("crypto/aead.zig");
 pub const rand = @import("crypto/rand.zig");
 pub const kx = @import("crypto/kx.zig");
+pub const pem = @import("crypto/pem.zig");
+pub const sig = @import("crypto/sig.zig");
+pub const x509 = @import("crypto/x509.zig");
 
 test {
     std.testing.refAllDecls(@This());
