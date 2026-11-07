@@ -58,8 +58,12 @@ pub const Certificate = struct {
 };
 
 /// The certificate authorities a peer's chain must lead to. Built by the
-/// caller and shared by any number of connections; verification only reads
-/// it.
+/// caller, then shared read-only by any number of connections on any
+/// threads; nothing may be added once connections use it.
+///
+/// Any certificate in the store is a trust anchor: an intermediate stays
+/// trusted even when its root is expired or absent, and a leaf in the
+/// store pins that leaf.
 pub const TrustStore = struct {
     store: *c.X509_STORE,
 
@@ -176,13 +180,22 @@ pub fn verify(store: *const TrustStore, chain: []const Certificate, options: Ver
         c.X509_V_ERR_CERT_NOT_YET_VALID => error.CertificateNotYetValid,
         c.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT,
         c.X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY,
+        c.X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE,
         c.X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT,
         c.X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN,
         c.X509_V_ERR_CERT_UNTRUSTED,
         => error.UnknownCa,
         c.X509_V_ERR_HOSTNAME_MISMATCH, c.X509_V_ERR_IP_ADDRESS_MISMATCH => error.HostnameMismatch,
         else => {
-            log.debug("certificate verification failed: {s}", .{c.X509_verify_cert_error_string(code)});
+            if (std.log.logEnabled(.debug, .ztls)) {
+                var subject: [256]u8 = undefined;
+                const name = c.X509_NAME_oneline(c.X509_get_subject_name(c.X509_STORE_CTX_get_current_cert(ctx)), &subject, subject.len);
+                log.debug("certificate verification failed at depth {d} ({s}): {s}", .{
+                    c.X509_STORE_CTX_get_error_depth(ctx),
+                    if (name) |n| std.mem.sliceTo(n, 0) else "?",
+                    c.X509_verify_cert_error_string(code),
+                });
+            }
             return error.BadCertificate;
         },
     };

@@ -57,9 +57,16 @@ pub const KeyType = union(enum) {
     ed25519,
 };
 
+/// Smaller RSA keys are refused, ours and the peer's alike.
+pub const min_rsa_bits = 2048;
+
 fn keyTypeOf(pkey: *c.EVP_PKEY) error{UnsupportedKey}!KeyType {
     return switch (c.EVP_PKEY_id(pkey)) {
-        c.EVP_PKEY_RSA => .{ .rsa = @intCast(c.EVP_PKEY_bits(pkey)) },
+        c.EVP_PKEY_RSA => {
+            const bits: u32 = @intCast(c.EVP_PKEY_bits(pkey));
+            if (bits < min_rsa_bits) return error.UnsupportedKey;
+            return .{ .rsa = bits };
+        },
         c.EVP_PKEY_EC => {
             const group = c.EC_KEY_get0_group(c.EVP_PKEY_get0_EC_KEY(pkey));
             return switch (c.EC_GROUP_get_curve_name(group)) {
@@ -298,6 +305,7 @@ test "ed25519 signatures verify with std.crypto" {
 }
 
 test "malformed and unsupported keys" {
+    try testing.expectError(error.UnsupportedKey, PrivateKey.parsePem(testing.allocator, @embedFile("../testdata/keys/rsa_1024_private_key.pem")));
     try testing.expectError(error.InvalidKey, PrivateKey.parsePem(testing.allocator, "nothing here"));
     try testing.expectError(error.InvalidKey, PrivateKey.parsePem(testing.allocator, "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"));
     try testing.expectError(error.InvalidPem, PrivateKey.parsePem(testing.allocator, "-----BEGIN PRIVATE KEY-----\nAAAA\n"));
