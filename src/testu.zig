@@ -41,3 +41,60 @@ test hexToBytes {
         hexToBytes(hex),
     );
 }
+
+/// A TCP connection to ourselves over the loopback interface, for self-talk
+/// tests. The two ends run as concurrent std.Io tasks, as they would in an
+/// application, over the real socket reader and writer.
+pub const Loopback = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+
+    pub fn init(io: std.Io) !Loopback {
+        const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        return .{ .io = io, .server = try address.listen(io, .{}) };
+    }
+
+    pub fn deinit(l: *Loopback) void {
+        l.server.deinit(l.io);
+    }
+
+    pub fn connect(l: *const Loopback) !std.Io.net.Stream {
+        return l.server.socket.address.connect(l.io, .{ .mode = .stream });
+    }
+
+    pub fn accept(l: *Loopback) !std.Io.net.Stream {
+        return l.server.accept(l.io);
+    }
+};
+
+test "Loopback connects two tasks" {
+    const io = std.testing.io;
+    var loopback = try Loopback.init(io);
+    defer loopback.deinit();
+
+    const Peer = struct {
+        fn run(l: *Loopback) !void {
+            const stream = try l.accept();
+            defer stream.close(l.io);
+            var buffer: [64]u8 = undefined;
+            var writer = stream.writer(l.io, &buffer);
+            for (0..100) |i| try writer.interface.print("line {d}\n", .{i});
+            try writer.interface.flush();
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&loopback});
+    defer peer.cancel(io) catch {};
+
+    const stream = try loopback.connect();
+    defer stream.close(io);
+    var buffer: [64]u8 = undefined;
+    var reader = stream.reader(io, &buffer);
+    var count: usize = 0;
+    while (try reader.interface.takeDelimiter('\n')) |line| {
+        var expected: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "line {d}", .{count}), line);
+        count += 1;
+    }
+    try peer.await(io);
+    try std.testing.expectEqual(100, count);
+}
