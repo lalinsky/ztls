@@ -457,10 +457,20 @@ pub const Connection = struct {
         c.output.advance(cipher.header_len + payload.len);
     }
 
-    /// A handshake record, sealed when there are keys.
-    pub fn writeHandshakeRecord(c: *Connection, payload: []const u8) WriteRecordError!void {
-        if (c.write.keys == null) return c.writePlaintextRecord(.handshake, payload);
-        return c.writeRecord(.handshake, payload);
+    /// An alert, sealed when there are keys. For the handshake; afterwards
+    /// alerts go through the write side's own checks.
+    pub fn writeAlert(c: *Connection, alert: proto.Alert) WriteRecordError!void {
+        if (c.write.keys == null) return c.writePlaintextRecord(.alert, &alert.encode());
+        return c.writeRecord(.alert, &alert.encode());
+    }
+
+    /// The dummy change_cipher_spec of middlebox compatibility mode (§D.4),
+    /// always in the clear.
+    pub fn writeChangeCipherSpec(c: *Connection) error{WriteFailed}!void {
+        const record = [_]u8{ @intFromEnum(proto.ContentType.change_cipher_spec), 3, 3, 0, 1, 1 };
+        const dest = c.output.writableSliceGreedy(record.len) catch return error.WriteFailed;
+        dest[0..record.len].* = record;
+        c.output.advance(record.len);
     }
 
     /// Sends what is in `output`.
