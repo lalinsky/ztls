@@ -1,0 +1,1150 @@
+//! A TLS 1.3 connection after the handshake: records in and out over the
+//! transport's `std.Io.Reader` and `std.Io.Writer`, exposed as a cleartext
+//! reader and writer of the same kind.
+//!
+//! The two directions are independent. One task may read while another
+//! writes, with nothing shared but a few atomics, and the read side never
+//! writes to the transport: an alert for a failure it found, or the
+//! KeyUpdate a peer asked for, is sent by the write side before its next
+//! record.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Io = std.Io;
+const proto = @import("protocol.zig");
+const cipher = @import("cipher.zig");
+const crypto = @import("crypto.zig");
+const codec = @import("codec.zig");
+
+const log = std.log.scoped(.ztls);
+
+/// The transport reader's buffer must hold one whole record.
+pub const input_buffer_len = cipher.max_record_len;
+/// The transport writer's buffer must hold one whole sealed record and the
+/// KeyUpdate that may have to go out ahead of it.
+pub const output_buffer_len = cipher.max_sealed_record_len + key_update_record_len;
+
+const key_update_msg_len = 4 + 1;
+const key_update_record_len = cipher.Keys.sealedLen(key_update_msg_len);
+/// Sealing a record writes past its plaintext: the content type and tag,
+/// and when a KeyUpdate is moved in ahead of it, that record's length too.
+const seal_spill = cipher.seal_overhead + key_update_record_len;
+/// Records carrying no application data (empty ones, post-handshake
+/// messages) a peer may send in a row before it is cut off.
+const max_idle_records = 32;
+
+/// What a read or write can fail with: the transport's own failure,
+/// something the record layer found, or an alert the peer sent.
+pub const Error = error{
+    ReadFailed,
+    WriteFailed,
+    TlsConnectionTruncated,
+    TlsConnectionFailed,
+    TlsRecordOverflow,
+    TlsBadRecordMac,
+    TlsDecodeError,
+    TlsUnexpectedMessage,
+    TlsIllegalParameter,
+    TlsInternalError,
+} || proto.Alert.Error;
+
+pub const State = enum(u8) {
+    open,
+    /// close_notify went this way, or the transport ended cleanly.
+    closed,
+    /// A failure ended this direction; `Shared.read_error` or the writer's
+    /// `err` says which.
+    failed,
+};
+
+pub const Connection = struct {
+    /// Ciphertext from the transport. Its buffer holds a whole record.
+    input: *Io.Reader,
+    /// Ciphertext to the transport. Its buffer holds a whole sealed record.
+    output: *Io.Writer,
+
+    read: ReadHalf align(std.atomic.cache_line),
+    write: WriteHalf align(std.atomic.cache_line),
+    shared: Shared align(std.atomic.cache_line),
+
+    /// The protocol agreed through ALPN, pointing into the configuration.
+    alpn_protocol: ?[]const u8 = null,
+    /// Treat a transport that ends between records without close_notify as
+    /// truncated rather than as a clean end.
+    strict_close_notify: bool = false,
+
+    /// Touched by the reading task only.
+    pub const ReadHalf = struct {
+        keys: ?cipher.Keys = null,
+        /// Cleartext opened in place in `input`'s buffer, not yet handed out.
+        cleartext: []u8 = &.{},
+        /// Records in a row that carried no application data.
+        idle_records: u32 = 0,
+        /// change_cipher_spec is tolerated until the handshake is over.
+        in_handshake: bool = true,
+    };
+
+    /// Touched by the writing task only.
+    pub const WriteHalf = struct {
+        keys: ?cipher.Keys = null,
+    };
+
+    /// What the two tasks share.
+    pub const Shared = struct {
+        read_state: std.atomic.Value(State) = .init(.open),
+        write_state: std.atomic.Value(State) = .init(.open),
+        /// `@intFromError` of the read side's failure, stored before
+        /// `read_state` becomes failed (release), read after seeing it
+        /// (acquire).
+        read_error: std.atomic.Value(u16) = .init(0),
+        /// The alert the read side wants sent, as `@intFromEnum`, or 0.
+        pending_alert: std.atomic.Value(u8) = .init(0),
+        /// The peer asked for a KeyUpdate; the write side answers.
+        key_update_requested: std.atomic.Value(bool) = .init(false),
+    };
+
+    pub fn init(input: *Io.Reader, output: *Io.Writer) Connection {
+        assert(input.buffer.len >= input_buffer_len);
+        assert(output.buffer.len >= output_buffer_len);
+        return .{ .input = input, .output = output, .read = .{}, .write = .{}, .shared = .{} };
+    }
+
+    /// Wipes the keys. Sends nothing; both tasks must be done.
+    pub fn deinit(c: *Connection) void {
+        if (c.read.keys) |*keys| keys.deinit();
+        if (c.write.keys) |*keys| keys.deinit();
+        c.* = undefined;
+    }
+
+    // Read side
+
+    /// One record, taken from the transport. The payload points into
+    /// `input`'s buffer and lives until the next record is read.
+    pub const Record = struct {
+        content_type: proto.ContentType,
+        payload: []u8,
+    };
+
+    pub const ReadRecordError = error{
+        ReadFailed,
+        /// close_notify, or the transport ended cleanly between records.
+        EndOfStream,
+        TlsConnectionTruncated,
+        TlsRecordOverflow,
+        TlsBadRecordMac,
+        TlsDecodeError,
+        TlsUnexpectedMessage,
+        TlsInternalError,
+    };
+
+    /// The next record. With keys it is opened in place, or into `dest` when
+    /// that is given and holds the whole inner plaintext (the payload then
+    /// points into `dest`). change_cipher_spec is skipped while the
+    /// handshake runs. close_notify and clean transport ends are
+    /// `EndOfStream`; other alerts are returned for the caller to act on.
+    pub fn readRecord(c: *Connection, dest: ?[]u8) ReadRecordError!Record {
+        while (true) {
+            const header = c.input.peek(cipher.header_len) catch |err| switch (err) {
+                error.EndOfStream => return c.inputEnded(),
+                error.ReadFailed => return error.ReadFailed,
+            };
+            const content_type: proto.ContentType = @enumFromInt(header[0]);
+            // legacy_record_version is ignored, as RFC 8446 §5.1 says.
+            const body_len = std.mem.readInt(u16, header[3..5], .big);
+            if (body_len > cipher.max_ciphertext_len) return error.TlsRecordOverflow;
+            const record = c.input.take(cipher.header_len + body_len) catch |err| switch (err) {
+                error.EndOfStream => return error.TlsConnectionTruncated,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            const body = record[cipher.header_len..];
+
+            if (c.read.keys) |*keys| {
+                switch (content_type) {
+                    .application_data => {
+                        const inner_len = body_len -| crypto.aead.tag_length;
+                        const out = if (dest) |d| (if (d.len >= inner_len) d else body) else body;
+                        const opened = keys.open(record, out) catch |err| switch (err) {
+                            error.TlsBadRecordMac => return error.TlsBadRecordMac,
+                            error.TlsDecodeError => return error.TlsDecodeError,
+                            error.TlsRecordOverflow => return error.TlsRecordOverflow,
+                            error.TlsUnexpectedMessage => return error.TlsUnexpectedMessage,
+                            error.TlsInternalError => return error.TlsInternalError,
+                        };
+                        return .{ .content_type = opened.content_type, .payload = out[0..opened.len] };
+                    },
+                    .change_cipher_spec => {
+                        // Middlebox compatibility (§5): one byte of 0x01,
+                        // dropped, but only until the handshake is done.
+                        if (!c.read.in_handshake or body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
+                        continue;
+                    },
+                    else => return error.TlsUnexpectedMessage,
+                }
+            } else {
+                // Before the handshake keys: ClientHello, ServerHello,
+                // HelloRetryRequest, an alert refusing them, and
+                // change_cipher_spec from a middlebox-compatible peer.
+                switch (content_type) {
+                    .handshake, .alert => {
+                        // Zero-length handshake and alert fragments are
+                        // forbidden (§5.1); an oversized plaintext record too.
+                        if (body_len == 0 or body_len > cipher.max_plaintext_len) return error.TlsUnexpectedMessage;
+                        return .{ .content_type = content_type, .payload = body };
+                    },
+                    .change_cipher_spec => {
+                        if (body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
+                        continue;
+                    },
+                    else => return error.TlsUnexpectedMessage,
+                }
+            }
+        }
+    }
+
+    /// The transport ran out between records (clean, unless strict) or
+    /// inside one (truncated). A clean end closes both directions: there
+    /// is nowhere left to send anything.
+    fn inputEnded(c: *Connection) ReadRecordError {
+        if (c.input.bufferedLen() != 0 or c.strict_close_notify) return error.TlsConnectionTruncated;
+        _ = c.shared.write_state.cmpxchgStrong(.open, .closed, .monotonic, .monotonic);
+        return error.EndOfStream;
+    }
+
+    /// Records the read side's failure for both tasks, and the alert the
+    /// write side should send for it, if any.
+    fn failRead(c: *Connection, err: Error) void {
+        c.shared.read_error.store(@intFromError(err), .monotonic);
+        if (proto.Alert.forLocalError(err)) |alert| {
+            c.shared.pending_alert.store(@intFromEnum(alert), .monotonic);
+        }
+        c.shared.read_state.store(.failed, .release);
+    }
+
+    const FillError = Error || error{EndOfStream};
+
+    /// Fetches cleartext for the application: the next application data
+    /// record, into `dest` when it fits there, else opened in place and
+    /// kept in `read.cleartext`. Returns how much went into `dest`.
+    /// Post-handshake messages and alerts are handled on the way.
+    fn fillCleartext(c: *Connection, dest: []u8) FillError!usize {
+        assert(c.read.cleartext.len == 0);
+        if (c.shared.read_state.load(.monotonic) != .open) {
+            return if (c.shared.read_state.load(.acquire) == .closed) error.EndOfStream else error.TlsConnectionFailed;
+        }
+        while (true) {
+            const record = c.readRecord(dest) catch |err| switch (err) {
+                error.EndOfStream => {
+                    c.shared.read_state.store(.closed, .release);
+                    return error.EndOfStream;
+                },
+                error.ReadFailed => {
+                    c.failRead(error.ReadFailed);
+                    return error.ReadFailed;
+                },
+                else => |e| {
+                    c.failRead(e);
+                    return e;
+                },
+            };
+            switch (record.content_type) {
+                .application_data => {
+                    if (record.payload.len == 0) {
+                        try c.countIdleRecord();
+                        continue;
+                    }
+                    c.read.idle_records = 0;
+                    if (record.payload.ptr == dest.ptr) return record.payload.len;
+                    c.read.cleartext = record.payload;
+                    return 0;
+                },
+                .alert => {
+                    if (record.payload.len != 2) {
+                        c.failRead(error.TlsDecodeError);
+                        return error.TlsDecodeError;
+                    }
+                    const alert = proto.Alert.decode(record.payload[0..2]);
+                    if (alert.toError()) |err| {
+                        // The peer's failure: it will not read an alert back.
+                        c.failRead(err);
+                        return err;
+                    }
+                    switch (alert) {
+                        .close_notify => {
+                            c.shared.read_state.store(.closed, .release);
+                            return error.EndOfStream;
+                        },
+                        // user_canceled is followed by close_notify (§6.1).
+                        else => {
+                            try c.countIdleRecord();
+                            continue;
+                        },
+                    }
+                },
+                .handshake => {
+                    c.handlePostHandshake(record.payload) catch |err| {
+                        c.failRead(err);
+                        return err;
+                    };
+                    try c.countIdleRecord();
+                    continue;
+                },
+                else => unreachable, // readRecord returns no other type
+            }
+        }
+    }
+
+    fn countIdleRecord(c: *Connection) Error!void {
+        c.read.idle_records += 1;
+        if (c.read.idle_records > max_idle_records) {
+            c.failRead(error.TlsUnexpectedMessage);
+            return error.TlsUnexpectedMessage;
+        }
+    }
+
+    /// Handshake messages after the handshake: KeyUpdate, and
+    /// NewSessionTicket, which v1 drops. Each must be whole within its
+    /// record, and KeyUpdate must be the record's last message (§4.6.3).
+    fn handlePostHandshake(c: *Connection, payload: []const u8) Error!void {
+        var d = codec.Decoder.init(payload);
+        while (!d.eof()) {
+            const handshake_type = d.decode(proto.HandshakeType) catch return error.TlsDecodeError;
+            var body = d.vector(u24) catch return error.TlsDecodeError;
+            switch (handshake_type) {
+                .key_update => {
+                    const request = body.decode(proto.KeyUpdateRequest) catch return error.TlsDecodeError;
+                    if (!body.eof() or !d.eof()) return error.TlsUnexpectedMessage;
+                    switch (request) {
+                        .update_not_requested => {},
+                        .update_requested => c.shared.key_update_requested.store(true, .monotonic),
+                        _ => return error.TlsIllegalParameter,
+                    }
+                    c.read.keys.?.update() catch return error.TlsInternalError;
+                },
+                .new_session_ticket => {},
+                else => return error.TlsUnexpectedMessage,
+            }
+        }
+    }
+
+    pub const Reader = struct {
+        conn: *Connection,
+        interface: Io.Reader,
+        /// Why the last read failed. `ReadFailed` means the transport
+        /// reader failed, and its own error says how.
+        err: ?Error = null,
+
+        fn init(c: *Connection, buffer: []u8) Reader {
+            return .{
+                .conn = c,
+                .interface = .{
+                    .vtable = &.{
+                        .stream = stream,
+                        .readVec = readVec,
+                    },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+
+        fn fail(self: *Reader, err: FillError) Io.Reader.Error {
+            switch (err) {
+                error.EndOfStream => return error.EndOfStream,
+                else => |e| {
+                    self.err = e;
+                    return error.ReadFailed;
+                },
+            }
+        }
+
+        /// Fills the destinations from the cleartext at hand, then from the
+        /// next record, decrypted straight into the first destination when
+        /// it fits.
+        fn readVec(r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+            const self: *Reader = @fieldParentPtr("interface", r);
+            const c = self.conn;
+            var dest_buffer: [8][]u8 = undefined;
+            const dest_n, const data_size = try r.writableVector(&dest_buffer, data);
+            const dests = dest_buffer[0..dest_n];
+
+            var n: usize = 0;
+            for (dests) |dest| {
+                if (dest.len == 0) continue;
+                if (c.read.cleartext.len == 0) {
+                    // Only block for another record when nothing was
+                    // delivered yet.
+                    if (n > 0) break;
+                    const direct = c.fillCleartext(dest) catch |err| return self.fail(err);
+                    if (direct > 0) {
+                        n += direct;
+                        continue;
+                    }
+                }
+                const len = @min(dest.len, c.read.cleartext.len);
+                @memcpy(dest[0..len], c.read.cleartext[0..len]);
+                c.read.cleartext = c.read.cleartext[len..];
+                n += len;
+                if (len < dest.len) break;
+            }
+            if (n > data_size) {
+                r.end += n - data_size;
+                return data_size;
+            }
+            return n;
+        }
+
+        fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+            const self: *Reader = @fieldParentPtr("interface", r);
+            const c = self.conn;
+            const dest = limit.slice(try w.writableSliceGreedy(1));
+            if (c.read.cleartext.len == 0) {
+                const direct = c.fillCleartext(dest) catch |err| return self.fail(err);
+                if (direct > 0) {
+                    w.advance(direct);
+                    return direct;
+                }
+            }
+            const len = @min(dest.len, c.read.cleartext.len);
+            @memcpy(dest[0..len], c.read.cleartext[0..len]);
+            c.read.cleartext = c.read.cleartext[len..];
+            w.advance(len);
+            return len;
+        }
+    };
+
+    /// The cleartext reader. `buffer` is an ordinary reader buffer that the
+    /// application may swap at any time; no connection state lives in it.
+    /// One per connection, for the reading task.
+    pub fn reader(c: *Connection, buffer: []u8) Reader {
+        assert(c.read.keys != null);
+        return Reader.init(c, buffer);
+    }
+
+    // Write side
+
+    pub const WriteRecordError = error{ WriteFailed, TlsInternalError };
+
+    /// Seals `payload` as one record and puts it in `output`, flushing the
+    /// transport first if it does not fit. Nothing else is sent first.
+    fn writeRecord(c: *Connection, content_type: proto.ContentType, payload: []const u8) WriteRecordError!void {
+        assert(payload.len <= cipher.max_plaintext_len);
+        const keys = &c.write.keys.?;
+        const record_len = cipher.Keys.sealedLen(payload.len);
+        const dest = c.output.writableSliceGreedy(record_len) catch return error.WriteFailed;
+        @memcpy(dest[cipher.header_len..][0..payload.len], payload);
+        try keys.seal(dest[0..record_len], content_type, payload.len);
+        c.output.advance(record_len);
+    }
+
+    /// Before the handshake keys: the record goes out as it is.
+    pub fn writePlaintextRecord(c: *Connection, content_type: proto.ContentType, payload: []const u8) error{WriteFailed}!void {
+        assert(c.write.keys == null);
+        assert(payload.len <= cipher.max_plaintext_len);
+        const dest = c.output.writableSliceGreedy(cipher.header_len + payload.len) catch return error.WriteFailed;
+        dest[0] = @intFromEnum(content_type);
+        std.mem.writeInt(u16, dest[1..3], @intFromEnum(proto.Version.tls_1_2), .big);
+        std.mem.writeInt(u16, dest[3..5], @intCast(payload.len), .big);
+        @memcpy(dest[cipher.header_len..][0..payload.len], payload);
+        c.output.advance(cipher.header_len + payload.len);
+    }
+
+    /// A handshake record, sealed when there are keys.
+    pub fn writeHandshakeRecord(c: *Connection, payload: []const u8) WriteRecordError!void {
+        if (c.write.keys == null) return c.writePlaintextRecord(.handshake, payload);
+        return c.writeRecord(.handshake, payload);
+    }
+
+    /// Sends what is in `output`.
+    pub fn flushOutput(c: *Connection) error{WriteFailed}!void {
+        c.output.flush() catch return error.WriteFailed;
+    }
+
+    /// Whether a KeyUpdate has to go out before the next record, claiming
+    /// the peer's request if there is one. The claim happens before the
+    /// update is sent, so a request arriving in between stays set and is
+    /// answered before the record after this one.
+    fn claimKeyUpdate(c: *Connection) bool {
+        const requested = c.shared.key_update_requested.load(.monotonic) and
+            c.shared.key_update_requested.swap(false, .monotonic);
+        return requested or c.write.keys.?.seq >= c.write.keys.?.recordLimit();
+    }
+
+    fn keyUpdateMessage(request: proto.KeyUpdateRequest) [key_update_msg_len]u8 {
+        return .{ @intFromEnum(proto.HandshakeType.key_update), 0, 0, 1, @intFromEnum(request) };
+    }
+
+    /// Sends a KeyUpdate and moves the write keys to the next generation.
+    fn sendKeyUpdate(c: *Connection, request: proto.KeyUpdateRequest) Error!void {
+        try c.writeRecord(.handshake, &keyUpdateMessage(request));
+        c.write.keys.?.update() catch return error.TlsInternalError;
+    }
+
+    /// Asks the peer to update its keys, updating ours first (§4.6.3).
+    /// For the writing task.
+    pub fn requestKeyUpdate(c: *Connection) Error!void {
+        try c.checkWritable();
+        c.sendKeyUpdate(.update_requested) catch |err| return c.failWrite(err);
+        try c.flushOutput();
+    }
+
+    /// The write side's state, with the read side's failure delivered
+    /// first: its alert goes out and this direction fails too.
+    fn checkWritable(c: *Connection) Error!void {
+        switch (c.shared.write_state.load(.monotonic)) {
+            .open => {},
+            .closed => return error.TlsConnectionFailed,
+            .failed => return error.TlsConnectionFailed,
+        }
+        if (c.shared.read_state.load(.acquire) == .failed) {
+            const read_error: Error = @errorCast(@errorFromInt(c.shared.read_error.load(.monotonic)));
+            const alert = c.shared.pending_alert.swap(0, .monotonic);
+            if (alert != 0) {
+                c.writeRecord(.alert, &@as(proto.Alert, @enumFromInt(alert)).encode()) catch {};
+                c.output.flush() catch {};
+            }
+            c.shared.write_state.store(.failed, .release);
+            return read_error;
+        }
+    }
+
+    fn failWrite(c: *Connection, err: Error) Error {
+        c.shared.write_state.store(.failed, .release);
+        return err;
+    }
+
+    /// Where the next in-place record's plaintext goes: inside `output`'s
+    /// unused capacity, after the header, with room left for the trailer
+    /// and for a KeyUpdate ahead of it. Empty when `output` needs flushing.
+    fn payloadWindow(c: *Connection) []u8 {
+        const unused = c.output.unusedCapacitySlice();
+        const reserved = cipher.header_len + seal_spill;
+        if (unused.len <= reserved) return unused[0..0];
+        return unused[cipher.header_len..][0..@min(cipher.max_plaintext_len, unused.len - reserved)];
+    }
+
+    /// Seals the first `len` bytes of `payloadWindow()` where they are, as
+    /// one record. A KeyUpdate that is due goes ahead of it, with the
+    /// plaintext moved up to make room. `output` is flushed when it has no
+    /// room for another full record.
+    fn sealWindow(c: *Connection, len: usize) Error!void {
+        try c.checkWritable();
+        const keys = &c.write.keys.?;
+        const buf = c.output.unusedCapacitySlice();
+        var at: usize = 0;
+        if (c.claimKeyUpdate()) {
+            std.mem.copyBackwards(u8, buf[key_update_record_len + cipher.header_len ..][0..len], buf[cipher.header_len..][0..len]);
+            const msg = keyUpdateMessage(.update_not_requested);
+            buf[cipher.header_len..][0..msg.len].* = msg;
+            keys.seal(buf[0..key_update_record_len], .handshake, msg.len) catch |err| return c.failWrite(err);
+            keys.update() catch return c.failWrite(error.TlsInternalError);
+            at = key_update_record_len;
+        }
+        if (len > 0) {
+            keys.seal(buf[at..], .application_data, len) catch |err| return c.failWrite(err);
+            at += cipher.Keys.sealedLen(len);
+        }
+        c.output.advance(at);
+        if (c.output.unusedCapacityLen() < output_buffer_len) {
+            c.output.flush() catch return c.failWrite(error.WriteFailed);
+        }
+    }
+
+    /// Sends what is sealed so far.
+    fn flushWrite(c: *Connection) Error!void {
+        try c.checkWritable();
+        c.output.flush() catch return c.failWrite(error.WriteFailed);
+    }
+
+    /// Sends close_notify and closes the write direction; later writes
+    /// fail. Idempotent. If the read side has an alert pending, that goes
+    /// out instead and both directions are failed. For the writing task,
+    /// after its writer was flushed for the last time.
+    pub fn close(c: *Connection) Error!void {
+        switch (c.shared.write_state.load(.monotonic)) {
+            .open => {},
+            .closed => return,
+            .failed => return error.TlsConnectionFailed,
+        }
+        try c.checkWritable();
+        c.writeRecord(.alert, &proto.Alert.close_notify.encode()) catch |err| return c.failWrite(err);
+        c.shared.write_state.store(.closed, .release);
+        c.output.flush() catch return error.WriteFailed;
+    }
+
+    /// Copies the start of `header` then `data` (the last element `splat`
+    /// times) into `dest`, as much as fits.
+    fn gather(dest: []u8, header: []const u8, data: []const []const u8, splat: usize) void {
+        var i = copyPrefix(dest, header);
+        for (data[0 .. data.len - 1]) |bytes| {
+            if (i == dest.len) return;
+            i += copyPrefix(dest[i..], bytes);
+        }
+        const pattern = data[data.len - 1];
+        if (pattern.len == 1) {
+            @memset(dest[i..], pattern[0]);
+            return;
+        }
+        var remaining = splat;
+        while (i < dest.len) : (remaining -= 1) {
+            assert(remaining > 0);
+            i += copyPrefix(dest[i..], pattern);
+        }
+    }
+
+    fn copyPrefix(dest: []u8, src: []const u8) usize {
+        const len = @min(dest.len, src.len);
+        @memcpy(dest[0..len], src[0..len]);
+        return len;
+    }
+
+    pub const Writer = struct {
+        conn: *Connection,
+        interface: Io.Writer,
+        /// Why the last write failed. `WriteFailed` means the transport
+        /// writer failed, and its own error says how.
+        err: ?Error = null,
+
+        fn init(c: *Connection, buffer: []u8) Writer {
+            return .{
+                .conn = c,
+                .interface = .{
+                    .vtable = &.{
+                        .drain = drain,
+                        .flush = flush,
+                    },
+                    .buffer = buffer,
+                    .end = 0,
+                },
+            };
+        }
+
+        fn initInPlace(c: *Connection) Writer {
+            return .{
+                .conn = c,
+                .interface = .{
+                    .vtable = &.{
+                        .drain = drainInPlace,
+                        .flush = flush,
+                        .rebase = rebaseInPlace,
+                    },
+                    .buffer = c.payloadWindow(),
+                    .end = 0,
+                },
+            };
+        }
+
+        fn fail(self: *Writer, err: Error) Io.Writer.Error {
+            self.err = err;
+            return error.WriteFailed;
+        }
+
+        /// A window with room in it, flushing `output` when it is full.
+        fn window(self: *Writer) Io.Writer.Error![]u8 {
+            const c = self.conn;
+            var w = c.payloadWindow();
+            if (w.len == 0) {
+                c.flushWrite() catch |err| return self.fail(err);
+                w = c.payloadWindow();
+                assert(w.len > 0);
+            }
+            return w;
+        }
+
+        /// Records until the buffer is sent, the last taking as much of
+        /// `data` as fits behind it.
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const self: *Writer = @fieldParentPtr("interface", w);
+            const buffered = w.buffered();
+            var n: usize = 0;
+            while (true) {
+                const dest = try self.window();
+                const total = buffered.len - n + Io.Writer.countSplat(data, splat);
+                const len = @min(dest.len, total);
+                if (len == 0) break;
+                gather(dest[0..len], buffered[n..], data, splat);
+                self.conn.sealWindow(len) catch |err| return self.fail(err);
+                n += len;
+                if (n >= buffered.len) break;
+            }
+            return w.consume(n);
+        }
+
+        /// What is buffered is already in place: as much of `data` as fits
+        /// joins it, and the window goes out as one record.
+        fn drainInPlace(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const self: *Writer = @fieldParentPtr("interface", w);
+            const total = Io.Writer.countSplat(data, splat);
+            const n = @min(w.buffer.len - w.end, total);
+            gather(w.buffer[w.end..][0..n], "", data, splat);
+            try self.seal(w.end + n);
+            return n;
+        }
+
+        /// The default rebase would drain with the preserved bytes hidden,
+        /// which seals the record ahead of them over their start. This
+        /// saves them, seals, and moves them to the front of the next
+        /// window.
+        fn rebaseInPlace(w: *Io.Writer, preserve: usize, minimum_len: usize) Io.Writer.Error!void {
+            const self: *Writer = @fieldParentPtr("interface", w);
+            while (w.buffer.len - w.end < minimum_len) {
+                const keep = @min(preserve, w.end);
+                const head = w.end - keep;
+                if (head == 0) return self.fail(error.TlsInternalError);
+                const tail = w.buffer[head..w.end];
+                var spill: [seal_spill]u8 = undefined;
+                const saved = @min(keep, spill.len);
+                @memcpy(spill[0..saved], tail[0..saved]);
+                try self.seal(head);
+                if (w.buffer.len < keep) return self.fail(error.TlsInternalError);
+                @memmove(w.buffer[saved..keep], tail[saved..]);
+                @memcpy(w.buffer[0..saved], spill[0..saved]);
+                w.end = keep;
+            }
+        }
+
+        /// Seals the first `len` bytes of the window and takes the next one.
+        fn seal(self: *Writer, len: usize) Io.Writer.Error!void {
+            self.conn.sealWindow(len) catch |err| return self.fail(err);
+            self.interface.buffer = try self.window();
+            self.interface.end = 0;
+        }
+
+        /// Seals what is buffered and sends everything sealed.
+        fn flush(w: *Io.Writer) Io.Writer.Error!void {
+            const self: *Writer = @fieldParentPtr("interface", w);
+            if (w.end > 0) {
+                if (w.vtable.drain == drainInPlace) {
+                    try self.seal(w.end);
+                } else {
+                    _ = try drain(w, &.{""}, 1);
+                }
+            }
+            self.conn.flushWrite() catch |err| return self.fail(err);
+        }
+    };
+
+    /// A cleartext writer with its own buffer; each drain copies into the
+    /// next record. One per connection, for the writing task.
+    pub fn writer(c: *Connection, buffer: []u8) Writer {
+        assert(c.write.keys != null);
+        return Writer.init(c, buffer);
+    }
+
+    /// A cleartext writer whose buffer is the next record's plaintext in
+    /// `output`, so what is written is copied once, to where it is sealed.
+    /// While it is in use nothing else may write to `output`, except
+    /// `close` after its last flush. Its buffer moves with each record and
+    /// must not be replaced. One per connection, for the writing task.
+    pub fn inPlaceWriter(c: *Connection) Writer {
+        assert(c.write.keys != null);
+        return Writer.initInPlace(c);
+    }
+};
+
+const testing = std.testing;
+const testu = @import("testu.zig");
+const key_schedule = @import("key_schedule.zig");
+
+/// Both ends of a connection with pre-derived keys, over a loopback
+/// socket: the peer runs as a concurrent task.
+const SelfTalk = struct {
+    io: Io,
+    loopback: testu.Loopback,
+    suite: proto.CipherSuite,
+
+    fn init(io: Io, suite: proto.CipherSuite) !SelfTalk {
+        return .{ .io = io, .loopback = try testu.Loopback.init(io), .suite = suite };
+    }
+
+    fn deinit(self: *SelfTalk) void {
+        self.loopback.deinit();
+    }
+
+    fn keys(self: *const SelfTalk, which: key_schedule.TrafficLabel) !cipher.Keys {
+        const ks = key_schedule.KeySchedule.init(cipher.suiteHash(self.suite).?);
+        return cipher.Keys.init(self.suite, ks.trafficSecret(which, "self-talk"));
+    }
+
+    /// One end, with its transport buffers; `deinit` before leaving the task.
+    const End = struct {
+        io: Io,
+        stream: Io.net.Stream,
+        input_buffer: [input_buffer_len]u8 = undefined,
+        output_buffer: [output_buffer_len]u8 = undefined,
+        input: Io.net.Stream.Reader = undefined,
+        output: Io.net.Stream.Writer = undefined,
+        conn: Connection = undefined,
+
+        fn setUp(end: *End, self: *const SelfTalk, side: proto.Side) !void {
+            end.input = end.stream.reader(end.io, &end.input_buffer);
+            end.output = end.stream.writer(end.io, &end.output_buffer);
+            end.conn = Connection.init(&end.input.interface, &end.output.interface);
+            end.conn.read.keys = try self.keys(if (side == .client) .server_application else .client_application);
+            end.conn.write.keys = try self.keys(if (side == .client) .client_application else .server_application);
+            end.conn.read.in_handshake = false;
+        }
+
+        fn deinit(end: *End) void {
+            end.conn.deinit();
+            end.stream.close(end.io);
+        }
+    };
+
+    fn client(self: *const SelfTalk, end: *End) !void {
+        end.* = .{ .io = self.io, .stream = try self.loopback.connect() };
+        errdefer end.stream.close(self.io);
+        try end.setUp(self, .client);
+    }
+
+    fn server(self: *SelfTalk, end: *End) !void {
+        end.* = .{ .io = self.io, .stream = try self.loopback.accept() };
+        errdefer end.stream.close(self.io);
+        try end.setUp(self, .server);
+    }
+};
+
+test "application data both ways, then close_notify" {
+    const io = testing.io;
+    for (proto.CipherSuite.all) |suite| {
+        var st = try SelfTalk.init(io, suite);
+        defer st.deinit();
+
+        const Peer = struct {
+            fn run(s: *SelfTalk) !void {
+                var end: SelfTalk.End = undefined;
+                try s.server(&end);
+                defer end.deinit();
+                var rbuf: [256]u8 = undefined;
+                var r = end.conn.reader(&rbuf);
+                var w = end.conn.inPlaceWriter();
+                while (try r.interface.takeDelimiter('\n')) |line| {
+                    try w.interface.print("echo: {s}\n", .{line});
+                    try w.interface.flush();
+                }
+                // The client's close_notify ends the stream; answer it.
+                try end.conn.close();
+            }
+        };
+        var peer = try io.concurrent(Peer.run, .{&st});
+        defer peer.cancel(io) catch {};
+
+        var end: SelfTalk.End = undefined;
+        try st.client(&end);
+        defer end.deinit();
+        var rbuf: [256]u8 = undefined;
+        var r = end.conn.reader(&rbuf);
+        var wbuf: [64]u8 = undefined;
+        var w = end.conn.writer(&wbuf);
+        for (0..10) |i| {
+            try w.interface.print("hello {d}\n", .{i});
+            try w.interface.flush();
+            var expected: [32]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "echo: hello {d}", .{i}), (try r.interface.takeDelimiter('\n')).?);
+        }
+        try end.conn.close();
+        try end.conn.close(); // idempotent
+        try w.interface.writeAll("after close"); // buffered, so not sent yet
+        try testing.expectError(error.WriteFailed, w.interface.flush());
+        try testing.expectEqual(error.TlsConnectionFailed, w.err.?);
+        try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+        try testing.expectEqual(null, r.err);
+        try testing.expectEqual(State.closed, end.conn.shared.read_state.load(.monotonic));
+        try peer.await(io);
+    }
+}
+
+test "large transfers through both writers, with small and swapped reader buffers" {
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .aes_128_gcm_sha256);
+    defer st.deinit();
+    const total = 300 * 1024;
+
+    const Peer = struct {
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            // A tiny reader buffer: every record is opened in place and
+            // handed out in pieces.
+            var rbuf: [100]u8 = undefined;
+            var r = end.conn.reader(&rbuf);
+            var w = end.conn.inPlaceWriter();
+            var received: usize = 0;
+            var next: u8 = 0;
+            while (received < total) {
+                const chunk = r.interface.peekGreedy(1) catch |err| {
+                    std.debug.print("peer read failed: {?}\n", .{r.err});
+                    return err;
+                };
+                for (chunk) |b| {
+                    try testing.expectEqual(next, b);
+                    next +%= 1;
+                }
+                received += chunk.len;
+                r.interface.toss(chunk.len);
+                // Echo in odd-sized writes so records fill at odd points.
+                try w.interface.writeAll(chunk);
+            }
+            try w.interface.flush();
+            try end.conn.close();
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    var w = end.conn.inPlaceWriter();
+    const Sender = struct {
+        fn run(wr: *Io.Writer) !void {
+            var pattern: [7919]u8 = undefined;
+            var next: u8 = 0;
+            var sent: usize = 0;
+            while (sent < total) {
+                const n = @min(pattern.len, total - sent);
+                for (pattern[0..n]) |*b| {
+                    b.* = next;
+                    next +%= 1;
+                }
+                try wr.writeAll(pattern[0..n]);
+                sent += n;
+            }
+            try wr.flush();
+        }
+    };
+    var sender = try io.concurrent(Sender.run, .{&w.interface});
+    defer sender.cancel(io) catch {};
+
+    // Read back through a big buffer first (records decrypt straight into
+    // it), then swap to a small one mid-stream, as an application may.
+    var big: [64 * 1024]u8 = undefined;
+    var small: [1024]u8 = undefined;
+    var r = end.conn.reader(&big);
+    var received: usize = 0;
+    var next: u8 = 0;
+    while (received < total) {
+        if (received > total / 2 and r.interface.buffer.ptr == &big) {
+            const buffered = r.interface.buffered();
+            @memcpy(small[0..buffered.len], buffered);
+            r.interface.buffer = &small;
+            r.interface.seek = 0;
+            r.interface.end = buffered.len;
+        }
+        const chunk = try r.interface.peekGreedy(1);
+        for (chunk) |b| {
+            try testing.expectEqual(next, b);
+            next +%= 1;
+        }
+        received += chunk.len;
+        r.interface.toss(chunk.len);
+    }
+    try sender.await(io);
+    try testing.expectEqual(error.EndOfStream, r.interface.peekGreedy(1));
+    try end.conn.close();
+    try peer.await(io);
+}
+
+test "key updates from both sides" {
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .chacha20_poly1305_sha256);
+    defer st.deinit();
+
+    const Peer = struct {
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            var rbuf: [256]u8 = undefined;
+            var r = end.conn.reader(&rbuf);
+            var w = end.conn.writer(&.{});
+            var count: usize = 0;
+            while (try r.interface.takeDelimiter('\n')) |line| {
+                try w.interface.writeAll(line);
+                try w.interface.writeByte('\n');
+                try w.interface.flush();
+                count += 1;
+                if (count == 2) try end.conn.requestKeyUpdate();
+            }
+            try end.conn.close();
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = end.conn.reader(&rbuf);
+    var w = end.conn.inPlaceWriter();
+    const write_gen0 = end.conn.write.keys.?.secret;
+    const read_gen0 = end.conn.read.keys.?.secret;
+    for (0..6) |i| {
+        if (i == 4) try end.conn.requestKeyUpdate();
+        try w.interface.print("message {d}\n", .{i});
+        try w.interface.flush();
+        var expected: [32]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "message {d}", .{i}), (try r.interface.takeDelimiter('\n')).?);
+    }
+    // The peer's request after its second reply rotated our write keys
+    // before message 3 went out; our request before message 4 rotated
+    // them again, and the peer's answer rotated its write keys, our read
+    // keys, twice in all.
+    try testing.expect(!std.mem.eql(u8, write_gen0.slice(), end.conn.write.keys.?.secret.slice()));
+    try testing.expect(!std.mem.eql(u8, read_gen0.slice(), end.conn.read.keys.?.secret.slice()));
+    const expected_write = key_schedule.nextTrafficSecret(.sha256, &key_schedule.nextTrafficSecret(.sha256, &write_gen0));
+    try testing.expectEqualSlices(u8, expected_write.slice(), end.conn.write.keys.?.secret.slice());
+    try end.conn.close();
+    try peer.await(io);
+}
+
+test "a bad record fails the reader, and the writer sends the alert" {
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .aes_256_gcm_sha384);
+    defer st.deinit();
+
+    const Peer = struct {
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            var rbuf: [256]u8 = undefined;
+            var r = end.conn.reader(&rbuf);
+            var w = end.conn.inPlaceWriter();
+            try w.interface.writeAll("fine\n");
+            try w.interface.flush();
+            // Corrupt the next record on the wire: seal it, then flip a bit.
+            const rec = try end.output.interface.writableSliceGreedy(cipher.Keys.sealedLen(5));
+            rec[cipher.header_len..][0..5].* = "oops\n".*;
+            try end.conn.write.keys.?.seal(rec[0..cipher.Keys.sealedLen(5)], .application_data, 5);
+            rec[cipher.header_len + 2] ^= 0x40;
+            end.output.interface.advance(cipher.Keys.sealedLen(5));
+            try end.output.interface.flush();
+            // The client's reader fails and its writer sends bad_record_mac.
+            try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+            try testing.expectEqual(error.TlsAlertBadRecordMac, r.err.?);
+            try w.interface.writeAll("more\n");
+            try testing.expectError(error.WriteFailed, w.interface.flush());
+            try testing.expectEqual(error.TlsAlertBadRecordMac, w.err.?);
+            try testing.expectError(error.TlsConnectionFailed, end.conn.close());
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = end.conn.reader(&rbuf);
+    var w = end.conn.writer(&.{});
+    try testing.expectEqualStrings("fine", (try r.interface.takeDelimiter('\n')).?);
+    try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+    try testing.expectEqual(error.TlsBadRecordMac, r.err.?);
+    try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+    try testing.expectEqual(error.TlsConnectionFailed, r.err.?);
+    // The writer learns of it, sends the alert, and fails with the cause.
+    try testing.expectError(error.WriteFailed, w.interface.writeAll("x")); // no buffer: drains at once
+    try testing.expectEqual(error.TlsBadRecordMac, w.err.?);
+    try testing.expectEqual(State.failed, end.conn.shared.write_state.load(.monotonic));
+    try peer.await(io);
+}
+
+test "transport ending without close_notify: clean at a record boundary, truncated inside one" {
+    const io = testing.io;
+    for ([_]bool{ false, true }) |strict| {
+        var st = try SelfTalk.init(io, .aes_128_gcm_sha256);
+        defer st.deinit();
+
+        const Peer = struct {
+            fn run(s: *SelfTalk, cut: bool) !void {
+                var end: SelfTalk.End = undefined;
+                try s.server(&end);
+                defer end.deinit();
+                var w = end.conn.inPlaceWriter();
+                try w.interface.writeAll("whole record\n");
+                try w.interface.flush();
+                if (cut) {
+                    const rec = try end.output.interface.writableSliceGreedy(cipher.Keys.sealedLen(4));
+                    rec[cipher.header_len..][0..4].* = "half".*;
+                    try end.conn.write.keys.?.seal(rec[0..cipher.Keys.sealedLen(4)], .application_data, 4);
+                    end.output.interface.advance(cipher.Keys.sealedLen(4) - 3);
+                    try end.output.interface.flush();
+                }
+                // Then just hang up.
+            }
+        };
+
+        for ([_]bool{ false, true }) |cut| {
+            var peer = try io.concurrent(Peer.run, .{ &st, cut });
+            defer peer.cancel(io) catch {};
+
+            var end: SelfTalk.End = undefined;
+            try st.client(&end);
+            defer end.deinit();
+            end.conn.strict_close_notify = strict;
+            var rbuf: [256]u8 = undefined;
+            var r = end.conn.reader(&rbuf);
+            try testing.expectEqualStrings("whole record", (try r.interface.takeDelimiter('\n')).?);
+            if (cut or strict) {
+                try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+                try testing.expectEqual(error.TlsConnectionTruncated, r.err.?);
+            } else {
+                try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+                // Nowhere to send close_notify: close does nothing.
+                try testing.expectEqual(State.closed, end.conn.shared.write_state.load(.monotonic));
+                try end.conn.close();
+            }
+            try peer.await(io);
+        }
+    }
+}
+
+test "concurrent reading and writing tasks on both ends" {
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .aes_128_gcm_sha256);
+    defer st.deinit();
+    const lines = 2000;
+
+    const Tasks = struct {
+        fn send(c: *Connection, tag: []const u8) !void {
+            var w = c.inPlaceWriter();
+            for (0..lines) |i| try w.interface.print("{s} {d}\n", .{ tag, i });
+            try w.interface.flush();
+            try c.close();
+        }
+        fn receive(c: *Connection, tag: []const u8) !void {
+            var rbuf: [512]u8 = undefined;
+            var r = c.reader(&rbuf);
+            var count: usize = 0;
+            while (try r.interface.takeDelimiter('\n')) |line| {
+                var expected: [32]u8 = undefined;
+                try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{s} {d}", .{ tag, count }), line);
+                count += 1;
+            }
+            try testing.expectEqual(lines, count);
+        }
+        fn peer(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            var sender = try s.io.concurrent(send, .{ &end.conn, "server" });
+            defer sender.cancel(s.io) catch {};
+            try receive(&end.conn, "client");
+            try sender.await(s.io);
+        }
+    };
+    var peer = try io.concurrent(Tasks.peer, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    var sender = try io.concurrent(Tasks.send, .{ &end.conn, "client" });
+    defer sender.cancel(io) catch {};
+    try Tasks.receive(&end.conn, "server");
+    try sender.await(io);
+    try peer.await(io);
+}

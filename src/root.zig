@@ -7,6 +7,7 @@ pub const protocol = @import("protocol.zig");
 pub const codec = @import("codec.zig");
 pub const key_schedule = @import("key_schedule.zig");
 pub const cipher = @import("cipher.zig");
+pub const connection = @import("connection.zig");
 
 test {
     std.testing.refAllDecls(@This());
