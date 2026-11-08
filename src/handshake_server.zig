@@ -241,7 +241,9 @@ fn selectAlpn(ours: []const []const u8, offered: ?[]const u8) Error!?[]const u8 
 
 fn parseClientHello(body: []const u8) Error!ClientHello {
     var d = codec.Decoder.init(body);
-    if (try d.decode(proto.Version) != .tls_1_2) return error.TlsProtocolVersion;
+    // legacy_version plays no part once supported_versions is there
+    // (§4.2.1), and that extension is required below.
+    _ = try d.decode(proto.Version);
     _ = try d.array(32); // random
     const session_id = try d.vectorBytes(u8);
     if (session_id.len > 32) return error.TlsDecodeError;
@@ -334,6 +336,9 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                     hello.server_name = name;
                 }
             },
+            // 0-RTT is not supported, and the client's early data could
+            // not be skipped; Go refuses it the same way.
+            .early_data => return error.TlsUnsupportedExtension,
             .application_layer_protocol_negotiation => {
                 hello.alpn = try data.vectorBytes(u16);
                 // Each name is 1 to 255 bytes, and there is at least one.
@@ -468,41 +473,55 @@ test "parsing the example ClientHello" {
     try testing.expect(!hello.has_cookie);
 }
 
+/// A minimal ClientHello body for the parser: one suite, x25519 and no
+/// share, so a retry would be needed.
+fn testClientHello(buf: []u8, o: struct { version: proto.Version = .tls_1_2, name: ?[]const u8 = null, early_data: bool = false }) ![]const u8 {
+    var w = codec.Writer.init(buf);
+    try w.enumValue(o.version);
+    const zeros: [32]u8 = @splat(0);
+    try w.slice(&zeros);
+    try w.vector(u8, &.{});
+    try w.vector(u16, &.{ 0x13, 0x01 });
+    try w.vector(u8, &.{0});
+    const ext = try w.beginLength(u16);
+    try w.enumValue(proto.Extension.supported_versions);
+    try w.vector(u16, &.{ 2, 3, 4 });
+    try w.enumValue(proto.Extension.supported_groups);
+    try w.vector(u16, &.{ 0, 2, 0, 0x1d });
+    try w.enumValue(proto.Extension.key_share);
+    try w.vector(u16, &.{ 0, 0 });
+    if (o.name) |name| {
+        try w.enumValue(proto.Extension.server_name);
+        const sni = try w.beginLength(u16);
+        const list = try w.beginLength(u16);
+        try w.byte(0);
+        try w.vector(u16, name);
+        try list.end(&w);
+        try sni.end(&w);
+    }
+    if (o.early_data) {
+        try w.enumValue(proto.Extension.early_data);
+        try w.vector(u16, &.{});
+    }
+    try ext.end(&w);
+    return w.written();
+}
+
 test "server names: a trailing dot is dropped, IP literals and NULs are refused" {
-    const Build = struct {
-        fn hello(buf: []u8, name: []const u8) ![]const u8 {
-            var w = codec.Writer.init(buf);
-            try w.enumValue(proto.Version.tls_1_2);
-            const zeros: [32]u8 = @splat(0);
-            try w.slice(&zeros);
-            try w.vector(u8, &.{});
-            try w.vector(u16, &.{ 0x13, 0x01 });
-            try w.vector(u8, &.{0});
-            const ext = try w.beginLength(u16);
-            try w.enumValue(proto.Extension.supported_versions);
-            try w.vector(u16, &.{ 2, 3, 4 });
-            try w.enumValue(proto.Extension.supported_groups);
-            try w.vector(u16, &.{ 0, 2, 0, 0x1d });
-            try w.enumValue(proto.Extension.key_share);
-            try w.vector(u16, &.{ 0, 0 }); // no shares: a retry would be needed
-            try w.enumValue(proto.Extension.server_name);
-            const sni = try w.beginLength(u16);
-            const list = try w.beginLength(u16);
-            try w.byte(0);
-            try w.vector(u16, name);
-            try list.end(&w);
-            try sni.end(&w);
-            try ext.end(&w);
-            return w.written();
-        }
-    };
     var buf: [512]u8 = undefined;
-    try testing.expectEqualStrings("example.com", (try parseClientHello(try Build.hello(&buf, "example.com."))).server_name.?);
-    try testing.expectEqualStrings("example.com", (try parseClientHello(try Build.hello(&buf, "example.com"))).server_name.?);
-    try testing.expectEqual(null, (try parseClientHello(try Build.hello(&buf, "10.0.0.1"))).server_name);
-    try testing.expectEqual(null, (try parseClientHello(try Build.hello(&buf, "::1"))).server_name);
-    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try Build.hello(&buf, "exa\x00mple.com")));
-    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try Build.hello(&buf, ".")));
+    try testing.expectEqualStrings("example.com", (try parseClientHello(try testClientHello(&buf, .{ .name = "example.com." }))).server_name.?);
+    try testing.expectEqualStrings("example.com", (try parseClientHello(try testClientHello(&buf, .{ .name = "example.com" }))).server_name.?);
+    try testing.expectEqual(null, (try parseClientHello(try testClientHello(&buf, .{ .name = "10.0.0.1" }))).server_name);
+    try testing.expectEqual(null, (try parseClientHello(try testClientHello(&buf, .{ .name = "::1" }))).server_name);
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try testClientHello(&buf, .{ .name = "exa\x00mple.com" })));
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try testClientHello(&buf, .{ .name = "." })));
+}
+
+test "legacy_version is ignored, early_data is refused" {
+    var buf: [512]u8 = undefined;
+    _ = try parseClientHello(try testClientHello(&buf, .{ .version = @enumFromInt(0x0301) }));
+    _ = try parseClientHello(try testClientHello(&buf, .{ .version = .tls_1_3 }));
+    try testing.expectError(error.TlsUnsupportedExtension, parseClientHello(try testClientHello(&buf, .{ .early_data = true })));
 }
 
 test "ALPN selection follows the server's order and refuses an offer with nothing in common" {
