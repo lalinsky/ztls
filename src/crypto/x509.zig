@@ -7,6 +7,7 @@ const c = @import("c");
 const err = @import("err.zig");
 const pem = @import("pem.zig");
 const sig = @import("sig.zig");
+const Bundle = std.crypto.Certificate.Bundle;
 
 const log = std.log.scoped(.ztls);
 
@@ -118,6 +119,32 @@ pub const TrustStore = struct {
             count += 1;
         }
         return count;
+    }
+
+    /// Adds every certificate in `bundle`, which does the loading: it
+    /// knows where each platform keeps its roots (`Bundle.rescan`) and
+    /// reads files through `std.Io`. Returns how many were added.
+    pub fn addBundle(self: *TrustStore, bundle: *const Bundle) error{ InvalidCertificate, CryptoFailed }!usize {
+        var count: usize = 0;
+        var it = bundle.map.valueIterator();
+        while (it.next()) |start| {
+            // Each entry is the offset of a DER certificate in `bytes`; its
+            // length is in its own header.
+            const element = std.crypto.Certificate.der.Element.parse(bundle.bytes.items, start.*) catch return error.InvalidCertificate;
+            try self.addDer(bundle.bytes.items[start.*..element.slice.end]);
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Adds the roots the system trusts, found as `Bundle.rescan` finds
+    /// them. Roots already expired are left out. Returns how many were
+    /// added.
+    pub fn addSystemBundle(self: *TrustStore, gpa: std.mem.Allocator, io: std.Io) (Bundle.RescanError || error{ InvalidCertificate, CryptoFailed })!usize {
+        var bundle: Bundle = .empty;
+        defer bundle.deinit(gpa);
+        try bundle.rescan(gpa, io, std.Io.Clock.real.now(io));
+        return self.addBundle(&bundle);
     }
 };
 
@@ -283,6 +310,39 @@ test "a chain through an intermediate" {
     defer store2.deinit();
     _ = try store2.addPem(testing.allocator, pki.intermediate);
     try verify(&store2, chain[0..1], .{ .now = valid_now, .purpose = .server, .host = "localhost" });
+}
+
+test "a std.crypto.Certificate.Bundle as the source of roots" {
+    var bundle: Bundle = .empty;
+    defer bundle.deinit(testing.allocator);
+    for ([_][]const u8{ pki.ca, pki.intermediate }) |text| {
+        var it = pem.Iterator.init(text);
+        const block = (try it.next()).?;
+        const start: u32 = @intCast(bundle.bytes.items.len);
+        const dest = try bundle.bytes.addManyAsSlice(testing.allocator, block.decodedSizeUpperBound());
+        bundle.bytes.items.len = start + (try block.decode(dest)).len;
+        try bundle.parseCert(testing.allocator, start, valid_now);
+    }
+    try testing.expectEqual(2, bundle.map.count());
+
+    var store = try TrustStore.init();
+    defer store.deinit();
+    try testing.expectEqual(2, try store.addBundle(&bundle));
+
+    var cert = try Certificate.parsePem(testing.allocator, pki.server_ec);
+    defer cert.deinit();
+    try verify(&store, &.{cert}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
+}
+
+test "the system's roots" {
+    var store = try TrustStore.init();
+    defer store.deinit();
+    const count = store.addSystemBundle(testing.allocator, testing.io) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    // Every system has some roots, and AWS-LC accepts all that std does.
+    try testing.expect(count > 0);
 }
 
 test "untrusted and client certificates" {

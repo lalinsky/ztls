@@ -76,7 +76,7 @@ A client:
 ```zig
 var trust = try ztls.TrustStore.init();
 defer trust.deinit();
-_ = try trust.addPem(gpa, ca_pem);
+_ = try trust.addSystemBundle(gpa, io); // or addPem(gpa, ca_pem)
 
 var conn = try ztls.client(&input.interface, &output.interface, .{
     .allocator = gpa,
@@ -131,8 +131,10 @@ of stream, as with tls.zig; `strict_close_notify` makes it a truncation.
 `CertKeyPair.fromSlice` takes a PEM chain (leaf first) and a PEM private
 key (PKCS#8, SEC 1 or PKCS#1). `TrustStore.addPem` and `addDer` take
 certificates; any certificate in the store is a trust anchor, an
-intermediate included. Reading files, finding system roots and the like is
-the application's job, through its own `std.Io`.
+intermediate included. `addSystemBundle` loads the roots the system
+trusts and `addBundle` takes any `std.crypto.Certificate.Bundle`, so files
+and system stores are read by std, through your `std.Io`, and AWS-LC only
+ever sees bytes.
 
 A server can hold several certificates: `certificates` are tried for the
 client's server name and the signature algorithms it accepts, and
