@@ -1,34 +1,34 @@
 # ztls
 
 A TLS 1.3 library for Zig, built on [AWS-LC](https://github.com/aws/aws-lc)'s
-libcrypto. It speaks TLS 1.3 only, on both the client and the server side,
-over any `std.Io.Reader` and `std.Io.Writer`, and hands back a cleartext
-reader and writer of the same kind.
+libcrypto. It runs over any `std.Io.Reader` and `std.Io.Writer` and hands
+back a cleartext reader and writer of the same kind, on both the client and
+the server side.
 
-It exists for servers and clients on [zio](https://github.com/lalinsky/zio),
-such as [Dusty](https://github.com/lalinsky/dusty), where fibers may move
-between threads and a connection is read by one task and written by another.
-Everything cryptographic, X.509 included, is AWS-LC's; the protocol is Zig.
+It was written for servers and clients on [zio](https://github.com/lalinsky/zio),
+such as [Dusty](https://github.com/lalinsky/dusty), where fibers move between
+threads and a connection is read by one task and written by another. AWS-LC
+does the cryptography and the X.509 work; the protocol is implemented in Zig.
 
 Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system, with no
 CMake, Perl or Go.
 
-## What it does
+## Features
 
-- TLS 1.3 client and server (RFC 8446), with no TLS 1.2.
+- Client and server per RFC 8446. Older protocol versions are refused with a
+  protocol_version alert.
 - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305.
 - X25519MLKEM768, X25519, P-256 and P-384 key exchange, with
   HelloRetryRequest on both sides.
 - ECDSA (P-256, P-384, P-521), RSA-PSS and Ed25519 signatures.
 - Server name indication, with the server's certificate picked by name;
   ALPN; client certificates, requested or required.
-- Certificate verification through AWS-LC's X.509 code, against a trust
-  store the application builds from PEM or DER bytes. ztls never reads a
-  file itself.
-- KeyUpdate in both directions; close_notify; precise errors.
+- Certificate verification by AWS-LC's X.509 code, against a trust store
+  built from PEM or DER, from files, or from the system's roots.
+- KeyUpdate in both directions and close_notify.
 
-Not yet: session resumption, 0-RTT, post-handshake client authentication.
-A peer that only speaks TLS 1.2 gets a protocol_version alert.
+Missing features are tracked in the
+[issues](https://github.com/lalinsky/ztls/issues).
 
 ## Using it
 
@@ -59,10 +59,10 @@ var conn = try ztls.server(&input.interface, &output.interface, .{
     .alpn_protocols = &.{ "h2", "http/1.1" },
     .now = std.Io.Clock.real.now(io),
 });
-defer conn.deinit(); // after both tasks are done; sends nothing
+defer conn.deinit(); // after both tasks are done
 
-var reader = conn.reader(&read_buffer); // a plain reader buffer, yours
-var writer = conn.inPlaceWriter();      // writes land where they are sealed
+var reader = conn.reader(&read_buffer); // an ordinary reader buffer
+var writer = conn.inPlaceWriter();      // encrypts inside the transport buffer
 
 while (try reader.interface.takeDelimiter('\n')) |line| {
     try writer.interface.print("echo: {s}\n", .{line});
@@ -86,60 +86,49 @@ var conn = try ztls.client(&input.interface, &output.interface, .{
 });
 ```
 
-`conn.alpn_protocol` is what ALPN agreed on, pointing into your own list.
+`conn.alpn_protocol` is the protocol ALPN agreed on.
 
 ### Reading and writing
 
 After the handshake the two directions are independent: one task may read
-through `reader` while another writes through `writer` or `inPlaceWriter`,
-with no lock between them. The read side never writes to the transport. An
-alert for a failure found while reading, or a KeyUpdate the peer asked for,
-goes out with the write side's next record.
+while another writes, with no lock between them. The read side never writes
+to the transport. An alert for a failure found while reading, or a KeyUpdate
+the peer asked for, goes out with the next written record.
 
-The transport reader's buffer must hold a whole record
-(`input_buffer_len`), the writer's a whole sealed record
-(`output_buffer_len`). The buffer given to `reader` is an ordinary
-`std.Io.Reader` buffer that the application owns and may swap at any time;
-records are decrypted straight into it when it has room, otherwise in place
-in the transport buffer and handed out in pieces. `inPlaceWriter` has no
-buffer of its own: what is written goes into the next record's plaintext
-inside the transport buffer and is sealed there.
+The transport buffers must hold a whole record: `input_buffer_len` for the
+reader and `output_buffer_len` for the writer. The buffer given to `reader`
+is an ordinary `std.Io.Reader` buffer owned by the application.
+`inPlaceWriter` has no buffer of its own and seals records inside the
+transport buffer. The `Connection` must not move once readers or writers
+exist.
 
-The `Connection` must not move once readers or writers exist.
-
-The handshake keeps its working buffers on the stack of the task that runs
-it (its own are around 16 KiB; AWS-LC's ML-KEM adds its own on top) and
-reassembles the peer's messages through the `allocator` in the options, up
-to `max_handshake_message_len` (64 KiB by default) for the certificate
-chain. Budget 64 KiB of stack for a task that runs handshakes.
+The handshake keeps about 16 KiB on the stack of the task that runs it, plus
+AWS-LC's ML-KEM working memory, so budget 64 KiB of stack for such a task.
+The peer's handshake messages are reassembled through the `allocator` in the
+options, up to `max_handshake_message_len`.
 
 ### Errors
 
-`std.Io.Reader` and `std.Io.Writer` can only report `ReadFailed` and
-`WriteFailed`. The `err` field of the reader or writer says what happened:
-an alert the peer sent (`TlsAlert...`), something the record layer found
-(`TlsBadRecordMac`, `TlsConnectionTruncated`, ...), or `ReadFailed` or
-`WriteFailed` when the transport itself failed and its own error says why.
-A peer certificate we reject is reported under std's names
-(`CertificateIssuerNotFound`, `CertificateExpired`, ...).
-A transport `ReadFailed`, such as a cancelled read, does not end the
-connection; the read may be retried.
+`std.Io.Reader` and `std.Io.Writer` only report `ReadFailed` and
+`WriteFailed`. The `err` field of the ztls reader or writer has the cause:
+an alert the peer sent (`TlsAlert...`), a record layer error
+(`TlsBadRecordMac`, `TlsConnectionTruncated`, ...), a rejected peer
+certificate under std's names (`CertificateIssuerNotFound`,
+`CertificateExpired`, ...), or `ReadFailed` or `WriteFailed` when the
+transport itself failed. A transport `ReadFailed`, such as a cancelled read,
+does not end the connection and the read may be retried.
 
 A transport that ends between records without close_notify is a clean end
-of stream, as with tls.zig; `strict_close_notify` makes it a truncation.
+of stream; `strict_close_notify` makes it an error.
 
 ### Certificates and trust
 
-`CertKeyPair.fromFilePath` and `fromSlice` take a PEM chain (leaf first)
-and a PEM private key (PKCS#8, SEC 1 or PKCS#1). `TrustStore.addPem` and `addDer` take
-certificates; any certificate in the store is a trust anchor, an
-intermediate included. `addSystemBundle` loads the roots the system
-trusts through your `std.Io`; `addPemFile`, `addPemDir` and `addBundle`
-(for a `std.crypto.Certificate.Bundle`) are the pieces it is made of.
-
-A server can hold several certificates: `certificates` are tried for the
-client's server name and the signature algorithms it accepts, and
-`select_certificate` lets the application decide first.
+`CertKeyPair` takes a PEM chain, leaf first, and a PEM private key, from
+files or from memory. `TrustStore` takes certificates from PEM or DER, from
+files or directories, or from the system's root store; every certificate in
+it is a trust anchor. A server may hold several certificates, chosen by the
+client's server name and signature algorithms, or by a `select_certificate`
+callback.
 
 ## Development
 
