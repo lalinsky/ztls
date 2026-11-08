@@ -43,7 +43,7 @@ pub const CertKeyPair = struct {
     pub fn fromFilePath(allocator: Allocator, io: std.Io, dir: std.Io.Dir, cert_path: []const u8, key_path: []const u8) FileError!CertKeyPair {
         const cert_pem = try dir.readFileAlloc(io, cert_path, allocator, .limited(max_file_len));
         defer allocator.free(cert_pem);
-        const key_pem = try dir.readFileAlloc(io, key_path, allocator, .limited(max_file_len));
+        const key_pem = try readSecretFile(allocator, io, dir, key_path);
         defer {
             std.crypto.secureZero(u8, key_pem);
             allocator.free(key_pem);
@@ -51,7 +51,40 @@ pub const CertKeyPair = struct {
         return fromSlice(allocator, cert_pem, key_pem);
     }
 
-    /// `fromFilePath` with absolute paths.
+    /// Reads a whole file of at most `max_file_len` bytes, wiping every
+    /// buffer the contents pass through on the way, which `readFileAlloc`
+    /// does not promise when it has to grow one: a key may come from a
+    /// pipe or a secret manager's pseudo-file whose size is not known up
+    /// front.
+    fn readSecretFile(allocator: Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) FileError![]u8 {
+        const file = try dir.openFile(io, sub_path, .{});
+        defer file.close(io);
+        var reader = file.reader(io, &.{});
+
+        var buf = try allocator.alloc(u8, 4096);
+        defer {
+            std.crypto.secureZero(u8, buf);
+            allocator.free(buf);
+        }
+        var len: usize = 0;
+        while (true) {
+            len += reader.interface.readSliceShort(buf[len..]) catch return reader.err.?;
+            // A short read is the end of the file.
+            if (len < buf.len) break;
+            if (buf.len > max_file_len) return error.StreamTooLong;
+            const bigger = try allocator.alloc(u8, @min(buf.len * 2, max_file_len + 1));
+            @memcpy(bigger[0..len], buf);
+            std.crypto.secureZero(u8, buf);
+            allocator.free(buf);
+            buf = bigger;
+        }
+        const exact = try allocator.alloc(u8, len);
+        @memcpy(exact, buf[0..len]);
+        return exact;
+    }
+
+    /// `fromFilePath` with absolute paths, which the caller has checked, as
+    /// with std's own `Absolute` functions.
     pub fn fromFilePathAbsolute(allocator: Allocator, io: std.Io, cert_path: []const u8, key_path: []const u8) FileError!CertKeyPair {
         std.debug.assert(std.Io.Dir.path.isAbsolute(cert_path));
         std.debug.assert(std.Io.Dir.path.isAbsolute(key_path));
@@ -238,6 +271,17 @@ test "CertKeyPair from files" {
     try testing.expectError(error.KeyMismatch, CertKeyPair.fromFilePath(testing.allocator, io, tmp.dir, "chain.pem", "other.key"));
     try testing.expectError(error.FileNotFound, CertKeyPair.fromFilePath(testing.allocator, io, tmp.dir, "chain.pem", "missing.key"));
     try testing.expectError(error.FileNotFound, CertKeyPair.fromFilePath(testing.allocator, io, tmp.dir, "missing.pem", "key.pem"));
+
+    // A key file past the first buffer, and one past the limit.
+    const padding: [5000]u8 = @splat('\n');
+    try tmp.dir.writeFile(io, .{ .sub_path = "padded.key", .data = &padding ++ @embedFile("testdata/pki/server-chain.key") });
+    var padded = try CertKeyPair.fromFilePath(testing.allocator, io, tmp.dir, "chain.pem", "padded.key");
+    defer padded.deinit(testing.allocator);
+    const huge = try testing.allocator.alloc(u8, CertKeyPair.max_file_len + 1);
+    defer testing.allocator.free(huge);
+    @memset(huge, '\n');
+    try tmp.dir.writeFile(io, .{ .sub_path = "huge.key", .data = huge });
+    try testing.expectError(error.StreamTooLong, CertKeyPair.fromFilePath(testing.allocator, io, tmp.dir, "chain.pem", "huge.key"));
 }
 
 test "CertKeyPair refuses a key that is not the leaf's, and no certificate" {
