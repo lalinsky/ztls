@@ -465,6 +465,34 @@ test "an empty host is a misconfiguration unless verification is off" {
     }));
 }
 
+const data13 = @import("testdata/tls13.zig");
+
+test "change_cipher_spec before the ClientHello or between its fragments is refused" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    const ccs = [_]u8{ @intFromEnum(proto.ContentType.change_cipher_spec), 3, 3, 0, 1, 1 };
+    const hello = data13.client_hello;
+    // The same ClientHello in two records with the CCS between them.
+    const split = [_]u8{ @intFromEnum(proto.ContentType.handshake), 3, 1, 0, 100 } ++ hello[5..105].* ++ ccs ++
+        [_]u8{ @intFromEnum(proto.ContentType.handshake), 3, 3, 0, 148 } ++ hello[105..].*;
+    const cases = [_][]const u8{ &(ccs ++ hello), &split };
+    for (cases) |bytes| {
+        var run: Run = .{ .loopback = undefined };
+        try run.start(io, .{ .allocator = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
+        {
+            var t: Transport = .{ .io = io, .stream = try run.loopback.connect() };
+            defer t.deinit();
+            t.setUp();
+            try t.output.interface.writeAll(bytes);
+            try t.output.interface.flush();
+            t.lingerClose();
+        }
+        const outcome = try run.finish(io);
+        try testing.expectError(error.TlsUnexpectedMessage, outcome.handshake);
+    }
+}
+
 test "a peer that hangs up during the handshake" {
     const io = testing.io;
     var pki = try Pki.init();

@@ -70,6 +70,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     defer shares.deinit();
     try writeClientHello(h, opt, &random, &session_id, &shares, opt.key_shares, null);
     try h.flush();
+    h.ccs_allowed = true;
 
     var msg = try h.nextMessage();
     try h.expect(msg, .server_hello);
@@ -178,7 +179,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 
     try h.installReadKeys(ap.server);
     try h.installWriteKeys(ap.client);
-    h.conn.read.in_handshake = false;
+    h.conn.read.accept_ccs = false;
     h.conn.alpn_protocol = alpn;
     h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
     h.conn.strict_close_notify = opt.strict_close_notify;

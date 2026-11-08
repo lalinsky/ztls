@@ -82,6 +82,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
 
     var msg = try h.nextMessage();
     try h.expect(msg, .client_hello);
+    h.ccs_allowed = true;
     try h.expectFlightEnd();
     var hello = try parseClientHello(msg.body);
     const auth = try selectCertificate(&hello, opt);
@@ -174,7 +175,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     h.hashMessage(msg);
 
     try h.installReadKeys(ap.client);
-    h.conn.read.in_handshake = false;
+    h.conn.read.accept_ccs = false;
     h.conn.alpn_protocol = choices.alpn;
     h.conn.strict_close_notify = opt.strict_close_notify;
 }

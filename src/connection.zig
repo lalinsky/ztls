@@ -110,8 +110,9 @@ pub const Connection = struct {
         /// change_cipher_spec records and warning alerts seen, each capped.
         ccs_records: u32 = 0,
         warning_alerts: u32 = 0,
-        /// change_cipher_spec is tolerated until the handshake is over.
-        in_handshake: bool = true,
+        /// Whether a change_cipher_spec may arrive: the handshake says so
+        /// while §5 allows one, never afterwards.
+        accept_ccs: bool = false,
     };
 
     /// Touched by the writing task only.
@@ -222,8 +223,8 @@ pub const Connection = struct {
                     },
                     .change_cipher_spec => {
                         // Middlebox compatibility (§5): one byte of 0x01,
-                        // dropped, but only until the handshake is done.
-                        if (!c.read.in_handshake or body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
+                        // dropped, where the handshake allows it.
+                        if (!c.read.accept_ccs or body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
                         try c.countChangeCipherSpec();
                         continue;
                     },
@@ -242,7 +243,7 @@ pub const Connection = struct {
                         return .{ .content_type = content_type, .payload = body };
                     },
                     .change_cipher_spec => {
-                        if (body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
+                        if (!c.read.accept_ccs or body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
                         try c.countChangeCipherSpec();
                         continue;
                     },
@@ -894,7 +895,6 @@ const SelfTalk = struct {
             end.conn = Connection.init(&end.input.interface, &end.output.interface);
             end.conn.read.keys = try self.keys(if (side == .client) .server_application else .client_application);
             end.conn.write.keys = try self.keys(if (side == .client) .client_application else .server_application);
-            end.conn.read.in_handshake = false;
         }
 
         fn deinit(end: *End) void {

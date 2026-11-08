@@ -242,6 +242,9 @@ pub const Handshake = struct {
     /// Received handshake bytes not yet taken as messages.
     inbox: std.ArrayList(u8) = .empty,
     inbox_pos: usize = 0,
+    /// A change_cipher_spec may arrive once the first ClientHello has been
+    /// sent or received (§5).
+    ccs_allowed: bool = false,
 
     pub fn init(conn: *Connection, allocator: Allocator, max_message_len: usize) Handshake {
         return .{
@@ -292,6 +295,9 @@ pub const Handshake = struct {
             h.inbox.shrinkRetainingCapacity(kept);
             h.inbox_pos = 0;
         }
+        // Not between the fragments of a message: nothing may come between
+        // those (§5.1).
+        h.conn.read.accept_ccs = h.ccs_allowed and h.inbox.items.len == 0;
         while (true) {
             const record = h.conn.readRecord(null) catch |err| switch (err) {
                 error.EndOfStream => return error.EndOfStream,
