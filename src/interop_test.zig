@@ -228,7 +228,7 @@ test "our client against openssl s_server" {
     };
     var trust = try ztls.TrustStore.init();
     defer trust.deinit();
-    _ = try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+    try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     var client_pair = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/client.pem"), @embedFile("testdata/pki/client.key"));
     defer client_pair.deinit(testing.allocator);
 
@@ -361,7 +361,7 @@ test "openssl s_client against our server" {
     };
     var trust = try ztls.TrustStore.init();
     defer trust.deinit();
-    _ = try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+    try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     var ec = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
     defer ec.deinit(testing.allocator);
     var rsa = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
@@ -466,7 +466,7 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
     try requireGo(io);
     var trust = try ztls.TrustStore.init();
     defer trust.deinit();
-    _ = try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+    try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     var client_pair = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/client.pem"), @embedFile("testdata/pki/client.key"));
     defer client_pair.deinit(testing.allocator);
 
@@ -538,7 +538,7 @@ test "Go's crypto/tls against our server, with X25519MLKEM768" {
     try requireGo(io);
     var trust = try ztls.TrustStore.init();
     defer trust.deinit();
-    _ = try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+    try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     var ec = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
     defer ec.deinit(testing.allocator);
 

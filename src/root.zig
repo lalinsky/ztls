@@ -80,7 +80,7 @@ const Pki = struct {
     fn init() !Pki {
         var ca = try TrustStore.init();
         errdefer ca.deinit();
-        _ = try ca.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+        try ca.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
         return .{
             .ca = ca,
             .server_ec = try pair("server-ec"),

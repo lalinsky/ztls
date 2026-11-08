@@ -724,7 +724,7 @@ test "certificate, certificate verify and finished round-trip through records" {
     try testing.expectEqual(sig.KeyType{ .ecdsa = .p384 }, peer.public_key.key_type);
     var store = try x509.TrustStore.init();
     defer store.deinit();
-    _ = try store.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+    try store.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     try receiver.verifyChain(&peer, &store, .server, "localhost", 1_800_000_000);
     try receiver.verifyChain(&peer, &store, .server, "127.0.0.1", 1_800_000_000);
     try testing.expectError(error.CertificateHostMismatch, receiver.verifyChain(&peer, &store, .server, "example.org", 1_800_000_000));

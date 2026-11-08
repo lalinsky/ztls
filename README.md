@@ -76,7 +76,7 @@ A client:
 ```zig
 var trust = try ztls.TrustStore.init();
 defer trust.deinit();
-_ = try trust.addSystemBundle(gpa, io); // or addPem(gpa, ca_pem)
+try trust.addSystemBundle(gpa, io); // or addPem(gpa, ca_pem)
 
 var conn = try ztls.client(&input.interface, &output.interface, .{
     .allocator = gpa,
