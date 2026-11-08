@@ -9,11 +9,19 @@ cd "$(dirname "$0")/../.."
 
 : "${ZIG:=zig}"
 : "${BORINGSSL:=.bogo/boringssl}"
-: "${BORINGSSL_REV:=main}"
+# Pinned: the runner's tests change, and so would the counts below.
+: "${BORINGSSL_REV:=0131ae9d78e42fcc2c1811315e62410ad96d8230}"
+# Passes with the pinned runner; fewer means tests slipped from passing to
+# unimplemented or failed, which -allow-unimplemented alone would hide.
+: "${MIN_PASS:=340}"
 
 if [ ! -d "$BORINGSSL" ]; then
     mkdir -p "$(dirname "$BORINGSSL")"
-    git clone --depth 1 --branch "$BORINGSSL_REV" https://boringssl.googlesource.com/boringssl "$BORINGSSL"
+    git clone https://boringssl.googlesource.com/boringssl "$BORINGSSL"
+fi
+if [ "$(git -C "$BORINGSSL" rev-parse HEAD)" != "$BORINGSSL_REV" ]; then
+    git -C "$BORINGSSL" fetch -q origin "$BORINGSSL_REV"
+    git -C "$BORINGSSL" checkout -q "$BORINGSSL_REV"
 fi
 
 "$ZIG" build bogo-shim
@@ -21,4 +29,13 @@ shim="$PWD/zig-out/bin/bogo-shim"
 config="$PWD/tests/bogo/config.json"
 
 cd "$BORINGSSL/ssl/test/runner"
-exec go test -shim-path "$shim" -shim-config "$config" -allow-unimplemented -pipe "$@"
+output=$(mktemp)
+trap 'rm -f "$output"' EXIT
+go test -shim-path "$shim" -shim-config "$config" -allow-unimplemented -pipe "$@" | tee "$output"
+status=${PIPESTATUS[0]}
+passed=$(grep -c '^PASSED (' "$output" || true)
+if [ $# -eq 0 ] && [ "$passed" -lt "$MIN_PASS" ]; then
+    echo "only $passed tests passed, expected at least $MIN_PASS" >&2
+    exit 1
+fi
+exit "$status"

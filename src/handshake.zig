@@ -468,9 +468,6 @@ pub const Handshake = struct {
         };
     }
 
-    /// A key change must fall on a record boundary (§5.1): a message
-    /// already received under the old keys that would be read under the
-    /// new ones is a violation.
     /// A flight has been read in full: handshake data beyond it in the
     /// same record is the peer getting ahead of what it can know, and is
     /// refused (as with a key change).
@@ -478,6 +475,9 @@ pub const Handshake = struct {
         if (h.inbox_pos != h.inbox.items.len) return error.TlsUnexpectedMessage;
     }
 
+    /// A key change must fall on a record boundary (§5.1): a message
+    /// already received under the old keys that would be read under the
+    /// new ones is a violation.
     pub fn installReadKeys(h: *Handshake, secret: Secret) Error!void {
         if (h.inbox_pos != h.inbox.items.len) return error.TlsUnexpectedMessage;
         if (h.conn.read.keys) |*old| old.deinit();

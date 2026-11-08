@@ -177,6 +177,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     try h.installWriteKeys(ap.client);
     h.conn.read.in_handshake = false;
     h.conn.alpn_protocol = alpn;
+    h.conn.setServerName(if (isIpLiteral(opt.host)) null else opt.host);
     h.conn.strict_close_notify = opt.strict_close_notify;
 }
 
@@ -321,10 +322,11 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: *const [32
 
 /// A repeated extension type is a malformed block (§4.2), whatever the
 /// type, so the whole block is checked before any extension is read.
-/// Servers send a handful, so a short list does.
+/// Servers send a handful of extensions, so a block past the list is
+/// taken as malformed too.
 fn checkNoDuplicates(extensions: codec.Decoder, err: Error) Error!void {
     var d = extensions;
-    var codes: [16]u16 = undefined;
+    var codes: [32]u16 = undefined;
     var len: usize = 0;
     while (!d.eof()) {
         const code = @intFromEnum(try d.decode(proto.Extension));

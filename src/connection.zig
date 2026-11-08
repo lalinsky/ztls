@@ -151,7 +151,8 @@ pub const Connection = struct {
         c.* = undefined;
     }
 
-    /// The name a client asked for through SNI, as the server saw it.
+    /// The name in SNI: what a client asked for, as the server saw it, or
+    /// what the client sent (none for an IP literal).
     pub fn serverName(c: *const Connection) ?[]const u8 {
         return if (c.server_name_len == 0) null else c.server_name_buf[0..c.server_name_len];
     }
@@ -319,14 +320,8 @@ pub const Connection = struct {
                     }
                     const alert = proto.Alert.decode(record.payload[0..2]);
                     if (alert.toError()) |err| {
-                        // A warning level on anything but close_notify or
-                        // user_canceled is malformed in TLS 1.3 (§6), and
-                        // the peer, not closing, can be told so.
-                        if (level == 1) {
-                            c.failRead(error.TlsDecodeError);
-                            return error.TlsDecodeError;
-                        }
-                        // The peer's failure: it will not read an alert back.
+                        // The peer's failure, whatever level it claims
+                        // (§6): it will not read an alert back.
                         c.failRead(err);
                         return err;
                     }

@@ -91,10 +91,6 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     h.conn.setServerName(hello.server_name);
     h.hashMessage(msg);
 
-    // The middlebox-compatibility change_cipher_spec goes out whatever the
-    // client's session id: §D.4 allows it at any time and peers must drop
-    // it, while some expect it unconditionally.
-    const compat = true;
     var session_id_buf: [32]u8 = undefined;
     @memcpy(session_id_buf[0..hello.session_id.len], hello.session_id);
     const session_id = session_id_buf[0..hello.session_id.len];
@@ -110,7 +106,10 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
         h.conn.retried = true;
         h.transcript.replaceWithMessageHash();
         try writeServerHello(h, choices.suite, choices.group, null, session_id);
-        if (compat) h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
+        // The middlebox-compatibility change_cipher_spec goes out whatever
+        // the client's session id: §D.4 allows it at any time and peers
+        // must drop it, while some expect it unconditionally.
+        h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
         try h.flush();
 
         msg = try h.nextMessage();
@@ -137,7 +136,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     defer hs.wipe();
     try h.installWriteKeys(hs.server);
     try h.installReadKeys(hs.client);
-    if (compat and !retried) h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
+    if (!retried) h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
 
     try writeEncryptedExtensions(h, choices.alpn);
     if (opt.client_auth != null) try writeCertificateRequest(h);

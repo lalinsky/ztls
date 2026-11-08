@@ -97,7 +97,8 @@
     "*CertificateType*": "no raw public keys",
     "TLS13-HRR-InvalidCompressionMethod": "RFC 8446 4.1.3 says illegal_parameter, BoringSSL says decode_error",
     "EMS-Forbidden-TLS13": "extended_master_secret is never offered, so the server has nothing to echo",
-    "CertificateVerificationFail-*": "an untrusted issuer is answered with unknown_ca, as RFC 8446 6.2 has it, not handshake_failure"
+    "CertificateVerificationFail-*": "an untrusted issuer is answered with unknown_ca, as RFC 8446 6.2 has it, not handshake_failure",
+    "SendWarningAlerts-TLS13": "an error alert at warning level is the peer's failure (RFC 8446 6) and gets no decode_error back"
   },
   "ErrorMap": {
     ":DECODE_ERROR:": [
