@@ -2,7 +2,8 @@
 //! this directory. Usage: survey-probe HOST [PORT] [--groups a,b,...].
 //! Prints tab-separated fields: HOST ok SUITE GROUP RETRIED KEY SCHEME
 //! ALPN STATUS, first with STATUS "-" as soon as the handshake is done and
-//! again with the HTTP status line once it arrives; or HOST fail ERROR.
+//! again with the HTTP status line, or with "error: NAME" when the request
+//! failed; or HOST fail ERROR when the handshake did.
 //! --groups replaces the client's default groups, the first one getting
 //! the key share.
 
@@ -75,15 +76,21 @@ fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, groups
     try report(out, host, &conn, "-");
     try out.flush();
 
+    // TLS is done; whatever happens now is the HTTP server's doing.
+    var status_buf: [128]u8 = undefined;
+    const status = request(&conn, host) catch |err| try std.fmt.bufPrint(&status_buf, "error: {t}", .{err});
+    try report(out, host, &conn, status);
+    conn.close() catch {};
+}
+
+fn request(conn: *ztls.Connection, host: []const u8) ![]const u8 {
     var read_buffer: [8192]u8 = undefined;
     var reader = conn.reader(&read_buffer);
     var writer = conn.inPlaceWriter();
     try writer.interface.print("HEAD / HTTP/1.1\r\nHost: {s}\r\nUser-Agent: ztls-survey\r\nConnection: close\r\n\r\n", .{host});
     try writer.interface.flush();
     const line = reader.interface.takeDelimiter('\n') catch |err| return reader.err orelse err;
-    const status = std.mem.trim(u8, line orelse return error.EmptyResponse, "\r");
-    try report(out, host, &conn, status);
-    conn.close() catch {};
+    return std.mem.trim(u8, line orelse return error.EmptyResponse, "\r");
 }
 
 fn report(out: *std.Io.Writer, host: []const u8, conn: *const ztls.Connection, status: []const u8) !void {

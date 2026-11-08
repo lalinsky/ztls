@@ -31,7 +31,8 @@ awk -F'\t' 'NR == FNR { if ($2 == "tls13") t[$1] = 1; next } ($1 in t) { c[$2 ==
     END { for (k in c) printf "  %-32s %6d  %5.1f%%\n", k, c[k], 100 * c[k] / n }' "$o" "$z" | sort -k2 -nr
 echo
 echo "== HTTP after a good handshake"
-awk -F'\t' '$2 == "ok" { c[$9 == "-" || $9 == "Timeout" ? "no response (" $9 ")" : "response"]++ } END { for (k in c) printf "  %-32s %6d\n", k, c[k] }' "$z" | sort -k2 -nr
+awk -F'	' '$2 == "ok" { c[$9 ~ /^HTTP\// ? "response" : "none: " $9]++ } END { for (k in c) printf "  %-40s %6d
+", k, c[k] }' "$z" | sort -k2 -nr
 echo
 echo "== TLS 1.3 hosts that failed with ztls (first 5 per error, with openssl's verification)"
 awk -F'\t' 'NR == FNR { if ($2 == "tls13") t[$1] = $4; next } ($1 in t) && $2 == "fail" { if (shown[$3]++ < 5) printf "  %-28s %-40s openssl: %s\n", $3, $1, t[$1] }' "$o" "$z" | sort
