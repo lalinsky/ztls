@@ -1,8 +1,10 @@
 //! Certificates, the trust store and chain verification through AWS-LC's
-//! X.509 code. Only bytes go in: PEM is decoded here and DER parsed by
-//! AWS-LC; reading files is the caller's job.
+//! X.509 code. PEM is decoded here and DER parsed by AWS-LC; files are
+//! read through `std.Io`, and only where the application asks for the
+//! system's roots.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c");
 const err = @import("err.zig");
 const pem = @import("pem.zig");
@@ -106,26 +108,75 @@ pub const TrustStore = struct {
         if (c.X509_STORE_add_cert(self.store, cert.x509) != 1) return err.fail();
     }
 
+    pub const AddPemError = pem.Error || error{ InvalidCertificate, CryptoFailed, OutOfMemory };
+
     /// Adds every CERTIFICATE block in `text`; other blocks are ignored.
     /// Returns how many were added.
-    pub fn addPem(self: *TrustStore, gpa: std.mem.Allocator, text: []const u8) (pem.Error || error{ InvalidCertificate, CryptoFailed, OutOfMemory })!usize {
+    pub fn addPem(self: *TrustStore, gpa: std.mem.Allocator, text: []const u8) AddPemError!usize {
+        return self.addPemBlocks(gpa, text, .fail);
+    }
+
+    const OnInvalid = enum { fail, skip };
+
+    fn addPemBlocks(self: *TrustStore, gpa: std.mem.Allocator, text: []const u8, on_invalid: OnInvalid) AddPemError!usize {
         var count: usize = 0;
         var it = pem.Iterator.init(text);
         while (try it.next()) |block| {
             if (!std.mem.eql(u8, block.label, "CERTIFICATE")) continue;
             const buf = try gpa.alloc(u8, block.decodedSizeUpperBound());
             defer gpa.free(buf);
-            try self.addDer(try block.decode(buf));
+            self.addDer(try block.decode(buf)) catch |e| switch (e) {
+                error.InvalidCertificate => switch (on_invalid) {
+                    .fail => return e,
+                    .skip => {
+                        log.debug("skipping a certificate that AWS-LC does not parse", .{});
+                        continue;
+                    },
+                },
+                error.CryptoFailed => return e,
+            };
             count += 1;
         }
         return count;
     }
 
-    /// Adds every certificate in `bundle`, which does the loading: it
-    /// knows where each platform keeps its roots (`Bundle.rescan`) and
-    /// reads files through `std.Io`. One AWS-LC will not parse is skipped
-    /// and logged, so that a single odd root cannot take the rest down.
-    /// Returns how many were added.
+    pub const AddPemFileError = std.Io.Dir.ReadFileAllocError || AddPemError;
+
+    /// Adds the certificates in the PEM file at `sub_path` under `dir`,
+    /// skipping any that AWS-LC does not parse so that one odd root cannot
+    /// take the rest down. Returns how many were added.
+    pub fn addPemFile(self: *TrustStore, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) AddPemFileError!usize {
+        const text = try dir.readFileAlloc(io, sub_path, gpa, .limited(max_pem_file_len));
+        defer gpa.free(text);
+        return self.addPemBlocks(gpa, text, .skip);
+    }
+
+    pub const AddPemDirError = std.Io.Dir.Iterator.Error || AddPemFileError;
+
+    /// Adds the certificates in every file of `dir`, as a directory of
+    /// single roots is laid out. A file that is not PEM, or a link to
+    /// nothing, is skipped. Returns how many were added.
+    pub fn addPemDir(self: *TrustStore, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) AddPemDirError!usize {
+        var count: usize = 0;
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            switch (entry.kind) {
+                .file, .sym_link => {},
+                else => continue,
+            }
+            count += self.addPemFile(gpa, io, dir, entry.name) catch |e| switch (e) {
+                error.FileNotFound, error.InvalidPem => {
+                    log.debug("skipping {s}, which is not a PEM file", .{entry.name});
+                    continue;
+                },
+                else => return e,
+            };
+        }
+        return count;
+    }
+
+    /// Adds every certificate in `bundle`. One AWS-LC will not parse is
+    /// skipped and logged. Returns how many were added.
     ///
     /// Two things about `Bundle` carry over. It keeps one certificate per
     /// subject name, so of two roots with the same name and different keys
@@ -153,15 +204,81 @@ pub const TrustStore = struct {
         return count;
     }
 
-    /// Adds the roots the system trusts, found as `Bundle.rescan` finds
-    /// them, with the limitations noted on `addBundle`. Roots already
-    /// expired are left out. Returns how many were added.
-    pub fn addSystemBundle(self: *TrustStore, gpa: std.mem.Allocator, io: std.Io) (Bundle.RescanError || err.Error)!usize {
-        var bundle: Bundle = .empty;
-        defer bundle.deinit(gpa);
-        try bundle.rescan(gpa, io, std.Io.Clock.real.now(io));
-        return self.addBundle(&bundle);
+    pub const AddSystemBundleError = Bundle.RescanError || std.Io.Dir.OpenError || AddPemDirError;
+
+    /// Adds the roots the system trusts. On Linux and the other Unixes
+    /// they are PEM files at well-known paths (`system_roots`), read here
+    /// and given to AWS-LC as they are. On Windows and macOS they live in
+    /// a system store that `std.crypto.Certificate.Bundle` knows how to
+    /// read, so it does the loading there, with the limitations noted on
+    /// `addBundle`. Returns how many were added.
+    pub fn addSystemBundle(self: *TrustStore, gpa: std.mem.Allocator, io: std.Io) AddSystemBundleError!usize {
+        if (system_roots) |roots| {
+            return self.addSystemRoots(gpa, io, roots);
+        } else {
+            var bundle: Bundle = .empty;
+            defer bundle.deinit(gpa);
+            try bundle.rescan(gpa, io, std.Io.Clock.real.now(io));
+            return self.addBundle(&bundle);
+        }
     }
+
+    fn addSystemRoots(self: *TrustStore, gpa: std.mem.Allocator, io: std.Io, roots: SystemRoots) AddSystemBundleError!usize {
+        for (roots.files) |path| {
+            return self.addPemFile(gpa, io, .cwd(), path) catch |e| switch (e) {
+                error.FileNotFound => continue,
+                else => return e,
+            };
+        }
+        var count: usize = 0;
+        for (roots.dirs) |path| {
+            var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch |e| switch (e) {
+                error.FileNotFound => continue,
+                else => return e,
+            };
+            defer dir.close(io);
+            count += try self.addPemDir(gpa, io, dir);
+        }
+        return count;
+    }
+};
+
+/// The most a PEM file read for roots may be. Distribution bundles are a
+/// few hundred KiB.
+const max_pem_file_len = 16 << 20;
+
+/// Where a Unix system keeps the roots it trusts: bundle files, of which
+/// the first one found is read, and failing that directories of single
+/// certificates, all of which are. The same places std looks.
+const SystemRoots = struct {
+    files: []const []const u8,
+    dirs: []const []const u8 = &.{},
+};
+
+const system_roots: ?SystemRoots = switch (builtin.os.tag) {
+    .linux => .{
+        .files = &.{
+            "/etc/ssl/certs/ca-certificates.crt", // Debian, Ubuntu, Arch, Gentoo
+            "/etc/pki/tls/certs/ca-bundle.crt", // Fedora, RHEL 6
+            "/etc/ssl/ca-bundle.pem", // OpenSUSE
+            "/etc/pki/tls/cacert.pem", // OpenELEC
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // CentOS, RHEL 7
+            "/etc/ssl/cert.pem", // Alpine
+        },
+        .dirs = &.{
+            "/etc/ssl/certs", // SLES
+            "/etc/pki/tls/certs", // Fedora, RHEL
+            "/system/etc/security/cacerts", // Android
+        },
+    },
+    .freebsd, .openbsd => .{ .files = &.{"/etc/ssl/cert.pem"} },
+    .netbsd => .{ .files = &.{"/etc/openssl/certs/ca-certificates.crt"} },
+    .dragonfly => .{ .files = &.{"/usr/local/etc/ssl/cert.pem"} },
+    .illumos => .{ .files = &.{"/etc/ssl/cacert.pem"} },
+    .haiku => .{ .files = &.{"/boot/system/data/ssl/CARootCertificates.pem"} },
+    .serenity => .{ .files = &.{"/etc/ssl/certs/ca-certificates.crt"} },
+    // Windows and macOS keep their roots in a system store.
+    else => null,
 };
 
 pub const Purpose = enum {
@@ -348,6 +465,35 @@ test "a std.crypto.Certificate.Bundle as the source of roots" {
     var cert = try Certificate.parsePem(testing.allocator, pki.server_ec);
     defer cert.deinit();
     try verify(&store, &.{cert}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
+}
+
+test "roots from PEM files and a directory of them" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ca.pem", .data = pki.ca });
+    try tmp.dir.writeFile(io, .{ .sub_path = "intermediate.pem", .data = pki.intermediate });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = pki.server_ec_key });
+    try tmp.dir.writeFile(io, .{ .sub_path = "README", .data = "Not a certificate.\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "broken.pem", .data = "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "notder.pem", .data = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n" });
+
+    var store = try TrustStore.init();
+    defer store.deinit();
+    try testing.expectEqual(1, try store.addPemFile(testing.allocator, io, tmp.dir, "ca.pem"));
+    try testing.expectEqual(0, try store.addPemFile(testing.allocator, io, tmp.dir, "key.pem"));
+    try testing.expectEqual(0, try store.addPemFile(testing.allocator, io, tmp.dir, "notder.pem"));
+    try testing.expectError(error.InvalidPem, store.addPemFile(testing.allocator, io, tmp.dir, "broken.pem"));
+    try testing.expectError(error.FileNotFound, store.addPemFile(testing.allocator, io, tmp.dir, "missing.pem"));
+
+    var from_dir = try TrustStore.init();
+    defer from_dir.deinit();
+    try testing.expectEqual(2, try from_dir.addPemDir(testing.allocator, io, tmp.dir));
+
+    var cert = try Certificate.parsePem(testing.allocator, pki.server_ec);
+    defer cert.deinit();
+    try verify(&store, &.{cert}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
+    try verify(&from_dir, &.{cert}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
 }
 
 test "the system's roots" {
