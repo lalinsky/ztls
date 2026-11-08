@@ -22,3 +22,17 @@ jobs:
         with:
           version: ${{ matrix.zig }}
       - run: zig build test --summary all
+
+  bogo:
+    runs-on: ubuntu-latest
+    name: BoGo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: false
+      - run: tests/bogo/run.sh
