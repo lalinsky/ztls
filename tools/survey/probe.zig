@@ -1,7 +1,10 @@
 //! One connection to a public server with ztls, for the TLS 1.3 survey in
-//! this directory. Usage: survey-probe HOST [PORT]. Prints one line of
-//! tab-separated fields: HOST ok SUITE GROUP RETRIED KEY SCHEME ALPN STATUS,
-//! or HOST fail ERROR.
+//! this directory. Usage: survey-probe HOST [PORT] [--groups a,b,...].
+//! Prints tab-separated fields: HOST ok SUITE GROUP RETRIED KEY SCHEME
+//! ALPN STATUS, first with STATUS "-" as soon as the handshake is done and
+//! again with the HTTP status line once it arrives; or HOST fail ERROR.
+//! --groups replaces the client's default groups, the first one getting
+//! the key share.
 
 const std = @import("std");
 const ztls = @import("ztls");
@@ -13,18 +16,37 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writer(io, &out_buf);
     const out = &stdout.interface;
     defer out.flush() catch {};
-    if (args.len < 2 or args.len > 3) {
-        try out.writeAll("usage: survey-probe HOST [PORT]\n");
-        std.process.exit(2);
+    var host: ?[]const u8 = null;
+    var port: u16 = 443;
+    var groups: std.ArrayList(ztls.protocol.NamedGroup) = .empty;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--groups") and i + 1 < args.len) {
+            i += 1;
+            var names = std.mem.splitScalar(u8, args[i], ',');
+            while (names.next()) |name| {
+                const group = std.meta.stringToEnum(ztls.protocol.NamedGroup, name) orelse return usage(out);
+                try groups.append(init.arena.allocator(), group);
+            }
+        } else if (std.fmt.parseInt(u16, args[i], 10)) |p| {
+            port = p;
+        } else |_| {
+            if (host != null) return usage(out);
+            host = args[i];
+        }
     }
-    const host = args[1];
-    const port: u16 = if (args.len == 3) try std.fmt.parseInt(u16, args[2], 10) else 443;
-    probe(init.gpa, io, host, port, out) catch |err| {
-        try out.print("{s}\tfail\t{t}\n", .{ host, err });
+    const name = host orelse return usage(out);
+    probe(init.gpa, io, name, port, groups.items, out) catch |err| {
+        try out.print("{s}\tfail\t{t}\n", .{ name, err });
     };
 }
 
-fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, out: *std.Io.Writer) !void {
+fn usage(out: *std.Io.Writer) !void {
+    try out.writeAll("usage: survey-probe HOST [PORT] [--groups a,b,...]\n");
+    std.process.exit(2);
+}
+
+fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, groups: []const ztls.protocol.NamedGroup, out: *std.Io.Writer) !void {
     var trust = try ztls.TrustStore.init();
     defer trust.deinit();
     try trust.addSystemBundle(gpa, io);
@@ -37,14 +59,21 @@ fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, out: *
     var input = stream.reader(io, &input_buffer);
     var output = stream.writer(io, &output_buffer);
 
-    var conn = try ztls.client(&input.interface, &output.interface, .{
+    var options: ztls.config.Client = .{
         .allocator = gpa,
         .host = host,
         .root_ca = &trust,
         .alpn_protocols = &.{"http/1.1"},
         .now = std.Io.Clock.real.now(io),
-    });
+    };
+    if (groups.len > 0) {
+        options.named_groups = groups;
+        options.key_shares = groups[0..1];
+    }
+    var conn = try ztls.client(&input.interface, &output.interface, options);
     defer conn.deinit();
+    try report(out, host, &conn, "-");
+    try out.flush();
 
     var read_buffer: [8192]u8 = undefined;
     var reader = conn.reader(&read_buffer);
@@ -53,7 +82,11 @@ fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, out: *
     try writer.interface.flush();
     const line = reader.interface.takeDelimiter('\n') catch |err| return reader.err orelse err;
     const status = std.mem.trim(u8, line orelse return error.EmptyResponse, "\r");
+    try report(out, host, &conn, status);
+    conn.close() catch {};
+}
 
+fn report(out: *std.Io.Writer, host: []const u8, conn: *const ztls.Connection, status: []const u8) !void {
     try out.print("{s}\tok\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
         host,
         tagName(ztls.protocol.CipherSuite, conn.suite),
@@ -64,7 +97,6 @@ fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, out: *
         conn.alpn_protocol orelse "-",
         status,
     });
-    conn.close() catch {};
 }
 
 fn tagName(comptime E: type, value: ?E) []const u8 {
