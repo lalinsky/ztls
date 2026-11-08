@@ -3,3 +3,4 @@ zig-out/
 zig-pkg/
 DESIGN.md
 .bogo/
+tools/survey/out/

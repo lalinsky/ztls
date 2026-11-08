@@ -44,4 +44,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("bogo-shim", "Build the BoGo shim").dependOn(&b.addInstallArtifact(shim, .{}).step);
+
+    // One ztls connection to a public server; see tools/survey/run.sh.
+    const probe = b.addExecutable(.{
+        .name = "survey-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/survey/probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ztls", .module = mod }},
+        }),
+    });
+    b.step("survey-probe", "Build the TLS 1.3 survey probe").dependOn(&b.addInstallArtifact(probe, .{}).step);
 }
