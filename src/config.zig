@@ -14,7 +14,6 @@ pub const Certificate = crypto.x509.Certificate;
 /// server presents, or a client under mutual TLS. Built once and shared
 /// read-only by any number of connections.
 pub const CertKeyPair = struct {
-    allocator: Allocator,
     /// Each certificate's DER, leaf first, as sent in the Certificate
     /// message.
     chain: []const []const u8,
@@ -33,6 +32,31 @@ pub const CertKeyPair = struct {
         /// The private key is not the leaf's.
         KeyMismatch,
     } || crypto.sig.ParseError;
+
+    pub const FileError = Error || std.Io.Dir.ReadFileAllocError;
+
+    /// The most a certificate or key file may be.
+    pub const max_file_len = 1 << 20;
+
+    /// From two PEM files under `dir`: the chain, leaf first, and the
+    /// private key. See `fromSlice`.
+    pub fn fromFilePath(allocator: Allocator, io: std.Io, dir: std.Io.Dir, cert_path: []const u8, key_path: []const u8) FileError!CertKeyPair {
+        const cert_pem = try dir.readFileAlloc(io, cert_path, allocator, .limited(max_file_len));
+        defer allocator.free(cert_pem);
+        const key_pem = try dir.readFileAlloc(io, key_path, allocator, .limited(max_file_len));
+        defer {
+            std.crypto.secureZero(u8, key_pem);
+            allocator.free(key_pem);
+        }
+        return fromSlice(allocator, cert_pem, key_pem);
+    }
+
+    /// `fromFilePath` with absolute paths.
+    pub fn fromFilePathAbsolute(allocator: Allocator, io: std.Io, cert_path: []const u8, key_path: []const u8) FileError!CertKeyPair {
+        std.debug.assert(std.Io.Dir.path.isAbsolute(cert_path));
+        std.debug.assert(std.Io.Dir.path.isAbsolute(key_path));
+        return fromFilePath(allocator, io, .cwd(), cert_path, key_path);
+    }
 
     /// From PEM text: every CERTIFICATE block of `cert_pem`, leaf first,
     /// and the first private key block of `key_pem`. Encrypted keys are
@@ -62,16 +86,16 @@ pub const CertKeyPair = struct {
         if (!leaf.matchesPrivateKey(&key)) return error.KeyMismatch;
 
         return .{
-            .allocator = allocator,
             .chain = try chain.toOwnedSlice(allocator),
             .leaf = leaf,
             .key = key,
         };
     }
 
-    pub fn deinit(self: *CertKeyPair) void {
-        for (self.chain) |der| self.allocator.free(der);
-        self.allocator.free(self.chain);
+    /// `allocator` is the one given to `fromSlice` or `fromFilePath`.
+    pub fn deinit(self: *CertKeyPair, allocator: Allocator) void {
+        for (self.chain) |der| allocator.free(der);
+        allocator.free(self.chain);
         self.leaf.deinit();
         self.key.deinit();
         self.* = undefined;
@@ -187,7 +211,7 @@ const testing = std.testing;
 
 test "CertKeyPair from the test PKI" {
     var pair = try CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-chain.pem"), @embedFile("testdata/pki/server-chain.key"));
-    defer pair.deinit();
+    defer pair.deinit(testing.allocator);
     try testing.expectEqual(2, pair.chain.len); // leaf and intermediate
     try testing.expectEqual(crypto.sig.KeyType{ .ecdsa = .p384 }, pair.key.key_type);
     var leaf = try Certificate.parseDer(pair.chain[0]);
@@ -195,8 +219,25 @@ test "CertKeyPair from the test PKI" {
     try testing.expect(leaf.matchesPrivateKey(&pair.key));
 
     var rsa = try CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
-    defer rsa.deinit();
+    defer rsa.deinit(testing.allocator);
     try testing.expectEqual(1, rsa.chain.len);
+}
+
+test "CertKeyPair from files" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "chain.pem", .data = @embedFile("testdata/pki/server-chain.pem") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = @embedFile("testdata/pki/server-chain.key") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.key", .data = @embedFile("testdata/pki/client.key") });
+
+    var pair = try CertKeyPair.fromFilePath(testing.allocator, io, tmp.dir, "chain.pem", "key.pem");
+    defer pair.deinit(testing.allocator);
+    try testing.expectEqual(2, pair.chain.len);
+
+    try testing.expectError(error.KeyMismatch, CertKeyPair.fromFilePath(testing.allocator, io, tmp.dir, "chain.pem", "other.key"));
+    try testing.expectError(error.FileNotFound, CertKeyPair.fromFilePath(testing.allocator, io, tmp.dir, "chain.pem", "missing.key"));
+    try testing.expectError(error.FileNotFound, CertKeyPair.fromFilePath(testing.allocator, io, tmp.dir, "missing.pem", "key.pem"));
 }
 
 test "CertKeyPair refuses a key that is not the leaf's, and no certificate" {

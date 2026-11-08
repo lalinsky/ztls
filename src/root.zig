@@ -93,12 +93,12 @@ const Pki = struct {
 
     fn deinit(p: *Pki) void {
         p.ca.deinit();
-        p.server_ec.deinit();
-        p.server_rsa.deinit();
-        p.server_ed25519.deinit();
-        p.server_chain.deinit();
-        p.client.deinit();
-        p.selfsigned.deinit();
+        p.server_ec.deinit(testing.allocator);
+        p.server_rsa.deinit(testing.allocator);
+        p.server_ed25519.deinit(testing.allocator);
+        p.server_chain.deinit(testing.allocator);
+        p.client.deinit(testing.allocator);
+        p.selfsigned.deinit(testing.allocator);
     }
 };
 

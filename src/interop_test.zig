@@ -230,7 +230,7 @@ test "our client against openssl s_server" {
     defer trust.deinit();
     _ = try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     var client_pair = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/client.pem"), @embedFile("testdata/pki/client.key"));
-    defer client_pair.deinit();
+    defer client_pair.deinit(testing.allocator);
 
     for (cases) |case| {
         const port = try freePort(io);
@@ -363,11 +363,11 @@ test "openssl s_client against our server" {
     defer trust.deinit();
     _ = try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     var ec = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
-    defer ec.deinit();
+    defer ec.deinit(testing.allocator);
     var rsa = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
-    defer rsa.deinit();
+    defer rsa.deinit(testing.allocator);
     var chain = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-chain.pem"), @embedFile("testdata/pki/server-chain.key"));
-    defer chain.deinit();
+    defer chain.deinit(testing.allocator);
     const cases = [_]Case{
         .{ .cert = &ec, .server_alpn = &.{ "h2", "http/1.1" }, .client_alpn = "http/1.1,h2", .expected_alpn = "h2" },
         .{ .cert = &rsa },
@@ -468,7 +468,7 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
     defer trust.deinit();
     _ = try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     var client_pair = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/client.pem"), @embedFile("testdata/pki/client.key"));
-    defer client_pair.deinit();
+    defer client_pair.deinit(testing.allocator);
 
     const Case = struct {
         groups: []const proto.NamedGroup,
@@ -540,7 +540,7 @@ test "Go's crypto/tls against our server, with X25519MLKEM768" {
     defer trust.deinit();
     _ = try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     var ec = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
-    defer ec.deinit();
+    defer ec.deinit(testing.allocator);
 
     const Case = struct {
         groups: []const proto.NamedGroup,

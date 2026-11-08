@@ -44,8 +44,8 @@ exe.root_module.addImport("ztls", ztls.module("ztls"));
 A server:
 
 ```zig
-var pair = try ztls.CertKeyPair.fromSlice(gpa, chain_pem, key_pem);
-defer pair.deinit();
+var pair = try ztls.CertKeyPair.fromFilePath(gpa, io, .cwd(), "chain.pem", "key.pem");
+defer pair.deinit(gpa);
 
 // The transport's reader and writer, with buffers for whole records.
 var input_buffer: [ztls.input_buffer_len]u8 = undefined;
@@ -128,8 +128,8 @@ of stream, as with tls.zig; `strict_close_notify` makes it a truncation.
 
 ### Certificates and trust
 
-`CertKeyPair.fromSlice` takes a PEM chain (leaf first) and a PEM private
-key (PKCS#8, SEC 1 or PKCS#1). `TrustStore.addPem` and `addDer` take
+`CertKeyPair.fromFilePath` and `fromSlice` take a PEM chain (leaf first)
+and a PEM private key (PKCS#8, SEC 1 or PKCS#1). `TrustStore.addPem` and `addDer` take
 certificates; any certificate in the store is a trust anchor, an
 intermediate included. `addSystemBundle` loads the roots the system
 trusts through your `std.Io`; `addPemFile`, `addPemDir` and `addBundle`

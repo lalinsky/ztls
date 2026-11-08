@@ -677,7 +677,7 @@ test "scheme selection" {
 
 test "certificate, certificate verify and finished round-trip through records" {
     var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-chain.pem"), @embedFile("testdata/pki/server-chain.key"));
-    defer pair.deinit();
+    defer pair.deinit(testing.allocator);
 
     // The sender writes into a buffer large enough for everything.
     var wire: [64 * 1024]u8 = undefined;
