@@ -176,14 +176,13 @@ pub const TrustStore = struct {
         if (try self.addPemBlocks(gpa, text, .fail) == 0) return error.NoCertificates;
     }
 
-    pub const AddPemDirError = std.Io.Dir.Iterator.Error || error{ InvalidPem, InvalidCertificate, CryptoFailed, OutOfMemory, Canceled, NoCertificates };
+    pub const AddPemDirError = std.Io.Dir.Iterator.Error || std.Io.Dir.ReadFileAllocError || AddPemError;
 
     /// Adds the certificates in every file of `dir`, as a directory of
-    /// single roots is laid out. A file that cannot be read, a link to
-    /// nothing or to a directory, or a file with no PEM in it is passed
-    /// over, but a malformed block in one that has is an error, as with
-    /// `addPemFile`. No certificate in the whole directory is
-    /// `error.NoCertificates`.
+    /// single roots is laid out. A link to nothing or to a directory, or
+    /// a file with no PEM in it, is passed over; a file that cannot be
+    /// read, or has a malformed block, is an error, as with `addPemFile`.
+    /// No certificate in the whole directory is `error.NoCertificates`.
     pub fn addPemDir(self: *TrustStore, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) AddPemDirError!void {
         var accepted: usize = 0;
         var it = dir.iterate();
@@ -195,12 +194,11 @@ pub const TrustStore = struct {
                 else => continue,
             }
             const text = dir.readFileAlloc(io, entry.name, gpa, .limited(max_pem_file_len)) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Canceled => return error.Canceled,
-                else => {
+                error.FileNotFound, error.IsDir => {
                     log.debug("skipping {s}: {s}", .{ entry.name, @errorName(e) });
                     continue;
                 },
+                else => |other| return other,
             };
             defer gpa.free(text);
             accepted += try self.addPemBlocks(gpa, text, .fail);
@@ -609,6 +607,23 @@ test "roots from PEM files and a directory of them" {
     defer empty.close(io);
     try testing.expectError(error.NoCertificates, from_dir.addPemDir(testing.allocator, io, empty));
     try testing.expectError(error.InvalidPem, from_dir.addPemDir(testing.allocator, io, tmp.dir));
+    // A file the directory holds but we may not read is not passed over.
+    if (builtin.os.tag != .windows) {
+        try tmp.dir.createDirPath(io, "locked");
+        try tmp.dir.writeFile(io, .{ .sub_path = "locked/ca.pem", .data = pki.ca });
+        const locked = try tmp.dir.openFile(io, "locked/ca.pem", .{});
+        defer locked.close(io);
+        try locked.setPermissions(io, .fromMode(0));
+        defer locked.setPermissions(io, .fromMode(0o644)) catch {};
+        var locked_dir = try tmp.dir.openDir(io, "locked", .{ .iterate = true });
+        defer locked_dir.close(io);
+        // Root reads anything; then there is nothing to check.
+        if (tmp.dir.openFile(io, "locked/ca.pem", .{})) |readable| {
+            readable.close(io);
+        } else |_| {
+            try testing.expectError(error.AccessDenied, from_dir.addPemDir(testing.allocator, io, locked_dir));
+        }
+    }
 
     // What the system has is taken as found: the good blocks still count.
     var system = try TrustStore.init();
