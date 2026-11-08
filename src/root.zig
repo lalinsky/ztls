@@ -18,6 +18,12 @@ pub const handshake = @import("handshake.zig");
 const handshake_client = @import("handshake_client.zig");
 const handshake_server = @import("handshake_server.zig");
 
+/// Names this library, for code written to tls.zig's API shape that
+/// adapts at comptime to the few places this one differs, such as the
+/// allocator in the options and the trust store type: check
+/// `@hasDecl(tls, "name")`.
+pub const name = "ztls";
+
 pub const Connection = connection.Connection;
 pub const TrustStore = config.TrustStore;
 pub const CertKeyPair = config.CertKeyPair;
@@ -87,8 +93,8 @@ const Pki = struct {
         };
     }
 
-    fn pair(comptime name: []const u8) !CertKeyPair {
-        return CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/" ++ name ++ ".pem"), @embedFile("testdata/pki/" ++ name ++ ".key"));
+    fn pair(comptime stem: []const u8) !CertKeyPair {
+        return CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/" ++ stem ++ ".pem"), @embedFile("testdata/pki/" ++ stem ++ ".key"));
     }
 
     fn deinit(p: *Pki) void {
@@ -389,8 +395,8 @@ test "the server picks its certificate by server name" {
         fn pick(context: ?*anyopaque, hello: config.SelectCertificate.Hello) ?*const CertKeyPair {
             const self: *@This() = @ptrCast(@alignCast(context.?));
             self.calls += 1;
-            const name = hello.server_name orelse return null;
-            if (std.mem.eql(u8, name, "rsa.example.test") and hello.acceptsKey(self.rsa.key.key_type)) return self.rsa;
+            const server_name = hello.server_name orelse return null;
+            if (std.mem.eql(u8, server_name, "rsa.example.test") and hello.acceptsKey(self.rsa.key.key_type)) return self.rsa;
             return null;
         }
     };
