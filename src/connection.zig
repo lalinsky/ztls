@@ -236,8 +236,9 @@ pub const Connection = struct {
                 switch (content_type) {
                     .handshake, .alert => {
                         // Zero-length handshake and alert fragments are
-                        // forbidden (§5.1); an oversized plaintext record too.
-                        if (body_len == 0 or body_len > cipher.max_plaintext_len) return error.TlsUnexpectedMessage;
+                        // forbidden (§5.1), as is a plaintext record over 2^14.
+                        if (body_len == 0) return error.TlsUnexpectedMessage;
+                        if (body_len > cipher.max_plaintext_len) return error.TlsRecordOverflow;
                         return .{ .content_type = content_type, .payload = body };
                     },
                     .change_cipher_spec => {
@@ -343,6 +344,11 @@ pub const Connection = struct {
                     }
                 },
                 .handshake => {
+                    // Zero-length handshake fragments are forbidden (§5.1).
+                    if (record.payload.len == 0) {
+                        c.failRead(error.TlsUnexpectedMessage);
+                        return error.TlsUnexpectedMessage;
+                    }
                     c.handlePostHandshake(record.payload) catch |err| {
                         c.failRead(err);
                         return err;
@@ -382,7 +388,8 @@ pub const Connection = struct {
             switch (handshake_type) {
                 .key_update => {
                     const request = body.decode(proto.KeyUpdateRequest) catch return error.TlsDecodeError;
-                    if (!body.eof() or !d.eof()) return error.TlsUnexpectedMessage;
+                    if (!body.eof()) return error.TlsDecodeError;
+                    if (!d.eof()) return error.TlsUnexpectedMessage;
                     switch (request) {
                         .update_not_requested => {},
                         .update_requested => c.shared.key_update_requested.store(true, .monotonic),
@@ -1103,6 +1110,58 @@ test "key updates from both sides" {
     try testing.expectEqualSlices(u8, expected_write.slice(), end.conn.write.keys.?.secret.slice());
     try end.conn.close();
     try peer.await(io);
+}
+
+test "a plaintext record over 2^14 bytes is record_overflow" {
+    var input_buffer: [input_buffer_len]u8 = @splat(0);
+    input_buffer[0..cipher.header_len].* = .{ @intFromEnum(proto.ContentType.handshake), 3, 3, 0x40, 0x01 };
+    var output_buffer: [output_buffer_len]u8 = undefined;
+    var input: Io.Reader = .fixed(&input_buffer);
+    var discard: Io.Writer.Discarding = .init(&output_buffer);
+    var conn = Connection.init(&input, &discard.writer);
+    defer conn.deinit();
+    try testing.expectError(error.TlsRecordOverflow, conn.readRecord(null));
+}
+
+test "malformed post-handshake records: empty, and a KeyUpdate with trailing bytes" {
+    const io = testing.io;
+    const Case = struct { payload: []const u8, expected: Failure };
+    const cases = [_]Case{
+        .{ .payload = &.{}, .expected = error.TlsUnexpectedMessage },
+        .{ .payload = &.{ @intFromEnum(proto.HandshakeType.key_update), 0, 0, 2, 0, 0 }, .expected = error.TlsDecodeError },
+    };
+    for (cases) |case| {
+        var st = try SelfTalk.init(io, .aes_128_gcm_sha256);
+        defer st.deinit();
+
+        const Peer = struct {
+            fn run(s: *SelfTalk, c: Case) !void {
+                var end: SelfTalk.End = undefined;
+                try s.server(&end);
+                defer end.deinit();
+                try end.conn.writeRecord(.handshake, c.payload);
+                try end.conn.flushOutput();
+                // The client's reader fails and its writer sends the alert.
+                var rbuf: [256]u8 = undefined;
+                var r = end.conn.reader(&rbuf);
+                try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+                try testing.expectEqual(proto.Alert.forLocalError(c.expected).?.toError().?, r.err.?);
+            }
+        };
+        var peer = try io.concurrent(Peer.run, .{ &st, case });
+        defer peer.cancel(io) catch {};
+
+        var end: SelfTalk.End = undefined;
+        try st.client(&end);
+        defer end.deinit();
+        var rbuf: [256]u8 = undefined;
+        var r = end.conn.reader(&rbuf);
+        var w = end.conn.writer(&.{});
+        try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+        try testing.expectEqual(case.expected, r.err.?);
+        try testing.expectError(error.WriteFailed, w.interface.writeAll("x"));
+        try peer.await(io);
+    }
 }
 
 test "a bad record fails the reader, and the writer sends the alert" {
