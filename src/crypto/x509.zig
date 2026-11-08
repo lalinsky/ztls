@@ -55,6 +55,14 @@ pub const Certificate = struct {
     /// Whether the certificate is for `host`: a DNS subject alternative
     /// name matches it (wildcards included); the subject common name is
     /// never consulted.
+    /// Whether the key may make signatures: a keyUsage extension, when
+    /// present, must have digitalSignature (RFC 5280 §4.2.1.3), and TLS 1.3
+    /// authenticates with signatures only.
+    pub fn allowsDigitalSignature(self: *const Certificate) bool {
+        if (c.X509_get_extension_flags(self.x509) & c.EXFLAG_KUSAGE == 0) return true;
+        return c.X509_get_key_usage(self.x509) & c.X509v3_KU_DIGITAL_SIGNATURE != 0;
+    }
+
     pub fn matchesHost(self: *const Certificate, host: []const u8) bool {
         const r = c.X509_check_host(self.x509, host.ptr, host.len, c.X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, null);
         if (r == 1) return true;

@@ -35,6 +35,9 @@ const seal_spill = cipher.seal_overhead + key_update_record_len;
 /// Records carrying no application data (empty ones, post-handshake
 /// messages) a peer may send in a row before it is cut off.
 const max_idle_records = 32;
+/// Warning alerts a peer may send over a connection's life; TLS 1.3 has
+/// only user_canceled, and that once.
+const max_warning_alerts = 4;
 
 /// What a read or write can fail with: the transport's own failure,
 /// something the record layer found, or an alert the peer sent.
@@ -78,8 +81,21 @@ pub const Connection = struct {
 
     /// The protocol agreed through ALPN, pointing into the configuration.
     alpn_protocol: ?[]const u8 = null,
+    /// What the handshake settled on.
+    suite: ?proto.CipherSuite = null,
+    group: ?proto.NamedGroup = null,
+    /// A HelloRetryRequest was needed.
+    retried: bool = false,
     /// The type of key in the peer's certificate, when it sent one.
     peer_key_type: ?crypto.sig.KeyType = null,
+    /// The scheme the peer signed its CertificateVerify with.
+    peer_signature_scheme: ?proto.SignatureScheme = null,
+    /// The peer's certificate chain as it sent it, leaf first, in DER;
+    /// copies owned by `allocator`. Empty when it sent none.
+    peer_certificates: []const []const u8 = &.{},
+    allocator: ?std.mem.Allocator = null,
+    server_name_buf: [255]u8 = undefined,
+    server_name_len: u8 = 0,
     /// Treat a transport that ends between records without close_notify as
     /// truncated rather than as a clean end.
     strict_close_notify: bool = false,
@@ -91,6 +107,9 @@ pub const Connection = struct {
         cleartext: []u8 = &.{},
         /// Records in a row that carried no application data.
         idle_records: u32 = 0,
+        /// change_cipher_spec records and warning alerts seen, each capped.
+        ccs_records: u32 = 0,
+        warning_alerts: u32 = 0,
         /// change_cipher_spec is tolerated until the handshake is over.
         in_handshake: bool = true,
     };
@@ -125,7 +144,23 @@ pub const Connection = struct {
     pub fn deinit(c: *Connection) void {
         if (c.read.keys) |*keys| keys.deinit();
         if (c.write.keys) |*keys| keys.deinit();
+        if (c.allocator) |gpa| {
+            for (c.peer_certificates) |der| gpa.free(der);
+            gpa.free(c.peer_certificates);
+        }
         c.* = undefined;
+    }
+
+    /// The name a client asked for through SNI, as the server saw it.
+    pub fn serverName(c: *const Connection) ?[]const u8 {
+        return if (c.server_name_len == 0) null else c.server_name_buf[0..c.server_name_len];
+    }
+
+    pub fn setServerName(c: *Connection, name: ?[]const u8) void {
+        const n = name orelse "";
+        assert(n.len <= c.server_name_buf.len);
+        @memcpy(c.server_name_buf[0..n.len], n);
+        c.server_name_len = @intCast(n.len);
     }
 
     // Read side
@@ -188,6 +223,7 @@ pub const Connection = struct {
                         // Middlebox compatibility (§5): one byte of 0x01,
                         // dropped, but only until the handshake is done.
                         if (!c.read.in_handshake or body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
+                        try c.countChangeCipherSpec();
                         continue;
                     },
                     else => return error.TlsUnexpectedMessage,
@@ -205,6 +241,7 @@ pub const Connection = struct {
                     },
                     .change_cipher_spec => {
                         if (body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
+                        try c.countChangeCipherSpec();
                         continue;
                     },
                     else => return error.TlsUnexpectedMessage,
@@ -275,8 +312,20 @@ pub const Connection = struct {
                         c.failRead(error.TlsDecodeError);
                         return error.TlsDecodeError;
                     }
+                    const level = record.payload[0];
+                    if (level != 1 and level != 2) {
+                        c.failRead(error.TlsIllegalParameter);
+                        return error.TlsIllegalParameter;
+                    }
                     const alert = proto.Alert.decode(record.payload[0..2]);
                     if (alert.toError()) |err| {
+                        // A warning level on anything but close_notify or
+                        // user_canceled is malformed in TLS 1.3 (§6), and
+                        // the peer, not closing, can be told so.
+                        if (level == 1) {
+                            c.failRead(error.TlsDecodeError);
+                            return error.TlsDecodeError;
+                        }
                         // The peer's failure: it will not read an alert back.
                         c.failRead(err);
                         return err;
@@ -288,6 +337,11 @@ pub const Connection = struct {
                         },
                         // user_canceled is followed by close_notify (§6.1).
                         else => {
+                            c.read.warning_alerts += 1;
+                            if (c.read.warning_alerts > max_warning_alerts) {
+                                c.failRead(error.TlsUnexpectedMessage);
+                                return error.TlsUnexpectedMessage;
+                            }
                             try c.countIdleRecord();
                             continue;
                         },
@@ -304,6 +358,12 @@ pub const Connection = struct {
                 else => unreachable, // readRecord returns no other type
             }
         }
+    }
+
+    /// One per side is the norm; a flood is a peer wasting our time.
+    fn countChangeCipherSpec(c: *Connection) error{TlsUnexpectedMessage}!void {
+        c.read.ccs_records += 1;
+        if (c.read.ccs_records > max_idle_records) return error.TlsUnexpectedMessage;
     }
 
     fn countIdleRecord(c: *Connection) Failure!void {

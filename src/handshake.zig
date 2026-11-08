@@ -426,6 +426,7 @@ pub const Handshake = struct {
         assert(h.schedule == null);
         const hash_algorithm = cipher.suiteHash(suite).?;
         h.suite = suite;
+        h.conn.suite = suite;
         h.transcript.select(hash_algorithm);
         h.schedule = key_schedule.KeySchedule.init(hash_algorithm);
     }
@@ -470,6 +471,13 @@ pub const Handshake = struct {
     /// A key change must fall on a record boundary (§5.1): a message
     /// already received under the old keys that would be read under the
     /// new ones is a violation.
+    /// A flight has been read in full: handshake data beyond it in the
+    /// same record is the peer getting ahead of what it can know, and is
+    /// refused (as with a key change).
+    pub fn expectFlightEnd(h: *Handshake) Error!void {
+        if (h.inbox_pos != h.inbox.items.len) return error.TlsUnexpectedMessage;
+    }
+
     pub fn installReadKeys(h: *Handshake, secret: Secret) Error!void {
         if (h.inbox_pos != h.inbox.items.len) return error.TlsUnexpectedMessage;
         if (h.conn.read.keys) |*old| old.deinit();
@@ -556,9 +564,9 @@ pub const Handshake = struct {
     }
 
     /// Parses a Certificate message. Null for an empty chain, which a
-    /// client may send when it has none.
+    /// client may send when it has none. The chain's DER is kept on the
+    /// connection for the application.
     pub fn parseCertificate(h: *Handshake, body: []const u8, expected_context: []const u8) Error!?PeerCertificate {
-        _ = h;
         var d = codec.Decoder.init(body);
         const context = try d.vectorBytes(u8);
         if (!std.mem.eql(u8, context, expected_context)) return error.TlsIllegalParameter;
@@ -568,17 +576,29 @@ pub const Handshake = struct {
 
         var peer: PeerCertificate = .{ .public_key = undefined };
         errdefer for (peer.chain[0..peer.len]) |*cert| cert.deinit();
+        var copies: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (copies.items) |der| h.allocator.free(der);
+            copies.deinit(h.allocator);
+        }
         while (!list.eof()) {
             if (peer.len == peer.chain.len) return error.TlsBadCertificate;
             const der = try list.vectorBytes(u24);
-            _ = try list.vector(u16); // extensions: status_request, SCTs; not used
-            peer.chain[peer.len] = x509.Certificate.parseDer(der) catch return error.TlsBadCertificate;
+            // Extensions here answer a request (status_request, SCTs) we
+            // never make (§4.4.2), so none may come.
+            const extensions = try list.vector(u16);
+            if (!extensions.eof()) return error.TlsUnsupportedExtension;
+            peer.chain[peer.len] = x509.Certificate.parseDer(der) catch return error.TlsDecodeError;
             peer.len += 1;
+            try copies.append(h.allocator, try h.allocator.dupe(u8, der));
         }
+        if (!peer.chain[0].allowsDigitalSignature()) return error.TlsBadCertificate;
         peer.public_key = peer.chain[0].publicKey() catch |err| switch (err) {
             error.UnsupportedKey => return error.TlsUnsupportedCertificate,
             error.CryptoFailed => return error.TlsInternalError,
         };
+        h.conn.peer_certificates = try copies.toOwnedSlice(h.allocator);
+        h.conn.allocator = h.allocator;
         return peer;
     }
 
@@ -617,6 +637,7 @@ pub const Handshake = struct {
         if (std.mem.indexOfScalar(proto.SignatureScheme, &signature_algorithms, scheme) == null) return error.TlsIllegalParameter;
         const algorithm = schemeAlgorithm(scheme) orelse return error.TlsIllegalParameter;
         if (!algorithm.suits(public_key.key_type)) return error.TlsIllegalParameter;
+        h.conn.peer_signature_scheme = scheme;
 
         var content_buf: [64 + 33 + 1 + crypto.hash.max_digest_length]u8 = undefined;
         const content = h.certificateVerifyContent(signer, &content_buf);
@@ -709,6 +730,7 @@ test "certificate, certificate verify and finished round-trip through records" {
     var unused_output: [@import("connection.zig").output_buffer_len]u8 = undefined;
     var discard: Io.Writer = .fixed(&unused_output);
     var receiver_conn = Connection.init(&limited.interface, &discard);
+    defer receiver_conn.deinit();
     var receiver = Handshake.init(&receiver_conn, testing.allocator, 64 * 1024);
     defer receiver.deinit();
     receiver.setSuite(.aes_128_gcm_sha256);

@@ -73,6 +73,8 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     var hello = try parseServerHello(msg.body, opt, &session_id);
     var sent_ccs = false;
     if (hello.is_retry) {
+        try h.expectFlightEnd();
+        h.conn.retried = true;
         h.setSuite(hello.suite);
         h.transcript.replaceWithMessageHash();
         h.hashMessage(msg);
@@ -109,6 +111,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 
     const key_share = hello.key_share orelse return error.TlsMissingExtension;
     if (!shares.has(key_share.group)) return error.TlsIllegalParameter;
+    h.conn.group = key_share.group;
     var secret_buf: [KeyShares.max_secret_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &secret_buf);
     const shared_secret = try shares.sharedSecret(key_share.group, key_share.share, &secret_buf);
@@ -150,6 +153,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 
     msg = try h.nextMessage();
     try h.expect(msg, .finished);
+    try h.expectFlightEnd();
     try h.verifyFinished(msg.body, &hs.server);
     h.hashMessage(msg);
 
@@ -286,23 +290,24 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: *const [32
 
     var hello: ServerHello = .{ .is_retry = is_retry, .suite = suite, .key_share = null };
     var saw_versions = false;
+    // (BoringSSL's runner wants illegal_parameter for a retry's duplicate.)
+    try checkNoDuplicates(extensions, if (is_retry) error.TlsIllegalParameter else error.TlsDecodeError);
     while (!extensions.eof()) {
         const extension = try extensions.decode(proto.Extension);
         var data = try extensions.vector(u16);
         switch (extension) {
             .supported_versions => {
-                if (saw_versions) return error.TlsIllegalParameter;
                 saw_versions = true;
                 if (try data.decode(proto.Version) != .tls_1_3) return error.TlsIllegalParameter;
             },
             .key_share => {
-                if (hello.key_share != null) return error.TlsIllegalParameter;
                 const group = try data.decode(proto.NamedGroup);
                 hello.key_share = .{ .group = group, .share = if (is_retry) &.{} else try data.vectorBytes(u16) };
             },
             .cookie => {
-                if (!is_retry or hello.cookie != null) return error.TlsIllegalParameter;
+                if (!is_retry) return error.TlsIllegalParameter;
                 hello.cookie = try data.vectorBytes(u16);
+                if (hello.cookie.?.len == 0) return error.TlsDecodeError;
             },
             // We offered no PSK, so nothing else belongs here (§4.1.3).
             else => return error.TlsUnsupportedExtension,
@@ -314,18 +319,36 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: *const [32
     return hello;
 }
 
+/// A repeated extension type is a malformed block (§4.2), whatever the
+/// type, so the whole block is checked before any extension is read.
+/// Servers send a handful, so a short list does.
+fn checkNoDuplicates(extensions: codec.Decoder, err: Error) Error!void {
+    var d = extensions;
+    var codes: [16]u16 = undefined;
+    var len: usize = 0;
+    while (!d.eof()) {
+        const code = @intFromEnum(try d.decode(proto.Extension));
+        _ = try d.vector(u16);
+        for (codes[0..len]) |c| if (c == code) return err;
+        if (len == codes.len) return err;
+        codes[len] = code;
+        len += 1;
+    }
+}
+
 /// Returns the ALPN protocol the server chose, as our own slice.
 fn parseEncryptedExtensions(body: []const u8, opt: config.Client) Error!?[]const u8 {
     var d = codec.Decoder.init(body);
     var extensions = try d.vector(u16);
     try d.expectEof();
     var alpn: ?[]const u8 = null;
+    try checkNoDuplicates(extensions, error.TlsDecodeError);
     while (!extensions.eof()) {
         const extension = try extensions.decode(proto.Extension);
         var data = try extensions.vector(u16);
         switch (extension) {
             .application_layer_protocol_negotiation => {
-                if (opt.alpn_protocols.len == 0 or alpn != null) return error.TlsUnsupportedExtension;
+                if (opt.alpn_protocols.len == 0) return error.TlsUnsupportedExtension;
                 var list = try data.vector(u16);
                 const name = try list.vectorBytes(u8);
                 try list.expectEof();
@@ -335,8 +358,10 @@ fn parseEncryptedExtensions(body: []const u8, opt: config.Client) Error!?[]const
                 // Not something we offered.
                 if (alpn == null) return error.TlsIllegalParameter;
             },
-            // An acknowledgement of our SNI, and the server's preferences.
-            .server_name, .supported_groups => {},
+            // An acknowledgement of our SNI, which must have been sent.
+            .server_name => if (isIpLiteral(opt.host)) return error.TlsUnsupportedExtension,
+            // The server's preferences, for a later connection.
+            .supported_groups => {},
             else => return error.TlsUnsupportedExtension,
         }
         if (extension != .supported_groups) try data.expectEof();
@@ -350,17 +375,18 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair) E
     var extensions = try d.vector(u16);
     try d.expectEof();
 
-    var request: CertificateRequest = .{ .context_buf = undefined, .context_len = @intCast(context.len), .scheme = null };
-    @memcpy(request.context_buf[0..context.len], context);
+    // The context is for post-handshake authentication only (§4.3.2).
+    if (context.len != 0) return error.TlsDecodeError;
+    var request: CertificateRequest = .{ .context_buf = undefined, .context_len = 0, .scheme = null };
 
     var offered: [64]proto.SignatureScheme = undefined;
     var offered_len: ?usize = null;
+    try checkNoDuplicates(extensions, error.TlsDecodeError);
     while (!extensions.eof()) {
         const extension = try extensions.decode(proto.Extension);
         var data = try extensions.vector(u16);
         switch (extension) {
             .signature_algorithms => {
-                if (offered_len != null) return error.TlsIllegalParameter;
                 var list = try data.vector(u16);
                 try data.expectEof();
                 var n: usize = 0;
@@ -373,8 +399,16 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair) E
                 }
                 offered_len = n;
             },
-            // certificate_authorities, oid_filters and the rest only narrow
-            // what the server would like; we offer what we have.
+            .certificate_authorities => {
+                var list = try data.vector(u16);
+                try data.expectEof();
+                if (list.eof()) return error.TlsDecodeError;
+                while (!list.eof()) {
+                    if ((try list.vectorBytes(u16)).len == 0) return error.TlsDecodeError;
+                }
+            },
+            // oid_filters and the rest only narrow what the server would
+            // like; we offer what we have.
             else => {},
         }
     }

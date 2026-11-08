@@ -22,7 +22,7 @@ pub const CertKeyPair = struct {
     key: PrivateKey,
 
     /// Certificates in a chain, including the leaf.
-    pub const max_chain_len = 16;
+    pub const max_chain_len = 64;
 
     pub const Error = error{
         /// No certificate in the PEM, or one that does not parse.

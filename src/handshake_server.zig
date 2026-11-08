@@ -82,13 +82,19 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
 
     var msg = try h.nextMessage();
     try h.expect(msg, .client_hello);
+    try h.expectFlightEnd();
     var hello = try parseClientHello(msg.body);
     const auth = try selectCertificate(&hello, opt);
     var choices = try choose(&hello, opt, auth);
     h.setSuite(choices.suite);
+    h.conn.group = choices.group;
+    h.conn.setServerName(hello.server_name);
     h.hashMessage(msg);
 
-    const compat = hello.session_id.len > 0;
+    // The middlebox-compatibility change_cipher_spec goes out whatever the
+    // client's session id: §D.4 allows it at any time and peers must drop
+    // it, while some expect it unconditionally.
+    const compat = true;
     var session_id_buf: [32]u8 = undefined;
     @memcpy(session_id_buf[0..hello.session_id.len], hello.session_id);
     const session_id = session_id_buf[0..hello.session_id.len];
@@ -101,6 +107,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     if (hello.shareFor(choices.group) == null) {
         // No usable share: ask for one (§4.1.4).
         retried = true;
+        h.conn.retried = true;
         h.transcript.replaceWithMessageHash();
         try writeServerHello(h, choices.suite, choices.group, null, session_id);
         if (compat) h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
@@ -108,6 +115,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
 
         msg = try h.nextMessage();
         try h.expect(msg, .client_hello);
+        try h.expectFlightEnd();
         hello = try parseClientHello(msg.body);
         const second = try choose(&hello, opt, auth);
         // The second hello may differ only in its key share (§4.1.2).
@@ -237,7 +245,7 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
     if (try d.decode(proto.Version) != .tls_1_2) return error.TlsProtocolVersion;
     _ = try d.array(32); // random
     const session_id = try d.vectorBytes(u8);
-    if (session_id.len > 32) return error.TlsIllegalParameter;
+    if (session_id.len > 32) return error.TlsDecodeError;
     const suites = try d.vectorBytes(u16);
     if (suites.len == 0 or suites.len % 2 != 0) return error.TlsDecodeError;
     // TLS 1.3 clients offer the null compression method only (§4.1.2).
@@ -247,17 +255,20 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
 
     var hello: ClientHello = .{ .session_id = session_id, .suites = suites };
     var supports_1_3 = false;
-    // One bit per extension type we know; a repeated one is a violation.
-    var seen: u64 = 0;
+    var has_key_share = false;
+    var has_groups = false;
+    // A repeated extension type is a malformed block (§4.2). Clients send
+    // a dozen or two, GREASE included.
+    var seen: [64]u16 = undefined;
+    var seen_len: usize = 0;
     while (!extensions.eof()) {
         const extension = try extensions.decode(proto.Extension);
         var data = try extensions.vector(u16);
         const code = @intFromEnum(extension);
-        if (code < 64) {
-            const bit = @as(u64, 1) << @intCast(code);
-            if (seen & bit != 0) return error.TlsIllegalParameter;
-            seen |= bit;
-        }
+        for (seen[0..seen_len]) |s| if (s == code) return error.TlsDecodeError;
+        if (seen_len == seen.len) return error.TlsDecodeError;
+        seen[seen_len] = code;
+        seen_len += 1;
         switch (extension) {
             .supported_versions => {
                 var list = try data.vector(u8);
@@ -266,6 +277,7 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                 }
             },
             .key_share => {
+                has_key_share = true;
                 var list = try data.vector(u16);
                 while (!list.eof()) {
                     const group = try list.decode(proto.NamedGroup);
@@ -278,6 +290,7 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                 }
             },
             .supported_groups => {
+                has_groups = true;
                 var list = try data.vector(u16);
                 if (list.eof()) return error.TlsDecodeError;
                 while (!list.eof()) {
@@ -324,7 +337,19 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
             },
             .application_layer_protocol_negotiation => {
                 hello.alpn = try data.vectorBytes(u16);
-                if (hello.alpn.?.len == 0) return error.TlsDecodeError;
+                // Each name is 1 to 255 bytes, and there is at least one.
+                var names = codec.Decoder.init(hello.alpn.?);
+                if (names.eof()) return error.TlsDecodeError;
+                while (!names.eof()) {
+                    if ((try names.vectorBytes(u8)).len == 0) return error.TlsDecodeError;
+                }
+            },
+            .certificate_authorities => {
+                var list = try data.vector(u16);
+                if (list.eof()) return error.TlsDecodeError;
+                while (!list.eof()) {
+                    if ((try list.vectorBytes(u16)).len == 0) return error.TlsDecodeError;
+                }
             },
             // We never send a cookie, so none may come back.
             .cookie => hello.has_cookie = true,
@@ -333,7 +358,8 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
         try data.expectEof();
     }
     if (!supports_1_3) return error.TlsProtocolVersion;
-    if (hello.key_shares_len == 0 and hello.groups_len == 0) return error.TlsMissingExtension;
+    // (EC)DHE is the only key exchange here, so both are required (§9.2).
+    if (!has_key_share or !has_groups) return error.TlsMissingExtension;
     // A share may only be offered for a group in supported_groups (§4.2.8).
     for (hello.key_shares[0..hello.key_shares_len]) |ks| {
         if (!hello.supportsGroup(ks.group)) return error.TlsIllegalParameter;
@@ -458,6 +484,8 @@ test "server names: a trailing dot is dropped, IP literals and NULs are refused"
             try w.vector(u16, &.{ 2, 3, 4 });
             try w.enumValue(proto.Extension.supported_groups);
             try w.vector(u16, &.{ 0, 2, 0, 0x1d });
+            try w.enumValue(proto.Extension.key_share);
+            try w.vector(u16, &.{ 0, 0 }); // no shares: a retry would be needed
             try w.enumValue(proto.Extension.server_name);
             const sni = try w.beginLength(u16);
             const list = try w.beginLength(u16);
