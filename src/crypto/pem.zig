@@ -26,6 +26,8 @@ pub const Block = struct {
 const decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
 
 /// Walks the blocks of a PEM file in order, skipping text between them.
+/// After a malformed block the iterator stands past that block's BEGIN
+/// marker, so calling `next` again finds the block after it.
 pub const Iterator = struct {
     rest: []const u8,
 
@@ -42,19 +44,28 @@ pub const Iterator = struct {
             self.rest = &.{};
             return null;
         };
+        const text = self.rest;
         const label_start = begin_at + begin.len;
-        const label_end = std.mem.indexOfPos(u8, self.rest, label_start, dashes) orelse return error.InvalidPem;
-        const label = self.rest[label_start..label_end];
+        self.rest = text[label_start..];
+
+        const label_end = std.mem.indexOfPos(u8, text, label_start, dashes) orelse return error.InvalidPem;
+        const label = text[label_start..label_end];
         const body_start = label_end + dashes.len;
 
-        const body_end = std.mem.indexOfPos(u8, self.rest, body_start, end) orelse return error.InvalidPem;
+        const body_end = std.mem.indexOfPos(u8, text, body_start, end) orelse return error.InvalidPem;
+        // A BEGIN before the END means this block never ended; the next
+        // one starts there.
+        if (std.mem.indexOfPos(u8, text[0..body_end], body_start, begin)) |next_begin| {
+            self.rest = text[next_begin..];
+            return error.InvalidPem;
+        }
         const end_label_start = body_end + end.len;
-        if (!std.mem.startsWith(u8, self.rest[end_label_start..], label)) return error.InvalidPem;
+        if (!std.mem.startsWith(u8, text[end_label_start..], label)) return error.InvalidPem;
         const end_dashes = end_label_start + label.len;
-        if (!std.mem.startsWith(u8, self.rest[end_dashes..], dashes)) return error.InvalidPem;
+        if (!std.mem.startsWith(u8, text[end_dashes..], dashes)) return error.InvalidPem;
 
-        const block: Block = .{ .label = label, .body = self.rest[body_start..body_end] };
-        self.rest = self.rest[end_dashes + dashes.len ..];
+        const block: Block = .{ .label = label, .body = text[body_start..body_end] };
+        self.rest = text[end_dashes + dashes.len ..];
         return block;
     }
 };
@@ -99,5 +110,24 @@ test "malformed input" {
     var buf: [8]u8 = undefined;
     try testing.expectError(error.InvalidPem, block.decode(&buf));
     it = Iterator.init("no blocks here");
+    try testing.expectEqual(null, try it.next());
+}
+
+test "resyncing after a malformed block" {
+    var it = Iterator.init("-----BEGIN X-----\nYWJj\n-----END Y-----\n-----BEGIN Z-----\nYWJj\n-----END Z-----\n");
+    try testing.expectError(error.InvalidPem, it.next());
+    const block = (try it.next()).?;
+    try testing.expectEqualStrings("Z", block.label);
+    try testing.expectEqual(null, try it.next());
+
+    // A BEGIN inside the text of an unterminated block is the next block,
+    // whatever the labels.
+    it = Iterator.init("-----BEGIN X-----\n-----BEGIN Z-----\nYWJj\n-----END Z-----\n");
+    try testing.expectError(error.InvalidPem, it.next());
+    try testing.expectEqualStrings("Z", ((try it.next()).?).label);
+    it = Iterator.init("-----BEGIN X-----\nabc\n-----BEGIN X-----\nYWJj\n-----END X-----\n");
+    try testing.expectError(error.InvalidPem, it.next());
+    const z = (try it.next()).?;
+    try testing.expectEqualStrings("YWJj", std.mem.trim(u8, z.body, "\n"));
     try testing.expectEqual(null, try it.next());
 }
