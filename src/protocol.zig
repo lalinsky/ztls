@@ -140,6 +140,7 @@ pub const Alert = enum(u8) {
     bad_certificate_status_response = 113,
     unknown_psk_identity = 115,
     certificate_required = 116,
+    general_error = 117,
     no_application_protocol = 120,
     _,
 
@@ -176,6 +177,7 @@ pub const Alert = enum(u8) {
         TlsAlertBadCertificateStatusResponse,
         TlsAlertUnknownPskIdentity,
         TlsAlertCertificateRequired,
+        TlsAlertGeneralError,
         TlsAlertNoApplicationProtocol,
         TlsAlertUnknown,
     };
@@ -208,6 +210,7 @@ pub const Alert = enum(u8) {
             .bad_certificate_status_response => error.TlsAlertBadCertificateStatusResponse,
             .unknown_psk_identity => error.TlsAlertUnknownPskIdentity,
             .certificate_required => error.TlsAlertCertificateRequired,
+            .general_error => error.TlsAlertGeneralError,
             .no_application_protocol => error.TlsAlertNoApplicationProtocol,
             _ => error.TlsAlertUnknown,
         };
@@ -340,7 +343,7 @@ test "every local error has an alert and every alert error is the peer's" {
 }
 
 test "alerts round-trip through errors" {
-    const alerts = [_]Alert{ .unexpected_message, .bad_record_mac, .decode_error, .no_application_protocol, .certificate_required };
+    const alerts = [_]Alert{ .unexpected_message, .bad_record_mac, .decode_error, .no_application_protocol, .certificate_required, .general_error };
     for (alerts) |alert| {
         const err = alert.toError().?;
         try testing.expect(Alert.isFromPeer(err));

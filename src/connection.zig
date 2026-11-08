@@ -35,6 +35,9 @@ const seal_spill = cipher.seal_overhead + key_update_record_len;
 /// Records carrying no application data (empty ones, post-handshake
 /// messages) a peer may send in a row before it is cut off.
 const max_idle_records = 32;
+/// KeyUpdates a sender may make over a connection's life (§4.7.3).
+const max_key_updates: u64 = (1 << 48) - 1;
+
 /// Warning alerts a peer may send over a connection's life; TLS 1.3 has
 /// only user_canceled, and that once.
 const max_warning_alerts = 4;
@@ -118,6 +121,8 @@ pub const Connection = struct {
     /// Touched by the writing task only.
     pub const WriteHalf = struct {
         keys: ?cipher.Keys = null,
+        /// KeyUpdates sent so far, capped at `max_key_updates`.
+        key_updates: u64 = 0,
     };
 
     /// What the two tasks share. Each state is stored by its own task
@@ -556,10 +561,20 @@ pub const Connection = struct {
     /// answered before the record after this one. A request is answered
     /// only when something is written, which §4.7.3 allows: a connection
     /// that never writes again never answers, and the peer is not blocked.
+    /// Past `max_key_updates` there is no update (§4.7.3): a request is
+    /// ignored and the keys stay until `seal` refuses them.
     fn claimKeyUpdate(c: *Connection) bool {
         const requested = c.shared.key_update_requested.load(.monotonic) and
             c.shared.key_update_requested.swap(false, .monotonic);
+        if (c.write.key_updates >= max_key_updates) return false;
         return requested or c.write.keys.?.seq >= c.write.keys.?.recordLimit();
+    }
+
+    /// Moves the write keys to the next generation, after the KeyUpdate
+    /// announcing it was sealed with the old ones.
+    fn advanceWriteKeys(c: *Connection) error{TlsInternalError}!void {
+        c.write.keys.?.update() catch return error.TlsInternalError;
+        c.write.key_updates += 1;
     }
 
     fn keyUpdateMessage(request: proto.KeyUpdateRequest) [key_update_msg_len]u8 {
@@ -569,13 +584,14 @@ pub const Connection = struct {
     /// Sends a KeyUpdate and moves the write keys to the next generation.
     fn sendKeyUpdate(c: *Connection, request: proto.KeyUpdateRequest) WriteError!void {
         try c.writeRecord(.handshake, &keyUpdateMessage(request));
-        c.write.keys.?.update() catch return error.TlsInternalError;
+        try c.advanceWriteKeys();
     }
 
     /// Asks the peer to update its keys, updating ours first (§4.7.3).
-    /// For the writing task.
+    /// For the writing task. Does nothing past `max_key_updates`.
     pub fn requestKeyUpdate(c: *Connection) WriteError!void {
         try c.checkWritable();
+        if (c.write.key_updates >= max_key_updates) return;
         c.sendKeyUpdate(.update_requested) catch |err| return c.failWrite(err);
         try c.flushOutput();
     }
@@ -633,7 +649,7 @@ pub const Connection = struct {
             const msg = keyUpdateMessage(.update_not_requested);
             buf[cipher.header_len..][0..msg.len].* = msg;
             keys.seal(buf[0..key_update_record_len], .handshake, msg.len) catch |err| return c.failWrite(err);
-            keys.update() catch return c.failWrite(error.TlsInternalError);
+            c.advanceWriteKeys() catch |err| return c.failWrite(err);
             at = key_update_record_len;
         }
         if (len > 0) {
@@ -1108,6 +1124,48 @@ test "key updates from both sides" {
     try testing.expect(!std.mem.eql(u8, read_gen0.slice(), end.conn.read.keys.?.secret.slice()));
     const expected_write = key_schedule.nextTrafficSecret(.sha256, &key_schedule.nextTrafficSecret(.sha256, &write_gen0));
     try testing.expectEqualSlices(u8, expected_write.slice(), end.conn.write.keys.?.secret.slice());
+    try end.conn.close();
+    try peer.await(io);
+}
+
+test "past the key update cap a sender ignores requests and keeps its keys" {
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .aes_128_gcm_sha256);
+    defer st.deinit();
+
+    const Peer = struct {
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            var rbuf: [256]u8 = undefined;
+            var r = end.conn.reader(&rbuf);
+            var w = end.conn.writer(&.{});
+            try end.conn.requestKeyUpdate();
+            try w.interface.writeAll("ping\n");
+            try w.interface.flush();
+            // Answered under the keys we already have: no update came back.
+            try testing.expectEqualStrings("pong", (try r.interface.takeDelimiter('\n')).?);
+            try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    end.conn.write.key_updates = max_key_updates;
+    const before = end.conn.write.keys.?.secret;
+    var rbuf: [256]u8 = undefined;
+    var r = end.conn.reader(&rbuf);
+    var w = end.conn.inPlaceWriter();
+    try testing.expectEqualStrings("ping", (try r.interface.takeDelimiter('\n')).?);
+    try end.conn.requestKeyUpdate(); // nothing happens at the cap
+    try w.interface.writeAll("pong\n");
+    try w.interface.flush();
+    try testing.expectEqualSlices(u8, before.slice(), end.conn.write.keys.?.secret.slice());
+    try testing.expectEqual(max_key_updates, end.conn.write.key_updates);
     try end.conn.close();
     try peer.await(io);
 }

@@ -136,12 +136,13 @@ pub const Keys = struct {
 
     /// Seals a record in place. On entry `record[header_len..][0..len]`
     /// holds the plaintext; on return `record[0..sealedLen(len)]` is the
-    /// record, ready to send. Fails only when this generation of keys is
-    /// used up, which the sender prevents with a KeyUpdate.
+    /// record, ready to send. Fails only past this generation's
+    /// `recordLimit` (§5.5), which the sender's KeyUpdate normally
+    /// forestalls; the record at the limit itself is the KeyUpdate.
     pub fn seal(keys: *Keys, record: []u8, content_type: proto.ContentType, len: usize) error{TlsInternalError}!void {
         assert(len <= max_plaintext_len);
         assert(record.len >= sealedLen(len));
-        if (keys.seq == std.math.maxInt(u64)) return error.TlsInternalError;
+        if (keys.seq > keys.recordLimit()) return error.TlsInternalError;
 
         const body_len = len + seal_overhead;
         record[0..header_len].* = header(body_len);
