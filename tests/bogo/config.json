@@ -1,0 +1,397 @@
+{
+  "DisabledTests": {
+    "*TLS1-*": "TLS 1.3 only",
+    "*-TLS1": "TLS 1.3 only",
+    "*TLS11*": "TLS 1.3 only",
+    "*TLS12*": "TLS 1.3 only",
+    "*SSL3*": "TLS 1.3 only",
+    "*DTLS*": "no DTLS",
+    "*-DTLS": "no DTLS",
+    "*QUIC*": "no QUIC",
+    "*-QUIC": "no QUIC",
+    "*Resume*": "no session resumption",
+    "*-Resume": "no session resumption",
+    "*Ticket*": "no session tickets",
+    "*PSK*": "no pre-shared keys",
+    "*EarlyData*": "no 0-RTT",
+    "*0RTT*": "no 0-RTT",
+    "*Renegotiat*": "no renegotiation in TLS 1.3",
+    "*ChannelID*": "no Channel ID",
+    "*NPN*": "no NPN",
+    "*NextProto*": "no NPN",
+    "*ECH*": "no ECH",
+    "*DelegatedCredential*": "no delegated credentials",
+    "*ALPS*": "no ALPS",
+    "*ApplicationSettings*": "no ALPS",
+    "*OCSP*": "no OCSP stapling",
+    "*SCT*": "no signed certificate timestamps",
+    "*SignedCertificateTimestamp*": "no signed certificate timestamps",
+    "*CertCompression*": "no certificate compression",
+    "*PAKE*": "no PAKE",
+    "*SPAKE*": "no PAKE",
+    "*RawPublicKey*": "no raw public keys",
+    "*RPK*": "no raw public keys",
+    "*TrustAnchor*": "no trust anchor identifiers",
+    "*Export*": "no exporters",
+    "*FalseStart*": "no False Start",
+    "*Fuzzer*": "no fuzzer mode",
+    "*HintMismatch*": "handshake hints are BoringSSL-specific",
+    "*Hints*": "handshake hints are BoringSSL-specific",
+    "*Handshaker*": "handshaker is BoringSSL-specific",
+    "*CECPQ2*": "no CECPQ2",
+    "*Kyber*": "no Kyber (only ML-KEM)",
+    "*P-521*": "no P-521",
+    "*secp521*": "no P-521",
+    "*MLDSA*": "no ML-DSA",
+    "*ML-DSA*": "no ML-DSA",
+    "*-RSA_PKCS1_SHA1*": "no SHA-1",
+    "*-ECDSA_SHA1*": "no SHA-1",
+    "*SHA1*": "no SHA-1",
+    "*RSA_PKCS1_SHA256_LEGACY*": "no legacy PKCS#1 in CertificateVerify",
+    "*CBC*": "no CBC suites",
+    "*3DES*": "no 3DES",
+    "*RC4*": "no RC4",
+    "*GREASE*": "no GREASE",
+    "*Compliance*": "no compliance policies",
+    "*FIPS*": "no compliance policies",
+    "*CNSA*": "no compliance policies",
+    "*WPA*": "no compliance policies",
+    "*JDK11*": "BoringSSL-specific workaround",
+    "*Padding*": "no ClientHello padding handling",
+    "*SRTP*": "no SRTP",
+    "*ExtraHandshake*": "no extra handshakes",
+    "*MaxSendFragment*": "no record size tuning",
+    "*WriteDifferentRecordSizes*": "no record size tuning",
+    "*PartialWrite*": "no partial writes",
+    "*PeekThenRead*": "no peek",
+    "*TLSUnique*": "no tls-unique",
+    "*KeyUpdate*": "runner-driven key update tests need flags not implemented yet",
+    "*DDoS*": "no DDoS callback",
+    "*SelectEmptyALPN*": "cannot select an empty protocol",
+    "*ALPN*Reject*": "no reject-ALPN hook",
+    "*CertificateSelection*": "runner-defined credential selection not implemented",
+    "*MultipleCertificate*": "runner-defined credential selection not implemented",
+    "*SigningPrefs*": "no signature preference configuration",
+    "*VerifyPrefs*": "no signature preference configuration",
+    "*NoKeyShares*": "always sends a key share",
+    "*UseCustomVerifyCallback*": "no custom verify callback",
+    "Basic-Server-RSA-*": "TLS 1.2 key exchange",
+    "Basic-Server-ECDHE-*": "TLS 1.2 key exchange",
+    "Basic-Client-*-TLS-*": "versionless basic tests negotiate TLS 1.2",
+    "*SignDefault-RSA_PKCS1_*": "a client with no usable scheme sends an empty Certificate, as RFC 8446 allows, instead of failing locally",
+    "ClientAuth-NoFallback*": "a client with no usable scheme sends an empty Certificate, as RFC 8446 allows, instead of failing locally",
+    "TLS13-InvalidCompressionMethod": "RFC 8446 4.1.2 says illegal_parameter, BoringSSL says decode_error",
+    "V2ClientHello*": "no SSLv2 ClientHello",
+    "FallbackSCSV*": "no fallback SCSV",
+    "SendHelloRetryRequest-2-TLS13": "a share for any supported group is accepted rather than retried for a preferred one",
+    "TrailingMessageData-TLS13-ServerFinished-TLS": "a Finished with trailing data is decode_error here, not a digest mismatch",
+    "TrailingMessageData-TLS13-ClientFinished-TLS": "a Finished with trailing data is decode_error here, not a digest mismatch",
+    "MissingSignatureAlgorithmsInCertificateRequest-TLS13": "missing_extension as RFC 8446 4.3.2 has it, not decode_error",
+    "UnencryptedEncryptedExtensions": "a plaintext handshake record under encryption is unexpected_message here, not bad_record_mac",
+    "TLS13-EmptyRecords-TLS": "a record with no content type is decode_error here, not bad_record_mac",
+    "CheckRecordVersion-TLS13": "RFC 8446 5.1 says the record version must be ignored",
+    "GarbageInitialRecordVersion-TLS13": "RFC 8446 5.1 says the record version must be ignored",
+    "*VerifyDefault-ECDSA_P521*": "P-521 signatures are accepted here",
+    "*VerifyDefault-Ed25519*": "Ed25519 is accepted by default here",
+    "Ed25519DefaultDisable*": "Ed25519 is accepted by default here",
+    "*CertificateType*": "no raw public keys",
+    "TLS13-HRR-InvalidCompressionMethod": "RFC 8446 4.1.3 says illegal_parameter, BoringSSL says decode_error",
+    "EMS-Forbidden-TLS13": "extended_master_secret is never offered, so the server has nothing to echo",
+    "CertificateVerificationFail-*": "an untrusted issuer is answered with unknown_ca, as RFC 8446 6.2 has it, not handshake_failure"
+  },
+  "ErrorMap": {
+    ":DECODE_ERROR:": [
+      "TlsDecodeError"
+    ],
+    ":BAD_LENGTH:": [
+      "TlsDecodeError"
+    ],
+    ":EXCESSIVE_MESSAGE_SIZE:": [
+      "TlsIllegalParameter",
+      "TlsDecodeError"
+    ],
+    ":UNEXPECTED_MESSAGE:": [
+      "TlsUnexpectedMessage"
+    ],
+    ":UNEXPECTED_RECORD:": [
+      "TlsUnexpectedMessage"
+    ],
+    ":UNEXPECTED_EXTENSION:": [
+      "TlsIllegalParameter",
+      "TlsUnsupportedExtension"
+    ],
+    ":DUPLICATE_EXTENSION:": [
+      "TlsDecodeError",
+      "TlsIllegalParameter"
+    ],
+    ":MISSING_EXTENSION:": [
+      "TlsMissingExtension"
+    ],
+    ":MISSING_KEY_SHARE:": [
+      "TlsMissingExtension",
+      "TlsIllegalParameter"
+    ],
+    ":WRONG_CURVE:": [
+      "TlsIllegalParameter"
+    ],
+    ":WRONG_CIPHER_RETURNED:": [
+      "TlsIllegalParameter"
+    ],
+    ":WRONG_VERSION_NUMBER:": [
+      "TlsProtocolVersion",
+      "TlsIllegalParameter",
+      "TlsDecodeError",
+      "TlsRecordOverflow"
+    ],
+    ":UNSUPPORTED_PROTOCOL:": [
+      "TlsProtocolVersion",
+      "TlsAlertProtocolVersion"
+    ],
+    ":NO_SHARED_CIPHER:": [
+      "TlsHandshakeFailure"
+    ],
+    ":NO_SHARED_GROUP:": [
+      "TlsHandshakeFailure",
+      "TlsMissingExtension"
+    ],
+    ":NO_COMMON_SIGNATURE_ALGORITHMS:": [
+      "TlsHandshakeFailure",
+      "TlsMissingExtension"
+    ],
+    ":HANDSHAKE_FAILURE_ON_CLIENT_HELLO:": [
+      "TlsHandshakeFailure",
+      "TlsAlertHandshakeFailure"
+    ],
+    ":DIGEST_CHECK_FAILED:": [
+      "TlsDecryptError"
+    ],
+    ":BAD_SIGNATURE:": [
+      "TlsDecryptError"
+    ],
+    ":BAD_DECRYPT:": [
+      "TlsBadRecordMac"
+    ],
+    ":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:": [
+      "TlsBadRecordMac"
+    ],
+    ":ENCRYPTED_LENGTH_TOO_LONG:": [
+      "TlsRecordOverflow"
+    ],
+    ":DATA_LENGTH_TOO_LONG:": [
+      "TlsRecordOverflow"
+    ],
+    ":RECORD_LENGTH_MISMATCH:": [
+      "TlsDecodeError",
+      "TlsIllegalParameter"
+    ],
+    ":TOO_MANY_EMPTY_FRAGMENTS:": [
+      "TlsUnexpectedMessage"
+    ],
+    ":TOO_MANY_WARNING_ALERTS:": [
+      "TlsUnexpectedMessage"
+    ],
+    ":TOO_MANY_KEY_UPDATES:": [
+      "TlsUnexpectedMessage"
+    ],
+    ":INVALID_ALERT:": [
+      "TlsDecodeError",
+      "TlsAlertUnknown"
+    ],
+    ":BAD_ALERT:": [
+      "TlsDecodeError",
+      "TlsAlert"
+    ],
+    ":WRONG_SSL_VERSION:": [
+      "TlsIllegalParameter",
+      "TlsProtocolVersion"
+    ],
+    ":INVALID_COMPRESSION_LIST:": [
+      "TlsIllegalParameter",
+      "TlsDecodeError"
+    ],
+    ":UNSUPPORTED_COMPRESSION_ALGORITHM:": [
+      "TlsIllegalParameter"
+    ],
+    ":INVALID_OUTER_RECORD_TYPE:": [
+      "TlsUnexpectedMessage"
+    ],
+    ":CERTIFICATE_VERIFY_FAILED:": [
+      "CertificateIssuerNotFound",
+      "CertificateHostMismatch",
+      "CertificateExpired",
+      "CertificateNotYetValid",
+      "TlsBadCertificate"
+    ],
+    ":PEER_DID_NOT_RETURN_A_CERTIFICATE:": [
+      "TlsCertificateRequired",
+      "TlsDecodeError"
+    ],
+    ":DECODE_ERROR_CERTIFICATE:": [
+      "TlsDecodeError",
+      "TlsBadCertificate"
+    ],
+    ":BAD_ECPOINT:": [
+      "TlsIllegalParameter",
+      "TlsDecodeError"
+    ],
+    ":NO_APPLICATION_PROTOCOL:": [
+      "TlsNoApplicationProtocol"
+    ],
+    ":INVALID_ALPN_PROTOCOL:": [
+      "TlsIllegalParameter",
+      "TlsDecodeError"
+    ],
+    ":INVALID_ALPN_PROTOCOL_LIST:": [
+      "TlsIllegalParameter",
+      "TlsDecodeError"
+    ],
+    ":SERVER_ECHOED_INVALID_SESSION_ID:": [
+      "TlsIllegalParameter"
+    ],
+    ":WRONG_SIGNATURE_TYPE:": [
+      "TlsIllegalParameter"
+    ],
+    ":UNKNOWN_CERTIFICATE_TYPE:": [
+      "TlsIllegalParameter",
+      "TlsUnsupportedCertificate"
+    ],
+    ":PARSE_TLSEXT:": [
+      "TlsDecodeError",
+      "TlsIllegalParameter"
+    ],
+    ":SECOND_SERVERHELLO_VERSION_MISMATCH:": [
+      "TlsIllegalParameter"
+    ],
+    ":UNEXPECTED_COMPATIBILITY_MODE:": [
+      "TlsIllegalParameter",
+      "TlsUnexpectedMessage"
+    ],
+    ":EMPTY_HELLO_RETRY_REQUEST:": [
+      "TlsIllegalParameter",
+      "TlsUnexpectedMessage"
+    ],
+    ":UNEXPECTED_HELLO_RETRY_REQUEST:": [
+      "TlsUnexpectedMessage",
+      "TlsIllegalParameter"
+    ],
+    ":DUPLICATE_KEY_SHARE:": [
+      "TlsIllegalParameter"
+    ],
+    ":SSLV3_ALERT_HANDSHAKE_FAILURE:": [
+      "TlsAlertHandshakeFailure"
+    ],
+    ":SSLV3_ALERT_ILLEGAL_PARAMETER:": [
+      "TlsAlertIllegalParameter"
+    ],
+    ":SSLV3_ALERT_CERTIFICATE_UNKNOWN:": [
+      "TlsAlertCertificateUnknown"
+    ],
+    ":SSLV3_ALERT_UNEXPECTED_MESSAGE:": [
+      "TlsAlertUnexpectedMessage"
+    ],
+    ":TLSV1_ALERT_DECODE_ERROR:": [
+      "TlsAlertDecodeError"
+    ],
+    ":TLSV1_ALERT_PROTOCOL_VERSION:": [
+      "TlsAlertProtocolVersion"
+    ],
+    ":TLSV1_ALERT_UNKNOWN_CA:": [
+      "TlsAlertUnknownCa"
+    ],
+    ":TLSV1_ALERT_CERTIFICATE_REQUIRED:": [
+      "TlsAlertCertificateRequired"
+    ],
+    ":TLSV1_ALERT_NO_APPLICATION_PROTOCOL:": [
+      "TlsAlertNoApplicationProtocol"
+    ],
+    ":TLSV1_ALERT_MISSING_EXTENSION:": [
+      "TlsAlertMissingExtension"
+    ],
+    ":TLSV1_ALERT_INSUFFICIENT_SECURITY:": [
+      "TlsAlertInsufficientSecurity"
+    ],
+    ":SSLV3_ALERT_BAD_CERTIFICATE:": [
+      "TlsAlertBadCertificate"
+    ],
+    ":SSLV3_ALERT_ACCESS_DENIED:": [
+      "TlsAlertAccessDenied"
+    ],
+    ":SSLV3_ALERT_DECRYPT_ERROR:": [
+      "TlsAlertDecryptError"
+    ],
+    ":TLSV1_ALERT_INTERNAL_ERROR:": [
+      "TlsAlertInternalError"
+    ],
+    ":SSLV3_ALERT_BAD_RECORD_MAC:": [
+      "TlsAlertBadRecordMac"
+    ],
+    ":SSLV3_ALERT_RECORD_OVERFLOW:": [
+      "TlsAlertRecordOverflow"
+    ],
+    ":SSLV3_ALERT_UNSUPPORTED_CERTIFICATE:": [
+      "TlsAlertUnsupportedCertificate"
+    ],
+    ":SSLV3_ALERT_CERTIFICATE_EXPIRED:": [
+      "TlsAlertCertificateExpired"
+    ],
+    ":TLSV1_ALERT_UNRECOGNIZED_NAME:": [
+      "TlsAlertUnrecognizedName"
+    ],
+    ":TLSV1_ALERT_UNSUPPORTED_EXTENSION:": [
+      "TlsAlertUnsupportedExtension"
+    ],
+    ":TLSV1_ALERT_INAPPROPRIATE_FALLBACK:": [
+      "TlsAlertInappropriateFallback"
+    ],
+    ":TLSV1_ALERT_USER_CANCELLED:": [
+      "TlsAlertUserCanceled"
+    ],
+    ":EXCESS_HANDSHAKE_DATA:": [
+      "TlsUnexpectedMessage"
+    ],
+    ":HTTP_REQUEST:": [
+      "TlsRecordOverflow",
+      "TlsConnectionTruncated",
+      "TlsDecodeError",
+      "TlsUnexpectedMessage"
+    ],
+    ":HTTPS_PROXY_REQUEST:": [
+      "TlsRecordOverflow",
+      "TlsConnectionTruncated",
+      "TlsDecodeError",
+      "TlsUnexpectedMessage"
+    ],
+    ":CLIENTHELLO_PARSE_FAILED:": [
+      "TlsDecodeError"
+    ],
+    ":ERROR_PARSING_EXTENSION:": [
+      "TlsDecodeError",
+      "TlsIllegalParameter",
+      "TlsUnsupportedExtension"
+    ],
+    ":UNSUPPORTED_ALGORITHM:": [
+      "TlsUnsupportedCertificate",
+      "TlsIllegalParameter"
+    ],
+    ":TLSV1_ALERT_RECORD_OVERFLOW:": [
+      "TlsAlertRecordOverflow"
+    ],
+    ":SSLV3_ALERT_DECOMPRESSION_FAILURE:": [
+      "TlsAlertUnknown"
+    ],
+    ":UNKNOWN_ALERT_TYPE:": [
+      "TlsIllegalParameter",
+      "TlsAlertUnknown"
+    ],
+    ":APPLICATION_DATA_ON_SHUTDOWN:": [
+      "data instead of close_notify"
+    ],
+    ":CANNOT_PARSE_LEAF_CERT:": [
+      "TlsDecodeError",
+      "TlsBadCertificate"
+    ],
+    ":KEY_USAGE_BIT_INCORRECT:": [
+      "TlsBadCertificate"
+    ]
+  }
+}

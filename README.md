@@ -151,8 +151,9 @@ zig build test -fqemu -Dtarget=aarch64-linux-musl
 
 The tests include self-talk over a loopback socket and interoperability
 with `openssl s_server` and `s_client` when OpenSSL 1.1.1 or newer is on the
-PATH. Format with Zig 0.16's `zig fmt`: 0.17's rewrites builtins that 0.16
-does not accept.
+PATH. `tests/bogo/run.sh` runs BoringSSL's test runner against the library;
+it needs Go. Format with Zig 0.16's `zig fmt`: 0.17's rewrites builtins
+that 0.16 does not accept.
 
 `vendor/aws-lc` builds libcrypto; `gen_sources.py` there regenerates the
 file lists from upstream's CMake build after an upgrade. AWS-LC's headers

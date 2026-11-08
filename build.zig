@@ -32,4 +32,16 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
+
+    // The shim BoringSSL's test runner drives; see tests/bogo/run.sh.
+    const shim = b.addExecutable(.{
+        .name = "bogo-shim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/bogo/shim.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "ztls", .module = mod }},
+        }),
+    });
+    b.step("bogo-shim", "Build the BoGo shim").dependOn(&b.addInstallArtifact(shim, .{}).step);
 }
