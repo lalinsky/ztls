@@ -134,7 +134,10 @@ certificates; any certificate in the store is a trust anchor, an
 intermediate included. `addSystemBundle` loads the roots the system
 trusts and `addBundle` takes any `std.crypto.Certificate.Bundle`, so files
 and system stores are read by std, through your `std.Io`, and AWS-LC only
-ever sees bytes.
+ever sees bytes. Two things come with that: a `Bundle` keeps one
+certificate per subject name, and it drops roots std's own X.509 parser
+does not understand before AWS-LC sees them. Neither affects the usual CA
+bundles; a trust store with unusual roots is better fed through `addPem`.
 
 A server can hold several certificates: `certificates` are tried for the
 client's server name and the signature algorithms it accepts, and

@@ -123,24 +123,40 @@ pub const TrustStore = struct {
 
     /// Adds every certificate in `bundle`, which does the loading: it
     /// knows where each platform keeps its roots (`Bundle.rescan`) and
-    /// reads files through `std.Io`. Returns how many were added.
-    pub fn addBundle(self: *TrustStore, bundle: *const Bundle) error{ InvalidCertificate, CryptoFailed }!usize {
+    /// reads files through `std.Io`. One AWS-LC will not parse is skipped
+    /// and logged, so that a single odd root cannot take the rest down.
+    /// Returns how many were added.
+    ///
+    /// Two things about `Bundle` carry over. It keeps one certificate per
+    /// subject name, so of two roots with the same name and different keys
+    /// only the first read survives. And it parses with std's X.509 code
+    /// first: a root with an extension or key type std does not know is
+    /// dropped before it gets here, and a malformed one fails the whole
+    /// load. For roots that come from the usual CA bundles neither
+    /// matters in practice.
+    pub fn addBundle(self: *TrustStore, bundle: *const Bundle) err.Error!usize {
         var count: usize = 0;
         var it = bundle.map.valueIterator();
         while (it.next()) |start| {
             // Each entry is the offset of a DER certificate in `bytes`; its
-            // length is in its own header.
-            const element = std.crypto.Certificate.der.Element.parse(bundle.bytes.items, start.*) catch return error.InvalidCertificate;
-            try self.addDer(bundle.bytes.items[start.*..element.slice.end]);
+            // length is in its own header, which Bundle has already parsed.
+            const element = std.crypto.Certificate.der.Element.parse(bundle.bytes.items, start.*) catch unreachable;
+            const der = bundle.bytes.items[start.*..element.slice.end];
+            var cert = Certificate.parseDer(der) catch {
+                log.debug("skipping a root certificate at bundle offset {d} that AWS-LC does not parse", .{start.*});
+                continue;
+            };
+            defer cert.deinit();
+            try self.addCertificate(&cert);
             count += 1;
         }
         return count;
     }
 
     /// Adds the roots the system trusts, found as `Bundle.rescan` finds
-    /// them. Roots already expired are left out. Returns how many were
-    /// added.
-    pub fn addSystemBundle(self: *TrustStore, gpa: std.mem.Allocator, io: std.Io) (Bundle.RescanError || error{ InvalidCertificate, CryptoFailed })!usize {
+    /// them, with the limitations noted on `addBundle`. Roots already
+    /// expired are left out. Returns how many were added.
+    pub fn addSystemBundle(self: *TrustStore, gpa: std.mem.Allocator, io: std.Io) (Bundle.RescanError || err.Error)!usize {
         var bundle: Bundle = .empty;
         defer bundle.deinit(gpa);
         try bundle.rescan(gpa, io, std.Io.Clock.real.now(io));
@@ -341,8 +357,9 @@ test "the system's roots" {
         error.FileNotFound => return error.SkipZigTest,
         else => return e,
     };
-    // Every system has some roots, and AWS-LC accepts all that std does.
-    try testing.expect(count > 0);
+    // A system has a hundred or so roots, and AWS-LC accepts all that
+    // std does; much fewer would mean part of the bundle went unread.
+    try testing.expect(count > 50);
 }
 
 test "untrusted and client certificates" {
