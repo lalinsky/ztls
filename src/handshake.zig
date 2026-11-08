@@ -29,7 +29,7 @@ pub const Error = proto.LocalError || proto.Alert.Error || error{
     OutOfMemory,
 };
 
-/// The ServerHello.random that makes it a HelloRetryRequest (§4.1.3).
+/// The ServerHello.random that makes it a HelloRetryRequest (§4.2.3).
 pub const hello_retry_request_random = [32]u8{
     0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
@@ -521,7 +521,7 @@ pub const Handshake = struct {
         try w.finish();
     }
 
-    /// The bytes a CertificateVerify signs (§4.4.3): 64 spaces, the
+    /// The bytes a CertificateVerify signs (§4.5.2): 64 spaces, the
     /// context string, a zero and the transcript hash.
     fn certificateVerifyContent(h: *const Handshake, signer: proto.Side, out: *[64 + 33 + 1 + crypto.hash.max_digest_length]u8) []const u8 {
         const context = switch (signer) {
@@ -554,7 +554,7 @@ pub const Handshake = struct {
     }
 
     /// A Finished message for the side whose handshake traffic secret
-    /// this is (§4.4.4).
+    /// this is (§4.5.3).
     pub fn writeFinished(h: *Handshake, traffic_secret: *const Secret) Error!void {
         var hash_buf: [crypto.hash.max_digest_length]u8 = undefined;
         const hash = h.transcriptHash(&hash_buf);
@@ -591,7 +591,7 @@ pub const Handshake = struct {
             if (peer.len == peer.chain.len) return error.TlsBadCertificate;
             const der = try list.vectorBytes(u24);
             // Extensions here answer a request (status_request, SCTs) we
-            // never make (§4.4.2), so none may come.
+            // never make (§4.5.1), so none may come.
             const extensions = try list.vector(u16);
             if (!extensions.eof()) return error.TlsUnsupportedExtension;
             peer.chain[peer.len] = x509.Certificate.parseDer(der) catch return error.TlsDecodeError;

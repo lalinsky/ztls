@@ -15,8 +15,8 @@ Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system.
 
 ## Features
 
-- Client and server per RFC 8446. Older protocol versions are refused with a
-  protocol_version alert.
+- Client and server per [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846).
+  Older protocol versions are refused with a protocol_version alert.
 - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305.
 - X25519MLKEM768, X25519, P-256 and P-384 key exchange, with
   HelloRetryRequest on both sides.

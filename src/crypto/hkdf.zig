@@ -1,5 +1,5 @@
 //! HKDF (RFC 5869) and the TLS 1.3 key schedule primitives built on it
-//! (RFC 8446 §7.1).
+//! (RFC 9846 §7.1).
 
 const std = @import("std");
 const assert = std.debug.assert;

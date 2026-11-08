@@ -1,4 +1,4 @@
-//! The client's side of the handshake (RFC 8446 §2): ClientHello, a
+//! The client's side of the handshake (RFC 9846 §2): ClientHello, a
 //! HelloRetryRequest if the server wants another group, the server's
 //! flight, then our Finished (and certificate, if asked).
 
@@ -65,7 +65,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     var random: [32]u8 = undefined;
     crypto.rand.bytes(&random);
     // A non-empty legacy_session_id asks the server for middlebox
-    // compatibility mode (§D.4); both sides then send a dummy CCS.
+    // compatibility mode (§E.4); both sides then send a dummy CCS.
     var session_id: [32]u8 = undefined;
     crypto.rand.bytes(&session_id);
 
@@ -85,7 +85,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
         h.setSuite(hello.suite);
         h.transcript.replaceWithMessageHash();
         h.hashMessage(msg);
-        // A retry must change something (§4.1.4): a group we support and
+        // A retry must change something (§4.2.4): a group we support and
         // did not already offer a share for, or a cookie to echo.
         var retry_groups: [1]proto.NamedGroup = undefined;
         var share_groups: []const proto.NamedGroup = opt.key_shares;
@@ -144,7 +144,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     }
 
     try h.expect(msg, .certificate);
-    // A server's chain is never empty (§4.4.2).
+    // A server's chain is never empty (§4.5.1).
     var peer = (try h.parseCertificate(msg.body, "")) orelse return error.TlsDecodeError;
     defer peer.deinit();
     h.conn.peer_key_type = peer.public_key.key_type;
@@ -173,7 +173,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
             try h.writeCertificate(req.context(), opt.auth.?);
             try h.writeCertificateVerify(opt.auth.?, req.scheme.?, .client);
         } else {
-            // Nothing to show: an empty Certificate (§4.4.2).
+            // Nothing to show: an empty Certificate (§4.5.1).
             try h.writeCertificate(req.context(), null);
         }
     }
@@ -323,7 +323,7 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: *const [32
                 hello.cookie = try data.vectorBytes(u16);
                 if (hello.cookie.?.len == 0) return error.TlsDecodeError;
             },
-            // We offered no PSK, so nothing else belongs here (§4.1.3).
+            // We offered no PSK, so nothing else belongs here (§4.2.3).
             else => return error.TlsUnsupportedExtension,
         }
         try data.expectEof();
@@ -333,7 +333,7 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: *const [32
     return hello;
 }
 
-/// A repeated extension type is a malformed block (§4.2), whatever the
+/// A repeated extension type is a malformed block (§4.3), whatever the
 /// type, so the whole block is checked before any extension is read.
 /// Servers send a handful of extensions, so a block past the list is
 /// taken as malformed too.
@@ -390,7 +390,7 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair) E
     var extensions = try d.vector(u16);
     try d.expectEof();
 
-    // The context is for post-handshake authentication only (§4.3.2).
+    // The context is for post-handshake authentication only (§4.4.2).
     if (context.len != 0) return error.TlsDecodeError;
     var request: CertificateRequest = .{ .context_buf = undefined, .context_len = 0, .scheme = null };
 

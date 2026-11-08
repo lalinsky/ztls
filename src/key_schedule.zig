@@ -1,4 +1,4 @@
-//! The TLS 1.3 key schedule (RFC 8446 §7.1) and the transcript hash it
+//! The TLS 1.3 key schedule (RFC 9846 §7.1) and the transcript hash it
 //! takes as input.
 
 const std = @import("std");
@@ -67,7 +67,7 @@ pub const Transcript = struct {
 
     /// After a HelloRetryRequest the first ClientHello is replaced by a
     /// synthetic message_hash handshake message holding its hash
-    /// (RFC 8446 §4.4.1).
+    /// (RFC 9846 §4.1).
     pub fn replaceWithMessageHash(t: *Transcript) void {
         var buf: [hash.max_digest_length]u8 = undefined;
         const h = t.digest(&buf);
@@ -164,7 +164,7 @@ pub fn nextTrafficSecret(algorithm: hash.Algorithm, secret: *const Secret) Secre
     return s;
 }
 
-/// The verify_data of a Finished message (§4.4.4) for the side whose
+/// The verify_data of a Finished message (§4.5.3) for the side whose
 /// traffic secret this is.
 pub fn verifyData(algorithm: hash.Algorithm, traffic_secret: *const Secret, transcript_hash: []const u8, out: *[hash.max_digest_length]u8) []const u8 {
     var finished_key: Secret = .{ .bytes = undefined, .len = traffic_secret.len };

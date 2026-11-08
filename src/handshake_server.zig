@@ -1,4 +1,4 @@
-//! The server's side of the handshake (RFC 8446 §2): the ClientHello, a
+//! The server's side of the handshake (RFC 9846 §2): the ClientHello, a
 //! HelloRetryRequest when the client sent no share we can use, our flight,
 //! then the client's Finished (and certificate, if we asked).
 
@@ -102,13 +102,13 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
 
     var retried = false;
     if (hello.shareFor(choices.group) == null) {
-        // No usable share: ask for one (§4.1.4).
+        // No usable share: ask for one (§4.2.4).
         retried = true;
         h.conn.retried = true;
         h.transcript.replaceWithMessageHash();
         try writeServerHello(h, choices.suite, choices.group, null, session_id);
         // The middlebox-compatibility change_cipher_spec goes out whatever
-        // the client's session id: §D.4 allows it at any time and peers
+        // the client's session id: §E.4 allows it at any time and peers
         // must drop it, while some expect it unconditionally.
         h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
         try h.flush();
@@ -118,7 +118,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
         try h.expectFlightEnd();
         hello = try parseClientHello(msg.body);
         const second = try choose(&hello, opt, auth);
-        // The second hello may differ only in its key share (§4.1.2).
+        // The second hello may differ only in its key share (§4.2.2).
         if (second.suite != choices.suite or second.group != choices.group or second.scheme != choices.scheme) return error.TlsIllegalParameter;
         if (!std.mem.eql(u8, hello.session_id, session_id) or hello.has_cookie) return error.TlsIllegalParameter;
         if (!std.mem.eql(u8, hello.server_name orelse "", server_name_buf[0..server_name_len])) return error.TlsIllegalParameter;
@@ -243,14 +243,14 @@ fn selectAlpn(ours: []const []const u8, offered: ?[]const u8) Error!?[]const u8 
 fn parseClientHello(body: []const u8) Error!ClientHello {
     var d = codec.Decoder.init(body);
     // legacy_version plays no part once supported_versions is there
-    // (§4.2.1), and that extension is required below.
+    // (§4.3.1), and that extension is required below.
     _ = try d.decode(proto.Version);
     _ = try d.array(32); // random
     const session_id = try d.vectorBytes(u8);
     if (session_id.len > 32) return error.TlsDecodeError;
     const suites = try d.vectorBytes(u16);
     if (suites.len == 0 or suites.len % 2 != 0) return error.TlsDecodeError;
-    // TLS 1.3 clients offer the null compression method only (§4.1.2).
+    // TLS 1.3 clients offer the null compression method only (§4.2.2).
     if (!std.mem.eql(u8, try d.vectorBytes(u8), &.{0})) return error.TlsIllegalParameter;
     var extensions = try d.vector(u16);
     try d.expectEof();
@@ -259,7 +259,7 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
     var supports_1_3 = false;
     var has_key_share = false;
     var has_groups = false;
-    // A repeated extension type is a malformed block (§4.2). Clients send
+    // A repeated extension type is a malformed block (§4.3). Clients send
     // a dozen or two, GREASE included.
     var seen: [64]u16 = undefined;
     var seen_len: usize = 0;
@@ -365,14 +365,14 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
     if (!supports_1_3) return error.TlsProtocolVersion;
     // (EC)DHE is the only key exchange here, so both are required (§9.2).
     if (!has_key_share or !has_groups) return error.TlsMissingExtension;
-    // A share may only be offered for a group in supported_groups (§4.2.8).
+    // A share may only be offered for a group in supported_groups (§4.3.8).
     for (hello.key_shares[0..hello.key_shares_len]) |ks| {
         if (!hello.supportsGroup(ks.group)) return error.TlsIllegalParameter;
     }
     return hello;
 }
 
-/// A ServerHello, or a HelloRetryRequest when `share` is null (§4.1.4).
+/// A ServerHello, or a HelloRetryRequest when `share` is null (§4.2.4).
 fn writeServerHello(h: *Handshake, suite: proto.CipherSuite, group: proto.NamedGroup, share: ?[]const u8, session_id: []const u8) Error!void {
     var buf: [2048]u8 = undefined;
     var w = codec.Writer.init(&buf);

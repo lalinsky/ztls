@@ -8,7 +8,7 @@ const c = @import("c");
 const err = @import("err.zig");
 const pem = @import("pem.zig");
 
-/// The signature algorithms of RFC 8446 §4.2.3 that may sign a
+/// The signature algorithms of RFC 9846 §4.3.3 that may sign a
 /// CertificateVerify. The rsa_pkcs1 ones may only appear in certificates,
 /// where X.509 verification handles them.
 pub const Algorithm = enum {

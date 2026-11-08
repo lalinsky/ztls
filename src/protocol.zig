@@ -1,4 +1,4 @@
-//! The constants of RFC 8446 and friends, and the alerts with their
+//! The constants of RFC 9846 and friends, and the alerts with their
 //! mapping to and from Zig errors.
 
 const std = @import("std");
@@ -265,7 +265,7 @@ pub const Alert = enum(u8) {
         };
     }
 
-    /// The two-byte alert body. TLS 1.3 peers ignore the level (RFC 8446
+    /// The two-byte alert body. TLS 1.3 peers ignore the level (RFC 9846
     /// §6), but the closure alerts are sent as warnings for older ones.
     pub fn encode(alert: Alert) [2]u8 {
         const level: Level = switch (alert) {
@@ -276,7 +276,7 @@ pub const Alert = enum(u8) {
     }
 
     /// The description byte of an alert body. The level is ignored, as
-    /// RFC 8446 §6 says it may be: every alert but two is fatal regardless.
+    /// RFC 9846 §6 says it may be: every alert but two is fatal regardless.
     pub fn decode(body: *const [2]u8) Alert {
         return @enumFromInt(body[1]);
     }

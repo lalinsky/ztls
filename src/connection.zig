@@ -198,7 +198,7 @@ pub const Connection = struct {
                 error.ReadFailed => return error.ReadFailed,
             };
             const content_type: proto.ContentType = @enumFromInt(header[0]);
-            // legacy_record_version is ignored, as RFC 8446 §5.1 says.
+            // legacy_record_version is ignored, as RFC 9846 §5.1 says.
             const body_len = std.mem.readInt(u16, header[3..5], .big);
             if (body_len > cipher.max_ciphertext_len) return error.TlsRecordOverflow;
             const record = c.input.take(cipher.header_len + body_len) catch |err| switch (err) {
@@ -380,7 +380,7 @@ pub const Connection = struct {
     /// NewSessionTicket, which v1 drops. Each must be whole within its
     /// record (every known stack sends them so; a ticket split across
     /// records would be an interop failure rather than a violation), and
-    /// KeyUpdate must be the record's last message (§4.6.3).
+    /// KeyUpdate must be the record's last message (§4.7.3).
     fn handlePostHandshake(c: *Connection, payload: []const u8) Failure!void {
         var d = codec.Decoder.init(payload);
         while (!d.eof()) {
@@ -536,7 +536,7 @@ pub const Connection = struct {
         return c.writeRecord(.alert, &alert.encode());
     }
 
-    /// The dummy change_cipher_spec of middlebox compatibility mode (§D.4),
+    /// The dummy change_cipher_spec of middlebox compatibility mode (§E.4),
     /// always in the clear.
     pub fn writeChangeCipherSpec(c: *Connection) error{WriteFailed}!void {
         const record = [_]u8{ @intFromEnum(proto.ContentType.change_cipher_spec), 3, 3, 0, 1, 1 };
@@ -554,7 +554,7 @@ pub const Connection = struct {
     /// the peer's request if there is one. The claim happens before the
     /// update is sent, so a request arriving in between stays set and is
     /// answered before the record after this one. A request is answered
-    /// only when something is written, which §4.6.3 allows: a connection
+    /// only when something is written, which §4.7.3 allows: a connection
     /// that never writes again never answers, and the peer is not blocked.
     fn claimKeyUpdate(c: *Connection) bool {
         const requested = c.shared.key_update_requested.load(.monotonic) and
@@ -572,7 +572,7 @@ pub const Connection = struct {
         c.write.keys.?.update() catch return error.TlsInternalError;
     }
 
-    /// Asks the peer to update its keys, updating ours first (§4.6.3).
+    /// Asks the peer to update its keys, updating ours first (§4.7.3).
     /// For the writing task.
     pub fn requestKeyUpdate(c: *Connection) WriteError!void {
         try c.checkWritable();

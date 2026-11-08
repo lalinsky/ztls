@@ -1,4 +1,4 @@
-//! Record protection (RFC 8446 §5.2): the keys of one direction, sealing
+//! Record protection (RFC 9846 §5.2): the keys of one direction, sealing
 //! and opening records in one AEAD pass, and the per-key-generation
 //! limits.
 
