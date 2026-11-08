@@ -147,3 +147,15 @@ that 0.16 does not accept.
 `vendor/aws-lc` builds libcrypto; `gen_sources.py` there regenerates the
 file lists from upstream's CMake build after an upgrade. AWS-LC's headers
 reach Zig through translate-c from `src/c.h`.
+
+## License
+
+ztls is [MIT](LICENSE). The test keys and the example handshake in
+`src/testdata` come from [tls.zig](https://github.com/ianic/tls.zig), also
+MIT, which is why its author is named in the licence too.
+
+AWS-LC is compiled into every binary that links ztls. Its code is
+Apache-2.0 or ISC, with BoringSSL-derived parts under ISC and
+OpenSSL-derived parts under Apache-2.0 and the original SSLeay notice;
+[its LICENSE](https://github.com/aws/aws-lc/blob/main/LICENSE) has the
+details. A shipped binary carries those notices along with ztls's.
