@@ -344,9 +344,10 @@ pub const Connection = struct {
     pub const Reader = struct {
         conn: *Connection,
         interface: Io.Reader,
-        /// Why the last read failed. `ReadFailed` means the transport
-        /// reader failed, and its own error says how; that one does not
-        /// end the connection, and the read may be retried.
+        /// Why the last read failed: a `Failure` of the connection, or
+        /// `ReadFailed` when the transport reader failed and its own error
+        /// says how; that one does not end the connection, and the read
+        /// may be retried.
         err: ?ReadError = null,
 
         fn init(c: *Connection, buffer: []u8) Reader {
@@ -633,8 +634,10 @@ pub const Connection = struct {
     pub const Writer = struct {
         conn: *Connection,
         interface: Io.Writer,
-        /// Why the last write failed. `WriteFailed` means the transport
-        /// writer failed, and its own error says how.
+        /// Why the last write failed: a `Failure` of the connection, the
+        /// read side's included since its alert goes out this way, or
+        /// `WriteFailed` when the transport writer failed and its own
+        /// error says how.
         err: ?WriteError = null,
 
         fn init(c: *Connection, buffer: []u8) Writer {

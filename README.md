@@ -120,6 +120,8 @@ chain. Budget 64 KiB of stack for a task that runs handshakes.
 an alert the peer sent (`TlsAlert...`), something the record layer found
 (`TlsBadRecordMac`, `TlsConnectionTruncated`, ...), or `ReadFailed` or
 `WriteFailed` when the transport itself failed and its own error says why.
+A peer certificate we reject is reported under std's names
+(`CertificateIssuerNotFound`, `CertificateExpired`, ...).
 A transport `ReadFailed`, such as a cancelled read, does not end the
 connection; the read may be retried.
 
