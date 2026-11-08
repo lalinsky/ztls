@@ -459,7 +459,14 @@ test "a peer that hangs up during the handshake" {
     const Rude = struct {
         fn run(l: *testu.Loopback) !void {
             const stream = try l.accept();
-            stream.close(l.io);
+            defer stream.close(l.io);
+            // Take the ClientHello first. Closing with it unread would
+            // reset the connection instead of ending it, and what the
+            // client then sees depends on the OS.
+            var buf: [4096]u8 = undefined;
+            var reader = stream.reader(l.io, &buf);
+            const header = try reader.interface.takeArray(5);
+            try reader.interface.discardAll(std.mem.readInt(u16, header[3..5], .big));
         }
     };
     var rude = try io.concurrent(Rude.run, .{&loopback});
