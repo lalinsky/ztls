@@ -1144,7 +1144,6 @@ test "past the key update cap a sender ignores requests and keeps its keys" {
             try end.conn.requestKeyUpdate();
             try w.interface.writeAll("ping\n");
             try w.interface.flush();
-            // Answered under the keys we already have: no update came back.
             try testing.expectEqualStrings("pong", (try r.interface.takeDelimiter('\n')).?);
             try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
         }

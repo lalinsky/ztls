@@ -13,9 +13,18 @@ echo
 echo "== ztls, $(wc -l <"$z") hosts (ok = handshake done, whatever HTTP did)"
 pct 2 <"$z"
 echo
-echo "== TLS 1.2 only, by ztls's own account: handshake_failure or a 1.2 ServerHello"
-echo "   (a server that shares none of our groups lands here too)"
-awk -F'\t' '$3 == "TlsAlertHandshakeFailure" || $3 == "TlsProtocolVersion" { c++ } END { printf "  %d of %d  %5.1f%%\n", c, NR, 100 * c / NR }' "$z"
+echo "== Headline, over the hosts that answered either probe"
+echo "   TLS 1.3: openssl negotiated it or ztls connected. TLS 1.2 only: openssl"
+echo "   negotiated 1.2 and ztls was refused, or ztls alone got a 1.2 answer."
+awk -F'\t' 'NR == FNR { o[$1] = $2; next }
+    {
+        z = ($2 == "ok") ? "ok" : $3
+        if (o[$1] == "tls13" || z == "ok") k = "TLS 1.3"
+        else if (o[$1] == "tls12_only" || z == "TlsAlertProtocolVersion" || z == "TlsAlertHandshakeFailure") k = "TLS 1.2 only"
+        else next
+        c[k]++; n++
+    }
+    END { for (k in c) printf "  %-32s %6d  %5.1f%%\n", k, c[k], 100 * c[k] / n; printf "  %-32s %6d\n", "answered", n }' "$o" "$z" | sort -k2 -nr
 echo
 echo "== ztls results on hosts that offer TLS 1.3"
 awk -F'\t' 'NR == FNR { if ($2 == "tls13") t[$1] = 1; next } ($1 in t) { c[$2 == "ok" ? "ok" : $3]++; n++ }

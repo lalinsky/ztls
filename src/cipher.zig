@@ -116,9 +116,9 @@ pub const Keys = struct {
         keys.* = next;
     }
 
-    /// How many records one generation of keys should seal before the
-    /// sender updates them: for AES-GCM a little under the 2^24.5 that §5.5
-    /// allows, so the update goes out with margin and a seal never fails.
+    /// How many records one generation of keys may seal before the sender
+    /// updates them: for AES-GCM a little under the 2^24.5 that §5.5
+    /// allows, so the update goes out with margin.
     pub fn recordLimit(keys: *const Keys) u64 {
         return switch (keys.algorithm) {
             .aes_128_gcm, .aes_256_gcm => 1 << 24,
@@ -138,7 +138,8 @@ pub const Keys = struct {
     /// holds the plaintext; on return `record[0..sealedLen(len)]` is the
     /// record, ready to send. Fails only past this generation's
     /// `recordLimit` (§5.5), which the sender's KeyUpdate normally
-    /// forestalls; the record at the limit itself is the KeyUpdate.
+    /// forestalls; the record at the limit itself is that KeyUpdate, or
+    /// an alert that ends the direction.
     pub fn seal(keys: *Keys, record: []u8, content_type: proto.ContentType, len: usize) error{TlsInternalError}!void {
         assert(len <= max_plaintext_len);
         assert(record.len >= sealedLen(len));

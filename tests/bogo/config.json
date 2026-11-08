@@ -86,7 +86,7 @@
     "SendHelloRetryRequest-2-TLS13": "a share for any supported group is accepted rather than retried for a preferred one",
     "TrailingMessageData-TLS13-ServerFinished-TLS": "a Finished with trailing data is decode_error here, not a digest mismatch",
     "TrailingMessageData-TLS13-ClientFinished-TLS": "a Finished with trailing data is decode_error here, not a digest mismatch",
-    "MissingSignatureAlgorithmsInCertificateRequest-TLS13": "missing_extension as RFC 9846 4.4.2 has it, not decode_error",
+    "MissingSignatureAlgorithmsInCertificateRequest-TLS13": "a CertificateRequest without signature_algorithms is answered with missing_extension (RFC 9846 9.2), not decode_error",
     "UnencryptedEncryptedExtensions": "a plaintext handshake record under encryption is unexpected_message here, not bad_record_mac",
     "TLS13-EmptyRecords-TLS": "a record with no content type is decode_error here, not bad_record_mac",
     "CheckRecordVersion-TLS13": "RFC 9846 5.1 says the record version must be ignored",
