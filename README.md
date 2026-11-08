@@ -28,9 +28,6 @@ Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system.
   built from PEM or DER, from files, or from the system's roots.
 - KeyUpdate in both directions and close_notify.
 
-Missing features are tracked in the
-[issues](https://github.com/lalinsky/ztls/issues).
-
 ## Using it
 
 ```sh
