@@ -64,6 +64,8 @@ pub const Certificate = struct {
     /// name matches it (wildcards included); the subject common name is
     /// never consulted.
     pub fn matchesHost(self: *const Certificate, host: []const u8) bool {
+        // A zero length tells AWS-LC to call strlen instead.
+        if (host.len == 0) return false;
         const r = c.X509_check_host(self.x509, host.ptr, host.len, c.X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, null);
         if (r == 1) return true;
         _ = err.take();
@@ -434,6 +436,9 @@ pub fn verify(store: *const TrustStore, chain: []const Certificate, options: Ver
     };
     if (c.X509_STORE_CTX_set_purpose(ctx, purpose) != 1) return err.fail();
     if (options.host) |host| {
+        // A zero length tells AWS-LC to call strlen and then, finding
+        // nothing, to check no name at all.
+        std.debug.assert(host.len != 0);
         c.X509_VERIFY_PARAM_set_hostflags(param, c.X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
         if (c.X509_VERIFY_PARAM_set1_host(param, host.ptr, host.len) != 1) return err.fail();
     }

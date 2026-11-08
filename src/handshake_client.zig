@@ -49,8 +49,11 @@ const CertificateRequest = struct {
 };
 
 fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
-    // Misconfiguration is ours, not the peer's.
+    // Misconfiguration is ours, not the peer's. An empty host would leave
+    // the certificate's name unchecked, which only insecure_skip_verify
+    // may ask for.
     if (opt.root_ca == null and !opt.insecure_skip_verify) return error.TlsInternalError;
+    if (opt.host.len == 0 and !opt.insecure_skip_verify) return error.TlsInternalError;
     if (opt.cipher_suites.len == 0 or opt.named_groups.len == 0 or opt.key_shares.len == 0) return error.TlsInternalError;
     for (opt.key_shares) |group| {
         if (std.mem.indexOfScalar(proto.NamedGroup, opt.named_groups, group) == null) return error.TlsInternalError;
@@ -177,7 +180,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     try h.installWriteKeys(ap.client);
     h.conn.read.in_handshake = false;
     h.conn.alpn_protocol = alpn;
-    h.conn.setServerName(if (isIpLiteral(opt.host)) null else opt.host);
+    h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
     h.conn.strict_close_notify = opt.strict_close_notify;
 }
 
@@ -185,6 +188,12 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 fn isIpLiteral(host: []const u8) bool {
     _ = std.Io.net.IpAddress.parse(host, 0) catch return false;
     return true;
+}
+
+/// Whether `host` goes out as SNI: a non-empty name that is not an
+/// IP literal.
+fn sendsSni(host: []const u8) bool {
+    return host.len != 0 and !isIpLiteral(host);
 }
 
 fn writeClientHello(
@@ -219,7 +228,7 @@ fn build(
     try w.enumList(opt.cipher_suites);
     try w.vector(u8, &.{0}); // legacy_compression_methods: null only
     const extensions = try w.beginLength(u16);
-    if (!isIpLiteral(opt.host)) {
+    if (sendsSni(opt.host)) {
         try w.enumValue(proto.Extension.server_name);
         const ext = try w.beginLength(u16);
         const list = try w.beginLength(u16);
@@ -361,7 +370,7 @@ fn parseEncryptedExtensions(body: []const u8, opt: config.Client) Error!?[]const
                 if (alpn == null) return error.TlsIllegalParameter;
             },
             // An acknowledgement of our SNI, which must have been sent.
-            .server_name => if (isIpLiteral(opt.host)) return error.TlsUnsupportedExtension,
+            .server_name => if (!sendsSni(opt.host)) return error.TlsUnsupportedExtension,
             // The server's preferences, for a later connection.
             .supported_groups => {},
             else => return error.TlsUnsupportedExtension,

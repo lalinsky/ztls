@@ -449,6 +449,22 @@ test "the server picks its certificate by server name" {
     try testing.expectError(error.TlsUnrecognizedName, outcome.handshake);
 }
 
+test "an empty host is a misconfiguration unless verification is off" {
+    var pki = try Pki.init();
+    defer pki.deinit();
+    // Refused before anything is read or written.
+    var input_buffer: [input_buffer_len]u8 = undefined;
+    var output_buffer: [output_buffer_len]u8 = undefined;
+    var input: Io.Reader = .fixed(&input_buffer);
+    var discard: Io.Writer.Discarding = .init(&output_buffer);
+    try testing.expectError(error.TlsInternalError, client(&input, &discard.writer, .{
+        .allocator = testing.allocator,
+        .host = "",
+        .root_ca = &pki.ca,
+        .now = valid_now,
+    }));
+}
+
 test "a peer that hangs up during the handshake" {
     const io = testing.io;
     var pki = try Pki.init();
