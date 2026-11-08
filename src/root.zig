@@ -463,6 +463,7 @@ test "an empty host is a misconfiguration unless verification is off" {
         .root_ca = &pki.ca,
         .now = valid_now,
     }));
+    try testing.expectEqual(0, discard.count + discard.writer.end);
 }
 
 const data13 = @import("testdata/tls13.zig");
@@ -474,8 +475,10 @@ test "change_cipher_spec before the ClientHello or between its fragments is refu
     const ccs = [_]u8{ @intFromEnum(proto.ContentType.change_cipher_spec), 3, 3, 0, 1, 1 };
     const hello = data13.client_hello;
     // The same ClientHello in two records with the CCS between them.
-    const split = [_]u8{ @intFromEnum(proto.ContentType.handshake), 3, 1, 0, 100 } ++ hello[5..105].* ++ ccs ++
-        [_]u8{ @intFromEnum(proto.ContentType.handshake), 3, 3, 0, 148 } ++ hello[105..].*;
+    const head = 100;
+    const rest = hello.len - 5 - head;
+    const split = [_]u8{ @intFromEnum(proto.ContentType.handshake), 3, 1, head >> 8, head & 0xff } ++ hello[5 .. 5 + head].* ++ ccs ++
+        [_]u8{ @intFromEnum(proto.ContentType.handshake), 3, 3, rest >> 8, rest & 0xff } ++ hello[5 + head ..].*;
     const cases = [_][]const u8{ &(ccs ++ hello), &split };
     for (cases) |bytes| {
         var run: Run = .{ .loopback = undefined };

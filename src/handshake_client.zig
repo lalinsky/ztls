@@ -14,6 +14,7 @@ const Error = handshake.Error;
 const Connection = @import("connection.zig").Connection;
 
 pub fn run(conn: *Connection, options: config.Client) Error!void {
+    try checkOptions(options);
     var h = Handshake.init(conn, options.allocator, options.max_handshake_message_len);
     defer h.deinit();
     handshakeInner(&h, options) catch |err| {
@@ -48,17 +49,19 @@ const CertificateRequest = struct {
     }
 };
 
-fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
-    // Misconfiguration is ours, not the peer's. An empty host would leave
-    // the certificate's name unchecked, which only insecure_skip_verify
-    // may ask for.
+/// Misconfiguration is ours, not the peer's: nothing is sent for it, not
+/// even an alert. An empty host would leave the certificate's name
+/// unchecked, which only insecure_skip_verify may ask for.
+fn checkOptions(opt: config.Client) error{TlsInternalError}!void {
     if (opt.root_ca == null and !opt.insecure_skip_verify) return error.TlsInternalError;
     if (opt.host.len == 0 and !opt.insecure_skip_verify) return error.TlsInternalError;
     if (opt.cipher_suites.len == 0 or opt.named_groups.len == 0 or opt.key_shares.len == 0) return error.TlsInternalError;
     for (opt.key_shares) |group| {
         if (std.mem.indexOfScalar(proto.NamedGroup, opt.named_groups, group) == null) return error.TlsInternalError;
     }
+}
 
+fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     var random: [32]u8 = undefined;
     crypto.rand.bytes(&random);
     // A non-empty legacy_session_id asks the server for middlebox
