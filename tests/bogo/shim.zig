@@ -234,19 +234,21 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
     return o;
 }
 
-/// BoGo numbers groups, suites and schemes as the wire does.
-fn groupFromId(id: u16) ?ztls.protocol.NamedGroup {
-    inline for (@typeInfo(ztls.protocol.NamedGroup).@"enum".fields) |f| {
-        if (f.value == id) return @enumFromInt(id);
+/// BoGo numbers groups, suites and schemes as the wire does. Only named
+/// values count; the enums are non-exhaustive.
+fn fromWire(comptime E: type, id: u16) ?E {
+    for (std.enums.values(E)) |value| {
+        if (@intFromEnum(value) == id) return value;
     }
     return null;
 }
 
+fn groupFromId(id: u16) ?ztls.protocol.NamedGroup {
+    return fromWire(ztls.protocol.NamedGroup, id);
+}
+
 fn suiteFromId(id: u16) ?ztls.protocol.CipherSuite {
-    inline for (@typeInfo(ztls.protocol.CipherSuite).@"enum".fields) |f| {
-        if (f.value == id) return @enumFromInt(id);
-    }
-    return null;
+    return fromWire(ztls.protocol.CipherSuite, id);
 }
 
 /// `-advertise-alpn` is the extension's wire form: length-prefixed names.
