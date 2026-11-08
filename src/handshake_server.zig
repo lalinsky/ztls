@@ -314,7 +314,11 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                     if (name.len > 0 and name[name.len - 1] == '.') name = name[0 .. name.len - 1];
                     if (name.len == 0 or name.len > 255) return error.TlsIllegalParameter;
                     if (std.mem.indexOfScalar(u8, name, 0) != null) return error.TlsIllegalParameter;
-                    if (std.Io.net.IpAddress.parse(name, 0)) |_| return error.TlsIllegalParameter else |_| {}
+                    // RFC 6066 forbids an IP literal here, but clients send
+                    // one when told to connect to an address (wrk does), and
+                    // every major stack lets it pass. It names no
+                    // certificate, so it is treated as no name at all.
+                    if (std.Io.net.IpAddress.parse(name, 0)) |_| continue else |_| {}
                     hello.server_name = name;
                 }
             },
@@ -468,8 +472,8 @@ test "server names: a trailing dot is dropped, IP literals and NULs are refused"
     var buf: [512]u8 = undefined;
     try testing.expectEqualStrings("example.com", (try parseClientHello(try Build.hello(&buf, "example.com."))).server_name.?);
     try testing.expectEqualStrings("example.com", (try parseClientHello(try Build.hello(&buf, "example.com"))).server_name.?);
-    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try Build.hello(&buf, "10.0.0.1")));
-    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try Build.hello(&buf, "::1")));
+    try testing.expectEqual(null, (try parseClientHello(try Build.hello(&buf, "10.0.0.1"))).server_name);
+    try testing.expectEqual(null, (try parseClientHello(try Build.hello(&buf, "::1"))).server_name);
     try testing.expectError(error.TlsIllegalParameter, parseClientHello(try Build.hello(&buf, "exa\x00mple.com")));
     try testing.expectError(error.TlsIllegalParameter, parseClientHello(try Build.hello(&buf, ".")));
 }
