@@ -11,8 +11,7 @@ threads and a connection is read by one task and written by another. AWS-LC
 does the cryptography and the X.509 work, and the protocol itself is written
 in Zig.
 
-Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system, with no
-CMake, Perl or Go.
+Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system.
 
 ## Features
 
