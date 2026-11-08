@@ -31,8 +31,12 @@ config="$PWD/tests/bogo/config.json"
 cd "$BORINGSSL/ssl/test/runner"
 output=$(mktemp)
 trap 'rm -f "$output"' EXIT
-go test -shim-path "$shim" -shim-config "$config" -allow-unimplemented -pipe "$@" | tee "$output"
-status=${PIPESTATUS[0]}
+# In an `if`, a failing pipeline does not end the script under `set -e`.
+if go test -shim-path "$shim" -shim-config "$config" -allow-unimplemented -pipe "$@" | tee "$output"; then
+    status=0
+else
+    status=${PIPESTATUS[0]}
+fi
 passed=$(grep -c '^PASSED (' "$output" || true)
 if [ $# -eq 0 ] && [ "$passed" -lt "$MIN_PASS" ]; then
     echo "only $passed tests passed, expected at least $MIN_PASS" >&2
