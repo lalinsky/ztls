@@ -174,9 +174,8 @@ pub const ClientAuth = struct {
 };
 
 /// The groups a client supports, in preference order.
-pub const default_named_groups = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1 };
-/// A server takes secp384r1 too, for clients that offer nothing better.
-pub const default_server_named_groups = default_named_groups ++ [_]proto.NamedGroup{.secp384r1};
+pub const default_named_groups = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1 };
+pub const default_server_named_groups = default_named_groups;
 /// The groups a client sends key shares for in its first ClientHello:
 /// the ones a server is likely to pick, so a HelloRetryRequest is rare.
 pub const default_key_shares = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519 };
