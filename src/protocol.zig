@@ -242,10 +242,8 @@ pub const Alert = enum(u8) {
             error.TlsBadCertificate => .bad_certificate,
             error.TlsUnsupportedCertificate => .unsupported_certificate,
             error.TlsCertificateRevoked => .certificate_revoked,
-            error.TlsCertificateExpired => .certificate_expired,
             error.TlsCertificateUnknown => .certificate_unknown,
             error.TlsIllegalParameter => .illegal_parameter,
-            error.TlsUnknownCa => .unknown_ca,
             error.TlsAccessDenied => .access_denied,
             error.TlsDecodeError => .decode_error,
             error.TlsDecryptError => .decrypt_error,
@@ -260,6 +258,9 @@ pub const Alert = enum(u8) {
             error.TlsUnknownPskIdentity => .unknown_psk_identity,
             error.TlsCertificateRequired => .certificate_required,
             error.TlsNoApplicationProtocol => .no_application_protocol,
+            error.CertificateIssuerNotFound => .unknown_ca,
+            error.CertificateExpired, error.CertificateNotYetValid => .certificate_expired,
+            error.CertificateHostMismatch => .bad_certificate,
             else => .internal_error,
         };
     }
@@ -297,10 +298,8 @@ pub const LocalError = error{
     TlsBadCertificate,
     TlsUnsupportedCertificate,
     TlsCertificateRevoked,
-    TlsCertificateExpired,
     TlsCertificateUnknown,
     TlsIllegalParameter,
-    TlsUnknownCa,
     TlsAccessDenied,
     TlsDecodeError,
     TlsDecryptError,
@@ -315,6 +314,12 @@ pub const LocalError = error{
     TlsUnknownPskIdentity,
     TlsCertificateRequired,
     TlsNoApplicationProtocol,
+    // What our own check of the peer's certificate can find, named as
+    // std.crypto and tls.zig name them.
+    CertificateIssuerNotFound,
+    CertificateExpired,
+    CertificateNotYetValid,
+    CertificateHostMismatch,
 };
 
 const testing = std.testing;

@@ -38,9 +38,7 @@ const max_idle_records = 32;
 
 /// What a read or write can fail with: the transport's own failure,
 /// something the record layer found, or an alert the peer sent.
-pub const Error = error{
-    ReadFailed,
-    WriteFailed,
+pub const Failure = error{
     TlsConnectionTruncated,
     TlsConnectionFailed,
     TlsRecordOverflow,
@@ -50,6 +48,14 @@ pub const Error = error{
     TlsIllegalParameter,
     TlsInternalError,
 } || proto.Alert.Error;
+/// What a read can fail with: the transport reader's failure, which does
+/// not end the connection, or a `Failure`, which does.
+pub const ReadError = error{ReadFailed} || Failure;
+/// What a write can fail with: the transport writer's failure or a
+/// `Failure`, the read side's included, since that is where its alert
+/// goes out.
+pub const WriteError = error{WriteFailed} || Failure;
+pub const Error = ReadError || WriteError;
 
 pub const State = enum(u8) {
     open,
@@ -218,7 +224,7 @@ pub const Connection = struct {
 
     /// Records the read side's failure for both tasks, and the alert the
     /// write side should send for it, if any.
-    fn failRead(c: *Connection, err: Error) void {
+    fn failRead(c: *Connection, err: Failure) void {
         c.shared.read_error.store(@intFromError(err), .monotonic);
         if (proto.Alert.forLocalError(err)) |alert| {
             c.shared.pending_alert.store(@intFromEnum(alert), .monotonic);
@@ -226,7 +232,7 @@ pub const Connection = struct {
         c.shared.read_state.store(.failed, .release);
     }
 
-    const FillError = Error || error{EndOfStream};
+    const FillError = ReadError || error{EndOfStream};
 
     /// Fetches cleartext for the application: the next application data
     /// record, into `dest` when it fits there, else opened in place and
@@ -300,7 +306,7 @@ pub const Connection = struct {
         }
     }
 
-    fn countIdleRecord(c: *Connection) Error!void {
+    fn countIdleRecord(c: *Connection) Failure!void {
         c.read.idle_records += 1;
         if (c.read.idle_records > max_idle_records) {
             c.failRead(error.TlsUnexpectedMessage);
@@ -313,7 +319,7 @@ pub const Connection = struct {
     /// record (every known stack sends them so; a ticket split across
     /// records would be an interop failure rather than a violation), and
     /// KeyUpdate must be the record's last message (§4.6.3).
-    fn handlePostHandshake(c: *Connection, payload: []const u8) Error!void {
+    fn handlePostHandshake(c: *Connection, payload: []const u8) Failure!void {
         var d = codec.Decoder.init(payload);
         while (!d.eof()) {
             const handshake_type = d.decode(proto.HandshakeType) catch return error.TlsDecodeError;
@@ -341,7 +347,7 @@ pub const Connection = struct {
         /// Why the last read failed. `ReadFailed` means the transport
         /// reader failed, and its own error says how; that one does not
         /// end the connection, and the read may be retried.
-        err: ?Error = null,
+        err: ?ReadError = null,
 
         fn init(c: *Connection, buffer: []u8) Reader {
             return .{
@@ -497,14 +503,14 @@ pub const Connection = struct {
     }
 
     /// Sends a KeyUpdate and moves the write keys to the next generation.
-    fn sendKeyUpdate(c: *Connection, request: proto.KeyUpdateRequest) Error!void {
+    fn sendKeyUpdate(c: *Connection, request: proto.KeyUpdateRequest) WriteError!void {
         try c.writeRecord(.handshake, &keyUpdateMessage(request));
         c.write.keys.?.update() catch return error.TlsInternalError;
     }
 
     /// Asks the peer to update its keys, updating ours first (§4.6.3).
     /// For the writing task.
-    pub fn requestKeyUpdate(c: *Connection) Error!void {
+    pub fn requestKeyUpdate(c: *Connection) WriteError!void {
         try c.checkWritable();
         c.sendKeyUpdate(.update_requested) catch |err| return c.failWrite(err);
         try c.flushOutput();
@@ -513,7 +519,7 @@ pub const Connection = struct {
     /// The write side's state, with the read side's failure delivered
     /// first: its alert goes out and this direction fails too. Only after
     /// the handshake; the handshake sends its own alerts.
-    fn checkWritable(c: *Connection) Error!void {
+    fn checkWritable(c: *Connection) WriteError!void {
         assert(c.write.keys != null);
         switch (c.shared.write_state.load(.monotonic)) {
             .open => {},
@@ -521,7 +527,7 @@ pub const Connection = struct {
             .failed => return error.TlsConnectionFailed,
         }
         if (c.shared.read_state.load(.acquire) == .failed) {
-            const read_error: Error = @errorCast(@errorFromInt(c.shared.read_error.load(.monotonic)));
+            const read_error: Failure = @errorCast(@errorFromInt(c.shared.read_error.load(.monotonic)));
             const alert = c.shared.pending_alert.swap(0, .monotonic);
             if (alert != 0) {
                 // This may land on an in-place writer's window; nothing
@@ -534,7 +540,7 @@ pub const Connection = struct {
         }
     }
 
-    fn failWrite(c: *Connection, err: Error) Error {
+    fn failWrite(c: *Connection, err: WriteError) WriteError {
         c.shared.write_state.store(.failed, .release);
         return err;
     }
@@ -553,7 +559,7 @@ pub const Connection = struct {
     /// one record. A KeyUpdate that is due goes ahead of it, with the
     /// plaintext moved up to make room. `output` is flushed when it has no
     /// room for another full record.
-    fn sealWindow(c: *Connection, len: usize) Error!void {
+    fn sealWindow(c: *Connection, len: usize) WriteError!void {
         try c.checkWritable();
         const keys = &c.write.keys.?;
         const buf = c.output.unusedCapacitySlice();
@@ -577,7 +583,7 @@ pub const Connection = struct {
     }
 
     /// Sends what is sealed so far.
-    fn flushWrite(c: *Connection) Error!void {
+    fn flushWrite(c: *Connection) WriteError!void {
         try c.checkWritable();
         c.output.flush() catch return c.failWrite(error.WriteFailed);
     }
@@ -586,7 +592,7 @@ pub const Connection = struct {
     /// fail. Idempotent. If the read side has an alert pending, that goes
     /// out instead and both directions are failed. For the writing task,
     /// after its writer was flushed for the last time.
-    pub fn close(c: *Connection) Error!void {
+    pub fn close(c: *Connection) WriteError!void {
         switch (c.shared.write_state.load(.monotonic)) {
             .open => {},
             .closed => return,
@@ -629,7 +635,7 @@ pub const Connection = struct {
         interface: Io.Writer,
         /// Why the last write failed. `WriteFailed` means the transport
         /// writer failed, and its own error says how.
-        err: ?Error = null,
+        err: ?WriteError = null,
 
         fn init(c: *Connection, buffer: []u8) Writer {
             return .{
@@ -660,7 +666,7 @@ pub const Connection = struct {
             };
         }
 
-        fn fail(self: *Writer, err: Error) Io.Writer.Error {
+        fn fail(self: *Writer, err: WriteError) Io.Writer.Error {
             self.err = err;
             return error.WriteFailed;
         }

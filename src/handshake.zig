@@ -598,9 +598,11 @@ pub const Handshake = struct {
             }
         }
         x509.verify(store, peer.chain[0..peer.len], options) catch |err| return switch (err) {
-            error.CertificateExpired, error.CertificateNotYetValid => error.TlsCertificateExpired,
-            error.UnknownCa => error.TlsUnknownCa,
-            error.HostnameMismatch, error.BadCertificate => error.TlsBadCertificate,
+            error.CertificateExpired => error.CertificateExpired,
+            error.CertificateNotYetValid => error.CertificateNotYetValid,
+            error.UnknownCa => error.CertificateIssuerNotFound,
+            error.HostnameMismatch => error.CertificateHostMismatch,
+            error.BadCertificate => error.TlsBadCertificate,
             error.CryptoFailed => error.TlsInternalError,
         };
     }
@@ -725,8 +727,8 @@ test "certificate, certificate verify and finished round-trip through records" {
     _ = try store.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     try receiver.verifyChain(&peer, &store, .server, "localhost", 1_800_000_000);
     try receiver.verifyChain(&peer, &store, .server, "127.0.0.1", 1_800_000_000);
-    try testing.expectError(error.TlsBadCertificate, receiver.verifyChain(&peer, &store, .server, "example.org", 1_800_000_000));
-    try testing.expectError(error.TlsCertificateExpired, receiver.verifyChain(&peer, &store, .server, "localhost", 1_000_000_000));
+    try testing.expectError(error.CertificateHostMismatch, receiver.verifyChain(&peer, &store, .server, "example.org", 1_800_000_000));
+    try testing.expectError(error.CertificateNotYetValid, receiver.verifyChain(&peer, &store, .server, "localhost", 1_000_000_000));
     receiver.hashMessage(msg);
 
     msg = try receiver.nextMessage();

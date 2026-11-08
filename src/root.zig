@@ -281,7 +281,7 @@ test "client certificates: none, requested, required" {
         .{ .auth_type = .request, .client_pair = null, .client_err = null, .server_err = null },
         .{ .auth_type = .require, .client_pair = &pki.client, .client_err = null, .server_err = null },
         .{ .auth_type = .require, .client_pair = null, .client_err = error.TlsAlertCertificateRequired, .server_err = error.TlsCertificateRequired },
-        .{ .auth_type = .require, .client_pair = &pki.selfsigned, .client_err = error.TlsAlertUnknownCa, .server_err = error.TlsUnknownCa },
+        .{ .auth_type = .require, .client_pair = &pki.selfsigned, .client_err = error.TlsAlertUnknownCa, .server_err = error.CertificateIssuerNotFound },
     };
     for (cases) |case| {
         var run: Run = .{ .loopback = undefined };
@@ -317,12 +317,12 @@ test "the client refuses a certificate it cannot trust, and tells the server" {
 
     const Case = struct { server_pair: *const CertKeyPair, host: []const u8, now: Io.Timestamp, skip_verify: bool = false, client_err: ?anyerror, server_err: ?anyerror };
     const cases = [_]Case{
-        .{ .server_pair = &pki.selfsigned, .host = "localhost", .now = valid_now, .client_err = error.TlsUnknownCa, .server_err = error.TlsAlertUnknownCa },
-        .{ .server_pair = &pki.server_ec, .host = "example.org", .now = valid_now, .client_err = error.TlsBadCertificate, .server_err = error.TlsAlertBadCertificate },
-        .{ .server_pair = &pki.server_ec, .host = "localhost", .now = .{ .nanoseconds = 1_000_000_000 * std.time.ns_per_s }, .client_err = error.TlsCertificateExpired, .server_err = error.TlsAlertCertificateExpired },
+        .{ .server_pair = &pki.selfsigned, .host = "localhost", .now = valid_now, .client_err = error.CertificateIssuerNotFound, .server_err = error.TlsAlertUnknownCa },
+        .{ .server_pair = &pki.server_ec, .host = "example.org", .now = valid_now, .client_err = error.CertificateHostMismatch, .server_err = error.TlsAlertBadCertificate },
+        .{ .server_pair = &pki.server_ec, .host = "localhost", .now = .{ .nanoseconds = 1_000_000_000 * std.time.ns_per_s }, .client_err = error.CertificateNotYetValid, .server_err = error.TlsAlertCertificateExpired },
         .{ .server_pair = &pki.selfsigned, .host = "localhost", .now = valid_now, .skip_verify = true, .client_err = null, .server_err = null },
         .{ .server_pair = &pki.server_ec, .host = "127.0.0.1", .now = valid_now, .client_err = null, .server_err = null },
-        .{ .server_pair = &pki.server_ec, .host = "10.0.0.1", .now = valid_now, .client_err = error.TlsBadCertificate, .server_err = error.TlsAlertBadCertificate },
+        .{ .server_pair = &pki.server_ec, .host = "10.0.0.1", .now = valid_now, .client_err = error.CertificateHostMismatch, .server_err = error.TlsAlertBadCertificate },
     };
     for (cases) |case| {
         var run: Run = .{ .loopback = undefined };
