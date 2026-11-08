@@ -15,12 +15,13 @@ cd "$(dirname "$0")/../.."
 # unimplemented or failed, which -allow-unimplemented alone would hide.
 : "${MIN_PASS:=340}"
 
+# Only the pinned commit is fetched; the full history is 400 MB.
 if [ ! -d "$BORINGSSL" ]; then
-    mkdir -p "$(dirname "$BORINGSSL")"
-    git clone https://boringssl.googlesource.com/boringssl "$BORINGSSL"
+    git init -q "$BORINGSSL"
+    git -C "$BORINGSSL" remote add origin https://boringssl.googlesource.com/boringssl
 fi
-if [ "$(git -C "$BORINGSSL" rev-parse HEAD)" != "$BORINGSSL_REV" ]; then
-    git -C "$BORINGSSL" fetch -q origin "$BORINGSSL_REV"
+if [ "$(git -C "$BORINGSSL" rev-parse --verify -q HEAD)" != "$BORINGSSL_REV" ]; then
+    git -C "$BORINGSSL" fetch -q --depth 1 origin "$BORINGSSL_REV"
     git -C "$BORINGSSL" checkout -q "$BORINGSSL_REV"
 fi
 
