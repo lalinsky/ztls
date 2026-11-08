@@ -150,9 +150,11 @@ reach Zig through translate-c from `src/c.h`.
 
 ## License
 
-ztls is [MIT](LICENSE). The test keys and the example handshake in
-`src/testdata` come from [tls.zig](https://github.com/ianic/tls.zig), also
-MIT, which is why its author is named in the licence too.
+ztls is [MIT](LICENSE). Part of the code began in
+[tls.zig](https://github.com/ianic/tls.zig), also MIT: the record layer's
+in-place writer and the AWS-LC build were written there first, and the
+test keys and the example handshake in `src/testdata` are its, which is
+why its author is named in the licence too.
 
 AWS-LC is compiled into every binary that links ztls. Its code is
 Apache-2.0 or ISC, with BoringSSL-derived parts under ISC and
