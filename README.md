@@ -8,7 +8,8 @@ the server side.
 It was written for servers and clients on [zio](https://github.com/lalinsky/zio),
 such as [Dusty](https://github.com/lalinsky/dusty), where fibers move between
 threads and a connection is read by one task and written by another. AWS-LC
-does the cryptography and the X.509 work; the protocol is implemented in Zig.
+does the cryptography and the X.509 work, and the protocol itself is written
+in Zig.
 
 Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system, with no
 CMake, Perl or Go.
@@ -21,8 +22,9 @@ CMake, Perl or Go.
 - X25519MLKEM768, X25519, P-256 and P-384 key exchange, with
   HelloRetryRequest on both sides.
 - ECDSA (P-256, P-384, P-521), RSA-PSS and Ed25519 signatures.
-- Server name indication, with the server's certificate picked by name;
-  ALPN; client certificates, requested or required.
+- Server name indication, with the server's certificate picked by name.
+- ALPN.
+- Client certificates, requested or required.
 - Certificate verification by AWS-LC's X.509 code, against a trust store
   built from PEM or DER, from files, or from the system's roots.
 - KeyUpdate in both directions and close_notify.
@@ -61,7 +63,8 @@ var conn = try ztls.server(&input.interface, &output.interface, .{
 });
 defer conn.deinit(); // after both tasks are done
 
-var reader = conn.reader(&read_buffer); // an ordinary reader buffer
+var read_buffer: [16 * 1024]u8 = undefined;
+var reader = conn.reader(&read_buffer);
 var writer = conn.inPlaceWriter();      // encrypts inside the transport buffer
 
 while (try reader.interface.takeDelimiter('\n')) |line| {
@@ -103,7 +106,7 @@ transport buffer. The `Connection` must not move once readers or writers
 exist.
 
 The handshake keeps about 16 KiB on the stack of the task that runs it, plus
-AWS-LC's ML-KEM working memory, so budget 64 KiB of stack for such a task.
+AWS-LC's ML-KEM working memory, so give that task at least 64 KiB of stack.
 The peer's handshake messages are reassembled through the `allocator` in the
 options, up to `max_handshake_message_len`.
 
@@ -119,14 +122,15 @@ transport itself failed. A transport `ReadFailed`, such as a cancelled read,
 does not end the connection and the read may be retried.
 
 A transport that ends between records without close_notify is a clean end
-of stream; `strict_close_notify` makes it an error.
+of stream; the `strict_close_notify` option makes it an error.
 
 ### Certificates and trust
 
 `CertKeyPair` takes a PEM chain, leaf first, and a PEM private key, from
 files or from memory. `TrustStore` takes certificates from PEM or DER, from
 files or directories, or from the system's root store; every certificate in
-it is a trust anchor. A server may hold several certificates, chosen by the
+it is a trust anchor. `now` is the time certificates are checked against.
+A server may hold several certificates, chosen by the
 client's server name and signature algorithms, or by a `select_certificate`
 callback.
 
@@ -138,7 +142,7 @@ zig build test -fwine -Dtarget=x86_64-windows-gnu   # networking tests skip unde
 zig build test -fqemu -Dtarget=aarch64-linux-musl
 ```
 
-The tests include self-talk over a loopback socket and interoperability
+The tests include client-server tests over a loopback socket and interoperability
 with `openssl s_server` and `s_client` when OpenSSL 1.1.1 or newer is on the
 PATH. `tests/bogo/run.sh` runs BoringSSL's test runner against the library;
 it needs Go. Format with Zig 0.16's `zig fmt`: 0.17's rewrites builtins
