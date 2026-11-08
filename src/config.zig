@@ -10,6 +10,18 @@ pub const TrustStore = crypto.x509.TrustStore;
 pub const PrivateKey = crypto.sig.PrivateKey;
 pub const Certificate = crypto.x509.Certificate;
 
+/// Signs CertificateVerify in the library's stead, so the handshake's
+/// task can hand the work to a thread pool.
+pub const Signer = struct {
+    context: ?*anyopaque = null,
+    /// Signs `message`, the framed CertificateVerify content, with `key`
+    /// under `algorithm` into `out`, and returns the signature as a slice
+    /// of `out`. Runs on the handshake's task and may block or suspend;
+    /// it must not touch the connection. Any error fails the handshake
+    /// with internal_error.
+    sign: *const fn (context: ?*anyopaque, key: *const PrivateKey, algorithm: crypto.sig.Algorithm, message: []const u8, out: []u8) anyerror![]u8,
+};
+
 /// A certificate chain, leaf first, with the leaf's private key: what a
 /// server presents, or a client under mutual TLS. Built once and shared
 /// read-only by any number of connections.
@@ -20,6 +32,8 @@ pub const CertKeyPair = struct {
     /// The leaf, parsed: its key type picks the signature algorithm.
     leaf: Certificate,
     key: PrivateKey,
+    /// Signs in place of `key` on the handshake's task, when set.
+    signer: ?Signer = null,
 
     /// Certificates in a chain, including the leaf.
     pub const max_chain_len = 64;

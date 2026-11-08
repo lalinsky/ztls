@@ -26,6 +26,7 @@ pub const is_ztls = true;
 pub const Connection = connection.Connection;
 pub const TrustStore = config.TrustStore;
 pub const CertKeyPair = config.CertKeyPair;
+pub const Signer = config.Signer;
 pub const Error = handshake.Error;
 
 /// The transport reader's buffer must be at least this long: one whole
@@ -308,6 +309,71 @@ test "client certificates: none, requested, required" {
             try outcome.echo;
         }
     }
+}
+
+test "a signer hook signs CertificateVerify, once per side that presents a certificate" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+
+    // Signs on another task, as a thread pool would, while the handshake
+    // waits.
+    const Counting = struct {
+        io: Io,
+        calls: usize = 0,
+
+        fn sign(context: ?*anyopaque, key: *const config.PrivateKey, algorithm: crypto.sig.Algorithm, message: []const u8, out: []u8) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            var job = try self.io.concurrent(config.PrivateKey.sign, .{ key, algorithm, message, out });
+            return job.await(self.io);
+        }
+    };
+    var server_signer: Counting = .{ .io = io };
+    var client_signer: Counting = .{ .io = io };
+    // Copies share the chain and key with the originals, which own them.
+    var server_pair = pki.server_rsa;
+    server_pair.signer = .{ .context = &server_signer, .sign = Counting.sign };
+    var client_pair = pki.client;
+    client_pair.signer = .{ .context = &client_signer, .sign = Counting.sign };
+
+    // Mutual authentication: each side signs once, through its hook.
+    var run: Run = .{ .loopback = undefined };
+    try run.start(io, .{
+        .allocator = testing.allocator,
+        .auth = &server_pair,
+        .now = valid_now,
+        .client_auth = .{ .root_ca = &pki.ca, .auth_type = .require },
+    });
+    _ = try clientOnce(&run.loopback, .{ .allocator = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now, .auth = &client_pair });
+    var outcome = try run.finish(io);
+    try outcome.handshake;
+    try outcome.echo;
+    try testing.expectEqual(1, server_signer.calls);
+    try testing.expectEqual(1, client_signer.calls);
+
+    // No client certificate asked for: the client's hook stays unused.
+    run = .{ .loopback = undefined };
+    try run.start(io, .{ .allocator = testing.allocator, .auth = &server_pair, .now = valid_now });
+    _ = try clientOnce(&run.loopback, .{ .allocator = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now, .auth = &client_pair });
+    outcome = try run.finish(io);
+    try outcome.handshake;
+    try outcome.echo;
+    try testing.expectEqual(2, server_signer.calls);
+    try testing.expectEqual(1, client_signer.calls);
+
+    // A hook that fails ends the handshake as our own error.
+    const Failing = struct {
+        fn sign(_: ?*anyopaque, _: *const config.PrivateKey, _: crypto.sig.Algorithm, _: []const u8, _: []u8) anyerror![]u8 {
+            return error.KeyUnavailable;
+        }
+    };
+    server_pair.signer = .{ .sign = Failing.sign };
+    run = .{ .loopback = undefined };
+    try run.start(io, .{ .allocator = testing.allocator, .auth = &server_pair, .now = valid_now });
+    try testing.expectError(error.TlsAlertInternalError, clientOnce(&run.loopback, .{ .allocator = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now }));
+    outcome = try run.finish(io);
+    try testing.expectError(error.TlsInternalError, outcome.handshake);
 }
 
 test "the client refuses a certificate it cannot trust, and tells the server" {

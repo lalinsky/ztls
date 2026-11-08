@@ -523,8 +523,8 @@ pub const Handshake = struct {
 
     /// The bytes a CertificateVerify signs (§4.5.2): 64 spaces, the
     /// context string, a zero and the transcript hash.
-    fn certificateVerifyContent(h: *const Handshake, signer: proto.Side, out: *[64 + 33 + 1 + crypto.hash.max_digest_length]u8) []const u8 {
-        const context = switch (signer) {
+    fn certificateVerifyContent(h: *const Handshake, side: proto.Side, out: *[64 + 33 + 1 + crypto.hash.max_digest_length]u8) []const u8 {
+        const context = switch (side) {
             .server => "TLS 1.3, server CertificateVerify",
             .client => "TLS 1.3, client CertificateVerify",
         };
@@ -535,13 +535,22 @@ pub const Handshake = struct {
         return out[0 .. 64 + context.len + 1 + hash.len];
     }
 
-    /// Signs the transcript so far with `pair`'s key under `scheme`.
-    pub fn writeCertificateVerify(h: *Handshake, pair: *const config.CertKeyPair, scheme: proto.SignatureScheme, signer: proto.Side) Error!void {
+    /// Signs the transcript so far with `pair`'s key under `scheme`,
+    /// through the pair's signer when it has one.
+    pub fn writeCertificateVerify(h: *Handshake, pair: *const config.CertKeyPair, scheme: proto.SignatureScheme, side: proto.Side) Error!void {
         var content_buf: [64 + 33 + 1 + crypto.hash.max_digest_length]u8 = undefined;
-        const content = h.certificateVerifyContent(signer, &content_buf);
+        const content = h.certificateVerifyContent(side, &content_buf);
         var signature_buf: [1024]u8 = undefined;
         if (pair.key.maxSignatureLength() > signature_buf.len) return error.TlsInternalError;
-        const signature = pair.key.sign(schemeAlgorithm(scheme).?, content, &signature_buf) catch return error.TlsInternalError;
+        const algorithm = schemeAlgorithm(scheme).?;
+        const signature = if (pair.signer) |s| blk: {
+            const signed = s.sign(s.context, &pair.key, algorithm, content, &signature_buf) catch return error.TlsInternalError;
+            // The hook's result has to be a slice of the buffer it was
+            // given; anything else is its bug, not the peer's.
+            const start = @intFromPtr(signed.ptr) -% @intFromPtr(&signature_buf);
+            if (start > signature_buf.len or signed.len > signature_buf.len - start) return error.TlsInternalError;
+            break :blk signed;
+        } else pair.key.sign(algorithm, content, &signature_buf) catch return error.TlsInternalError;
 
         var message_buf: [4 + 2 + 2 + signature_buf.len]u8 = undefined;
         var w = codec.Writer.init(&message_buf);
@@ -635,7 +644,7 @@ pub const Handshake = struct {
 
     /// Checks a CertificateVerify against the transcript so far and the
     /// peer's key. The scheme must be one we offered and suit the key.
-    pub fn verifyCertificateVerify(h: *Handshake, body: []const u8, public_key: *const sig.PublicKey, signer: proto.Side) Error!void {
+    pub fn verifyCertificateVerify(h: *Handshake, body: []const u8, public_key: *const sig.PublicKey, side: proto.Side) Error!void {
         var d = codec.Decoder.init(body);
         const scheme = try d.decode(proto.SignatureScheme);
         const signature = try d.vectorBytes(u16);
@@ -646,7 +655,7 @@ pub const Handshake = struct {
         h.conn.peer_signature_scheme = scheme;
 
         var content_buf: [64 + 33 + 1 + crypto.hash.max_digest_length]u8 = undefined;
-        const content = h.certificateVerifyContent(signer, &content_buf);
+        const content = h.certificateVerifyContent(side, &content_buf);
         public_key.verify(algorithm, content, signature) catch |err| return switch (err) {
             error.SignatureInvalid => error.TlsDecryptError,
             error.AlgorithmMismatch => error.TlsIllegalParameter,
