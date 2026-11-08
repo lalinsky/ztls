@@ -157,7 +157,9 @@ pub const TrustStore = struct {
         return self.count() - before;
     }
 
-    /// How many certificates the store holds.
+    /// How many certificates the store holds. For while the store is being
+    /// built: it reads the store without its lock, so not on one already
+    /// shared with connections that verify against it.
     pub fn count(self: *const TrustStore) usize {
         return c.sk_X509_OBJECT_num(c.X509_STORE_get0_objects(self.store));
     }
@@ -262,8 +264,9 @@ pub const TrustStore = struct {
         for (roots.files) |path| {
             const added = self.addPemFile(gpa, io, .cwd(), path) catch |e| switch (e) {
                 error.OutOfMemory, error.Canceled, error.CryptoFailed => return e,
+                error.FileNotFound => continue,
                 else => {
-                    log.debug("skipping {s}: {s}", .{ path, @errorName(e) });
+                    log.warn("skipping the system roots in {s}: {s}", .{ path, @errorName(e) });
                     continue;
                 },
             };
@@ -273,8 +276,9 @@ pub const TrustStore = struct {
         for (roots.dirs) |path| {
             var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch |e| switch (e) {
                 error.Canceled => return e,
+                error.FileNotFound, error.NotDir => continue,
                 else => {
-                    log.debug("skipping {s}: {s}", .{ path, @errorName(e) });
+                    log.warn("skipping the system roots in {s}: {s}", .{ path, @errorName(e) });
                     continue;
                 },
             };
