@@ -16,12 +16,19 @@ const Handshake = handshake.Handshake;
 const KeyShares = handshake.KeyShares;
 const Error = handshake.Error;
 
-/// What the ServerHello settled that the rest of the handshake needs.
-pub const Hello = struct {
-    client_random: *const [32]u8,
-    server_random: [32]u8,
-    extended_master_secret: bool,
-    alpn: ?[]const u8,
+/// What a TLS 1.2 ServerHello settles.
+pub const ServerHello = struct {
+    suite: proto.CipherSuite,
+    random: [32]u8,
+    extended_master_secret: bool = false,
+    /// Our own slice.
+    alpn: ?[]const u8 = null,
+};
+
+/// The two randoms, which the PRF and the ServerKeyExchange signature take.
+const Randoms = struct {
+    client: *const [32]u8,
+    server: *const [32]u8,
 };
 
 const master_secret_len = 48;
@@ -29,8 +36,9 @@ const verify_data_len = 12;
 
 /// Runs the handshake after the ServerHello, which `h` has hashed, with
 /// the suite set.
-pub fn run(h: *Handshake, opt: config.Client, hello: Hello) Error!void {
+pub fn run(h: *Handshake, opt: config.Client, client_random: *const [32]u8, hello: ServerHello) Error!void {
     const suite = h.suite;
+    const randoms: Randoms = .{ .client = client_random, .server = &hello.random };
     const hash_algorithm = cipher.suiteHash(suite).?;
     // Every record from here on says TLS 1.2.
     h.conn.read.check_record_version = true;
@@ -49,7 +57,7 @@ pub fn run(h: *Handshake, opt: config.Client, hello: Hello) Error!void {
 
     msg = try h.nextMessage();
     try h.expect(msg, .server_key_exchange);
-    const exchange = try parseServerKeyExchange(msg.body, opt, &peer.public_key, hello);
+    const exchange = try parseServerKeyExchange(msg.body, opt, &peer.public_key, randoms);
     h.conn.peer_signature_scheme = exchange.scheme;
     h.hashMessage(msg);
 
@@ -87,10 +95,10 @@ pub fn run(h: *Handshake, opt: config.Client, hello: Hello) Error!void {
         const session_hash = h.transcriptHash(&hash_buf);
         crypto.prf.tls12(hash_algorithm, response.secret, "extended master secret", session_hash, "", &master);
     } else {
-        crypto.prf.tls12(hash_algorithm, response.secret, "master secret", hello.client_random, &hello.server_random, &master);
+        crypto.prf.tls12(hash_algorithm, response.secret, "master secret", randoms.client, randoms.server, &master);
     }
 
-    var keys = try KeyBlock.derive(suite, &master, hello);
+    var keys = try KeyBlock.derive(suite, &master, randoms);
     defer keys.wipe();
 
     h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
@@ -145,17 +153,17 @@ fn checkLeaf(peer: *const handshake.PeerCertificate, suite: proto.CipherSuite, n
     switch (suiteAuthentication(suite)) {
         .rsa => if (key_type != .rsa) return error.TlsIllegalParameter,
         .ecdsa => {
-            const group: proto.NamedGroup = switch (key_type) {
-                .ecdsa => |curve| switch (curve) {
-                    .p256 => .secp256r1,
-                    .p384 => .secp384r1,
-                    .p521 => .secp521r1,
+            switch (key_type) {
+                .ecdsa => |curve| {
+                    const group: proto.NamedGroup = switch (curve) {
+                        .p256 => .secp256r1,
+                        .p384 => .secp384r1,
+                        .p521 => .secp521r1,
+                    };
+                    if (std.mem.indexOfScalar(proto.NamedGroup, named_groups, group) == null) return error.TlsIllegalParameter;
                 },
-                .ed25519 => .x25519,
+                .ed25519 => {},
                 .rsa => return error.TlsIllegalParameter,
-            };
-            if (key_type == .ecdsa and std.mem.indexOfScalar(proto.NamedGroup, named_groups, group) == null) {
-                return error.TlsIllegalParameter;
             }
             if (!peer.chain[0].allowsDigitalSignature()) return error.TlsBadCertificate;
         },
@@ -177,7 +185,7 @@ const KeyExchange = struct {
 
 /// The server's ECDHE parameters (RFC 8422 §5.4) and its signature over
 /// them and both randoms, made with the leaf's key.
-fn parseServerKeyExchange(body: []const u8, opt: config.Client, public_key: *const sig.PublicKey, hello: Hello) Error!KeyExchange {
+fn parseServerKeyExchange(body: []const u8, opt: config.Client, public_key: *const sig.PublicKey, randoms: Randoms) Error!KeyExchange {
     var d = codec.Decoder.init(body);
     // ECCurveType: named_curve only; explicit curves are long gone.
     if (try d.decode(u8) != 3) return error.TlsIllegalParameter;
@@ -201,8 +209,8 @@ fn parseServerKeyExchange(body: []const u8, opt: config.Client, public_key: *con
 
     var content_buf: [32 + 32 + 4 + 255]u8 = undefined;
     var w = codec.Writer.init(&content_buf);
-    w.slice(hello.client_random) catch unreachable;
-    w.slice(&hello.server_random) catch unreachable;
+    w.slice(randoms.client) catch unreachable;
+    w.slice(randoms.server) catch unreachable;
     w.slice(params) catch unreachable;
     public_key.verify(algorithm, w.written(), signature) catch |err| return switch (err) {
         error.SignatureInvalid => error.TlsDecryptError,
@@ -244,9 +252,9 @@ const KeyBlock = struct {
     algorithm: crypto.aead.Algorithm,
     bytes: [2 * crypto.aead.max_key_length + 2 * crypto.aead.nonce_length]u8,
 
-    fn derive(suite: proto.CipherSuite, master: *const [master_secret_len]u8, hello: Hello) Error!KeyBlock {
+    fn derive(suite: proto.CipherSuite, master: *const [master_secret_len]u8, randoms: Randoms) Error!KeyBlock {
         var block: KeyBlock = .{ .algorithm = cipher.suiteAead(suite).?, .bytes = undefined };
-        crypto.prf.tls12(cipher.suiteHash(suite).?, master, "key expansion", &hello.server_random, hello.client_random, block.bytes[0..block.len()]);
+        crypto.prf.tls12(cipher.suiteHash(suite).?, master, "key expansion", randoms.server, randoms.client, block.bytes[0..block.len()]);
         return block;
     }
 
@@ -299,15 +307,15 @@ fn verifyFinished(h: *const Handshake, hash_algorithm: crypto.hash.Algorithm, ma
 const testing = std.testing;
 
 /// A ServerKeyExchange for `group` with a dummy point, signed by `pair`.
-fn testServerKeyExchange(buf: []u8, pair: *const config.CertKeyPair, hello: Hello, curve_type: u8, group: proto.NamedGroup, scheme: proto.SignatureScheme) ![]u8 {
+fn testServerKeyExchange(buf: []u8, pair: *const config.CertKeyPair, randoms: Randoms, curve_type: u8, group: proto.NamedGroup, scheme: proto.SignatureScheme) ![]u8 {
     var w = codec.Writer.init(buf);
     try w.byte(curve_type);
     try w.enumValue(group);
     try w.vector(u8, &@as([32]u8, @splat(9)));
     const params_len = w.written().len;
     var content: [512]u8 = undefined;
-    @memcpy(content[0..32], hello.client_random);
-    @memcpy(content[32..64], &hello.server_random);
+    @memcpy(content[0..32], randoms.client);
+    @memcpy(content[32..64], randoms.server);
     @memcpy(content[64..][0..params_len], w.written());
     var sig_buf: [512]u8 = undefined;
     // A scheme the key cannot sign under gets an ECDSA signature anyway.
@@ -324,7 +332,8 @@ test "a ServerKeyExchange is signed over both randoms, with a group and scheme w
     var public = try pair.leaf.publicKey();
     defer public.deinit();
     const client_random: [32]u8 = @splat(1);
-    const hello: Hello = .{ .client_random = &client_random, .server_random = @splat(2), .extended_master_secret = true, .alpn = null };
+    const server_random: [32]u8 = @splat(2);
+    const hello: Randoms = .{ .client = &client_random, .server = &server_random };
     const opt: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined };
     var buf: [512]u8 = undefined;
 
@@ -338,8 +347,9 @@ test "a ServerKeyExchange is signed over both randoms, with a group and scheme w
     try testing.expectError(error.TlsDecryptError, parseServerKeyExchange(body, opt, &public, hello));
     // In TLS 1.2 the scheme's curve is not the key's: P-256 under SHA-384.
     _ = try parseServerKeyExchange(try testServerKeyExchange(&buf, &pair, hello, 3, .x25519, .ecdsa_secp384r1_sha384), opt, &public, hello);
-    var other = hello;
-    other.server_random[0] ^= 1;
+    var other_random = server_random;
+    other_random[0] ^= 1;
+    const other: Randoms = .{ .client = &client_random, .server = &other_random };
     try testing.expectError(error.TlsDecryptError, parseServerKeyExchange(try testServerKeyExchange(&buf, &pair, hello, 3, .x25519, .ecdsa_secp256r1_sha256), opt, &public, other));
 
     // A scheme for another kind of key, explicit curves, the TLS 1.3

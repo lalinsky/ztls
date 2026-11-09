@@ -25,20 +25,20 @@ pub fn run(conn: *Connection, options: config.Client) Error!void {
     };
 }
 
-/// What a ServerHello or HelloRetryRequest tells us.
+/// A ServerHello of either version.
+const AnyServerHello = union(enum) {
+    tls13: ServerHello,
+    tls12: tls12.ServerHello,
+};
+
+/// What a TLS 1.3 ServerHello or HelloRetryRequest tells us.
 const ServerHello = struct {
-    /// TLS 1.3 or TLS 1.2.
-    version: proto.Version,
-    random: [32]u8,
     is_retry: bool,
     suite: proto.CipherSuite,
     /// The server's share, or in a HelloRetryRequest the group it wants a
     /// share for; a retry may instead carry only a cookie.
     key_share: ?KeyShare,
     cookie: ?[]const u8 = null,
-    /// TLS 1.2 only: what the ServerHello's extensions agreed.
-    extended_master_secret: bool = false,
-    alpn: ?[]const u8 = null,
 
     const KeyShare = struct {
         group: proto.NamedGroup,
@@ -102,19 +102,16 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 
     var msg = try h.nextMessage();
     try h.expect(msg, .server_hello);
-    var hello = try parseServerHello(msg.body, opt, session_id);
-    if (hello.version == .tls_1_2) {
-        h.setSuite(hello.suite);
-        h.hashMessage(msg);
-        try tls12.run(h, opt, .{
-            .client_random = &random,
-            .server_random = hello.random,
-            .extended_master_secret = hello.extended_master_secret,
-            .alpn = hello.alpn,
-        });
-        h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
-        return;
-    }
+    var hello = switch (try parseServerHello(msg.body, opt, session_id)) {
+        .tls13 => |hello| hello,
+        .tls12 => |hello| {
+            h.setSuite(hello.suite);
+            h.hashMessage(msg);
+            try tls12.run(h, opt, &random, hello);
+            h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
+            return;
+        },
+    };
     h.ccs_allowed = true;
     h.tolerate_warnings = false;
     var sent_ccs = false;
@@ -146,9 +143,11 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 
         msg = try h.nextMessage();
         try h.expect(msg, .server_hello);
-        const second = try parseServerHello(msg.body, opt, session_id);
-        // A retry settled TLS 1.3 (§4.2.4).
-        if (second.version != .tls_1_3) return error.TlsIllegalParameter;
+        const second = switch (try parseServerHello(msg.body, opt, session_id)) {
+            .tls13 => |second| second,
+            // A retry settled TLS 1.3 (§4.2.4).
+            .tls12 => return error.TlsIllegalParameter,
+        };
         if (second.is_retry) return error.TlsUnexpectedMessage;
         if (second.suite != hello.suite) return error.TlsIllegalParameter;
         hello = second;
@@ -347,11 +346,13 @@ fn build(
     try message.end(w);
 }
 
-/// The last eight bytes of a TLS 1.2 ServerHello.random from a server that
-/// could have spoken TLS 1.3 (RFC 9846 §4.2.3).
+/// The last eight bytes of a ServerHello.random from a server that could
+/// have spoken TLS 1.3 and chose TLS 1.2, or something older
+/// (RFC 9846 §4.2.3).
 const downgrade_tls12 = "DOWNGRD\x01";
+const downgrade_tls11 = "DOWNGRD\x00";
 
-fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8) Error!ServerHello {
+fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8) Error!AnyServerHello {
     var d = codec.Decoder.init(body);
     const legacy_version = try d.decode(proto.Version);
     const random = (try d.array(32)).*;
@@ -363,9 +364,9 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
     var extensions = if (d.eof()) codec.Decoder.init(&.{}) else try d.vector(u16);
     try d.expectEof();
 
-    // supported_versions says TLS 1.3; without it, legacy_version says
-    // what is spoken.
-    var version = legacy_version;
+    // Only supported_versions says TLS 1.3 (§4.2.1); without it,
+    // legacy_version says what is spoken, and only TLS 1.2 is spoken so.
+    var version: proto.Version = if (legacy_version == .tls_1_2) .tls_1_2 else return error.TlsProtocolVersion;
     var scan = extensions;
     while (!scan.eof()) {
         const extension = try scan.decode(proto.Extension);
@@ -373,23 +374,21 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
         if (extension == .supported_versions) {
             // Only in answer to ours, and only for TLS 1.3.
             if (!offers(opt, .tls_1_3)) return error.TlsUnsupportedExtension;
-            if (legacy_version != .tls_1_2) return error.TlsProtocolVersion;
             if (try data.decode(proto.Version) != .tls_1_3) return error.TlsIllegalParameter;
             try data.expectEof();
             version = .tls_1_3;
         }
     }
-    if (version != .tls_1_3 and version != .tls_1_2) return error.TlsProtocolVersion;
     if (!offers(opt, version)) return error.TlsProtocolVersion;
     // One of ours, and one of the version's.
     if (std.mem.indexOfScalar(proto.CipherSuite, opt.cipher_suites, suite) == null) return error.TlsIllegalParameter;
     if (suite.version() != version) return error.TlsIllegalParameter;
 
-    if (version == .tls_1_2) return parseServerHelloTls12(opt, random, session_id, echoed_session_id, suite, extensions);
+    if (version == .tls_1_2) return .{ .tls12 = try parseServerHelloTls12(opt, random, suite, extensions) };
 
     const is_retry = std.mem.eql(u8, &random, &handshake.hello_retry_request_random);
     if (!std.mem.eql(u8, echoed_session_id, session_id)) return error.TlsIllegalParameter;
-    var hello: ServerHello = .{ .version = .tls_1_3, .random = random, .is_retry = is_retry, .suite = suite, .key_share = null };
+    var hello: ServerHello = .{ .is_retry = is_retry, .suite = suite, .key_share = null };
     // (BoringSSL's runner wants illegal_parameter for a retry's duplicate.)
     try checkNoDuplicates(extensions, if (is_retry) error.TlsIllegalParameter else error.TlsDecodeError);
     while (!extensions.eof()) {
@@ -411,26 +410,22 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
         }
         try data.expectEof();
     }
-    return hello;
+    return .{ .tls13 = hello };
 }
 
-/// The rest of a TLS 1.2 ServerHello: the downgrade sentinel, no
-/// resumption, and the extensions TLS 1.2 puts here.
-fn parseServerHelloTls12(
-    opt: config.Client,
-    random: [32]u8,
-    session_id: []const u8,
-    echoed_session_id: []const u8,
-    suite: proto.CipherSuite,
-    extensions: codec.Decoder,
-) Error!ServerHello {
-    // A server that could speak TLS 1.3 and chose 1.2 anyway has been
-    // tampered with, when we offered 1.3 (§4.2.3).
-    if (offers(opt, .tls_1_3) and std.mem.eql(u8, random[24..], downgrade_tls12)) return error.TlsIllegalParameter;
-    // Our session ID back would mean resuming a session we never had.
-    if (session_id.len > 0 and std.mem.eql(u8, echoed_session_id, session_id)) return error.TlsIllegalParameter;
+/// The rest of a TLS 1.2 ServerHello: the downgrade sentinel and the
+/// extensions TLS 1.2 puts here. Its session ID is not looked at: we
+/// offer none to resume, and a server that echoes our TLS 1.3 one gets a
+/// full handshake, as with AWS-LC (one that tries to resume fails at the
+/// Certificate it does not send).
+fn parseServerHelloTls12(opt: config.Client, random: [32]u8, suite: proto.CipherSuite, extensions: codec.Decoder) Error!tls12.ServerHello {
+    // A server that could speak TLS 1.3 and chose an older version has
+    // been tampered with, when we offered 1.3 (§4.2.3).
+    if (offers(opt, .tls_1_3)) {
+        if (std.mem.eql(u8, random[24..], downgrade_tls12) or std.mem.eql(u8, random[24..], downgrade_tls11)) return error.TlsIllegalParameter;
+    }
 
-    var hello: ServerHello = .{ .version = .tls_1_2, .random = random, .is_retry = false, .suite = suite, .key_share = null };
+    var hello: tls12.ServerHello = .{ .suite = suite, .random = random };
     try checkNoDuplicates(extensions, error.TlsDecodeError);
     var d = extensions;
     while (!d.eof()) {
@@ -585,7 +580,7 @@ test "a ServerHello must echo the session id and name TLS 1.3" {
     try w.vector(u16, &.{ 0, 0x17 });
     try ext.end(&w);
 
-    const hello = try parseServerHello(w.written(), opt, &session_id);
+    const hello = (try parseServerHello(w.written(), opt, &session_id)).tls13;
     try testing.expect(hello.is_retry);
     try testing.expectEqual(proto.NamedGroup.secp256r1, hello.key_share.?.group);
     try testing.expectEqual(null, hello.cookie);
@@ -628,11 +623,11 @@ test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
     var buf: [256]u8 = undefined;
 
     // No extensions block at all, and one with what a server sends.
-    var hello = try parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, null), opt, &ours);
-    try testing.expectEqual(proto.Version.tls_1_2, hello.version);
+    var hello = (try parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, null), opt, &ours)).tls12;
+    try testing.expectEqual(suite, hello.suite);
     try testing.expect(!hello.extended_master_secret);
     const usual = [_]u8{ 0xff, 0x01, 0, 1, 0 } ++ [_]u8{ 0, 23, 0, 0 } ++ [_]u8{ 0, 11, 0, 2, 1, 0 };
-    hello = try parseServerHello(try testServerHello(&buf, .tls_1_2, &random, "", suite, &usual), opt, &ours);
+    hello = (try parseServerHello(try testServerHello(&buf, .tls_1_2, &random, "", suite, &usual), opt, &ours)).tls12;
     try testing.expect(hello.extended_master_secret);
     try testing.expectEqualSlices(u8, &random, &hello.random);
 
@@ -645,15 +640,22 @@ test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
     // supported_versions may not pick TLS 1.2.
     const v12 = [_]u8{ 0, 43, 0, 2, 3, 3 };
     try testing.expectError(error.TlsIllegalParameter, parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &ours, suite, &v12), opt, &ours));
-    // Anything older is refused.
+    // Anything older is refused, and TLS 1.3 only through supported_versions.
     try testing.expectError(error.TlsProtocolVersion, parseServerHello(try testServerHello(&buf, @enumFromInt(0x0302), &random, &theirs, suite, null), opt, &ours));
+    try testing.expectError(error.TlsProtocolVersion, parseServerHello(try testServerHello(&buf, .tls_1_3, &random, &ours, .aes_128_gcm_sha256, null), opt, &ours));
+    try testing.expectError(error.TlsProtocolVersion, parseServerHello(try testServerHello(&buf, .tls_1_3, &random, &ours, .aes_128_gcm_sha256, &.{}), only13, &ours));
 
-    // The downgrade sentinel, since we offered TLS 1.3 too.
-    random[24..].* = "DOWNGRD\x01".*;
-    try testing.expectError(error.TlsIllegalParameter, parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, null), opt, &ours));
+    // The downgrade sentinels, since we offered TLS 1.3 too, but not when
+    // we offered TLS 1.2 alone.
+    const tls12_only: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &proto.CipherSuite.tls12 };
+    for ([_]*const [8]u8{ downgrade_tls12, downgrade_tls11 }) |sentinel| {
+        random[24..].* = sentinel.*;
+        try testing.expectError(error.TlsIllegalParameter, parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, null), opt, &ours));
+        _ = try parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, null), tls12_only, "");
+    }
     random = @splat(0x5a);
-    // Our session ID back: resumption we never asked for.
-    try testing.expectError(error.TlsIllegalParameter, parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &ours, suite, null), opt, &ours));
+    // Our session ID back gets a full handshake, as with AWS-LC.
+    _ = (try parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &ours, suite, null), opt, &ours)).tls12;
 
     // renegotiation_info must be empty; point formats must allow
     // uncompressed; nothing we did not offer.
