@@ -210,6 +210,8 @@ pub const Client = struct {
     insecure_skip_verify: bool = false,
     /// A certificate to present if the server asks for one.
     auth: ?*const CertKeyPair = null,
+    /// Offered in this order. Any of `CipherSuite.tls12` among them offers
+    /// TLS 1.2 too, after TLS 1.3; with only those, TLS 1.2 alone.
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
     named_groups: []const proto.NamedGroup = &default_named_groups,
     /// Groups to send key shares for; each must be in `named_groups`.
@@ -242,6 +244,7 @@ pub const Server = struct {
     /// `auth` are tried. Null leaves the choice to them.
     select_certificate: ?SelectCertificate = null,
     client_auth: ?ClientAuth = null,
+    /// The server speaks TLS 1.3 only; TLS 1.2 suites here are skipped.
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
     /// Supported, in preference order. A client whose offer shares none

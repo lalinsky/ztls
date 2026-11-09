@@ -175,7 +175,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     h.hashMessage(msg);
 
     try h.installReadKeys(ap.client);
-    h.conn.read.accept_ccs = false;
+    h.conn.read.ccs = .refuse;
     h.conn.alpn_protocol = choices.alpn;
     h.conn.strict_close_notify = opt.strict_close_notify;
 }
@@ -190,7 +190,7 @@ fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const
         if (select.callback(select.context, info)) |pair| return pair;
     }
     for (opt.certificates) |pair| {
-        if (handshake.selectScheme(pair.key.key_type, schemes) == null) continue;
+        if (handshake.selectScheme(pair.key.key_type, schemes, .tls13) == null) continue;
         if (hello.server_name) |name| {
             if (!pair.leaf.matchesHost(name)) continue;
         }
@@ -200,14 +200,15 @@ fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const
 }
 
 fn acceptsKey(info: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
-    return handshake.selectScheme(key_type, info.schemes) != null;
+    return handshake.selectScheme(key_type, info.schemes, .tls13) != null;
 }
 
 /// Picks the suite, group, signature scheme and ALPN protocol, or says
 /// why no handshake is possible.
 fn choose(hello: *const ClientHello, opt: config.Server, auth: *const config.CertKeyPair) Error!Choices {
+    // The server speaks TLS 1.3 only: TLS 1.2 suites in the list are passed over.
     const suite = for (opt.cipher_suites) |suite| {
-        if (hello.offersSuite(suite)) break suite;
+        if (suite.version() == .tls_1_3 and hello.offersSuite(suite)) break suite;
     } else return error.TlsHandshakeFailure;
 
     // Of the groups the client sent shares for, our favourite; failing
@@ -219,7 +220,7 @@ fn choose(hello: *const ClientHello, opt: config.Server, auth: *const config.Cer
     } else return error.TlsHandshakeFailure;
 
     const schemes = hello.schemes[0 .. hello.schemes_len orelse return error.TlsMissingExtension];
-    const scheme = handshake.selectScheme(auth.key.key_type, schemes) orelse return error.TlsHandshakeFailure;
+    const scheme = handshake.selectScheme(auth.key.key_type, schemes, .tls13) orelse return error.TlsHandshakeFailure;
 
     return .{ .suite = suite, .group = group, .scheme = scheme, .alpn = try selectAlpn(opt.alpn_protocols, hello.alpn) };
 }

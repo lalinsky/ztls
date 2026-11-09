@@ -213,7 +213,15 @@ test "our client against openssl s_server" {
         key_update: bool = false,
         /// Bytes to push through in each direction, concurrently.
         transfer: usize = 0,
+        /// The server speaks TLS 1.2 only; we offer both versions.
+        tls12: bool = false,
+        /// OpenSSL's TLS 1.2 suite names, and signature algorithms.
+        cipher: ?[]const u8 = null,
+        sigalgs: ?[]const u8 = null,
+        /// Ask for a client certificate without requiring one.
+        request_cert: bool = false,
     };
+    const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
     const cases = [_]Case{
         .{ .server_alpn = "h2,http/1.1", .client_alpn = &.{ "http/1.1", "h2" }, .expected_alpn = "h2" },
         .{ .cert = "server-rsa" },
@@ -225,6 +233,17 @@ test "our client against openssl s_server" {
         .{ .ciphersuites = "TLS_AES_128_GCM_SHA256", .suites = &.{.aes_128_gcm_sha256} },
         .{ .key_update = true },
         .{ .transfer = 1 << 20 },
+        // TLS 1.2: ECDHE_ECDSA with the default suite, curve and hash.
+        .{ .tls12 = true, .suites = &both, .server_alpn = "h2,http/1.1", .client_alpn = &.{ "http/1.1", "h2" }, .expected_alpn = "h2" },
+        // ECDHE_RSA signed with RSA-PSS, and with PKCS#1 v1.5.
+        .{ .tls12 = true, .suites = &both, .cert = "server-rsa", .cipher = "ECDHE-RSA-AES256-GCM-SHA384" },
+        .{ .tls12 = true, .suites = &both, .cert = "server-rsa", .sigalgs = "RSA+SHA256" },
+        .{ .tls12 = true, .suites = &both, .cert = "server-rsa", .sigalgs = "RSA+SHA512", .cipher = "ECDHE-RSA-CHACHA20-POLY1305" },
+        .{ .tls12 = true, .suites = &both, .cert = "server-ed25519" },
+        .{ .tls12 = true, .suites = &both, .cipher = "ECDHE-ECDSA-CHACHA20-POLY1305", .groups = "P-256" },
+        .{ .tls12 = true, .suites = &both, .cipher = "ECDHE-ECDSA-AES256-GCM-SHA384", .groups = "P-384" },
+        .{ .tls12 = true, .suites = &proto.CipherSuite.tls12, .request_cert = true },
+        .{ .tls12 = true, .suites = &both, .transfer = 1 << 20 },
     };
     var trust = try ztls.TrustStore.init();
     defer trust.deinit();
@@ -243,7 +262,7 @@ test "our client against openssl s_server" {
         try argv.appendSlice(testing.allocator, &.{
             "openssl",                                                       "s_server",
             "-accept",                                                       accept,
-            "-tls1_3",                                                       "-rev",
+            if (case.tls12) "-tls1_2" else "-tls1_3",                        "-rev",
             "-naccept",                                                      "1",
             "-quiet",                                                        "-cert",
             try std.fmt.bufPrint(&cert_buf, pki ++ "{s}.pem", .{case.cert}), "-key",
@@ -253,6 +272,9 @@ test "our client against openssl s_server" {
         if (case.client_cert) try argv.appendSlice(testing.allocator, &.{ "-Verify", "1", "-CAfile", pki ++ "ca.pem" });
         if (case.groups) |groups| try argv.appendSlice(testing.allocator, &.{ "-groups", groups });
         if (case.ciphersuites) |suites| try argv.appendSlice(testing.allocator, &.{ "-ciphersuites", suites });
+        if (case.cipher) |cipher| try argv.appendSlice(testing.allocator, &.{ "-cipher", cipher });
+        if (case.sigalgs) |sigalgs| try argv.appendSlice(testing.allocator, &.{ "-sigalgs", sigalgs });
+        if (case.request_cert) try argv.appendSlice(testing.allocator, &.{ "-verify", "1", "-CAfile", pki ++ "ca.pem" });
 
         const peer = try Peer.spawn(io, argv.items, .ignore, .ignore);
         errdefer peer.abort();
@@ -271,6 +293,7 @@ test "our client against openssl s_server" {
         });
         defer conn.deinit();
         if (case.expected_alpn) |alpn| try testing.expectEqualStrings(alpn, conn.alpn_protocol.?) else try testing.expectEqual(null, conn.alpn_protocol);
+        try testing.expectEqual(if (case.tls12) proto.Version.tls_1_2 else .tls_1_3, conn.version.?);
 
         var rbuf: [256]u8 = undefined;
         var r = conn.reader(&rbuf);
@@ -474,8 +497,11 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
         groups: []const proto.NamedGroup,
         client_cert: bool = false,
         transfer: usize = 0,
+        tls12: bool = false,
     };
     const cases = [_]Case{
+        // TLS 1.2 needs the leaf's curve, P-256, among the groups offered.
+        .{ .groups = &.{ .x25519_ml_kem768, .x25519, .secp256r1 }, .tls12 = true },
         .{ .groups = &.{.x25519_ml_kem768} },
         .{ .groups = &.{.x25519}, .client_cert = true },
         .{ .groups = &.{.secp256r1}, .transfer = 1 << 20 },
@@ -492,6 +518,7 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
             "h2,http/1.1",
         });
         if (case.client_cert) try argv.appendSlice(testing.allocator, &.{ "-require-client-cert", "-ca", pki ++ "ca.pem" });
+        if (case.tls12) try argv.append(testing.allocator, "-tls12");
         const peer = try Peer.spawn(io, argv.items, .ignore, .pipe);
         errdefer peer.abort();
         var line_buf: [128]u8 = undefined;
@@ -511,6 +538,7 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
             .key_shares = case.groups,
             .alpn_protocols = &.{"h2"},
             .auth = if (case.client_cert) &client_pair else null,
+            .cipher_suites = if (case.tls12) &(proto.CipherSuite.all ++ proto.CipherSuite.tls12) else &proto.CipherSuite.all,
         });
         defer conn.deinit();
         try testing.expectEqualStrings("h2", conn.alpn_protocol.?);

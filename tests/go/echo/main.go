@@ -29,9 +29,14 @@ func main() {
 	alpn := flag.String("alpn", "", "comma-separated ALPN protocols")
 	serverName := flag.String("servername", "localhost", "server name to send and verify")
 	requireClientCert := flag.Bool("require-client-cert", false, "server: require a client certificate")
+	tls12 := flag.Bool("tls12", false, "speak TLS 1.2 instead of 1.3")
 	flag.Parse()
 
 	cfg := &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, ServerName: *serverName}
+	if *tls12 {
+		cfg.MinVersion = tls.VersionTLS12
+		cfg.MaxVersion = tls.VersionTLS12
+	}
 	if *alpn != "" {
 		cfg.NextProtos = strings.Split(*alpn, ",")
 	}

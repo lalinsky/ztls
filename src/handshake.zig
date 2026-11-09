@@ -15,7 +15,8 @@ const sig = crypto.sig;
 const x509 = crypto.x509;
 const key_schedule = @import("key_schedule.zig");
 const Secret = key_schedule.Secret;
-const Connection = @import("connection.zig").Connection;
+const connection = @import("connection.zig");
+const Connection = connection.Connection;
 
 const log = std.log.scoped(.ztls);
 
@@ -35,9 +36,10 @@ pub const hello_retry_request_random = [32]u8{
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 };
 
-/// What we put in signature_algorithms, in preference order. The
-/// rsa_pkcs1 ones are for certificate signatures only, which X.509
-/// verification checks; they never sign a CertificateVerify.
+/// What we put in signature_algorithms, in preference order. In TLS 1.3
+/// the rsa_pkcs1 ones are for certificate signatures only, which X.509
+/// verification checks; they never sign a CertificateVerify. In TLS 1.2
+/// they sign handshakes too.
 pub const signature_algorithms = [_]proto.SignatureScheme{
     .ecdsa_secp256r1_sha256,
     .ecdsa_secp384r1_sha384,
@@ -51,9 +53,11 @@ pub const signature_algorithms = [_]proto.SignatureScheme{
     .rsa_pkcs1_sha512,
 };
 
-/// The algorithm a scheme stands for in a TLS 1.3 CertificateVerify, or
-/// null for one that may not sign it there (the rsa_pkcs1 ones, §4.2.3).
-pub fn schemeAlgorithm(scheme: proto.SignatureScheme) ?sig.Algorithm {
+/// The algorithm a scheme stands for when it signs a handshake in
+/// `version`: a CertificateVerify, or in TLS 1.2 a ServerKeyExchange too.
+/// Null for one that may not: the rsa_pkcs1 ones in TLS 1.3 (§4.2.3), and
+/// any scheme we do not implement.
+pub fn schemeAlgorithm(scheme: proto.SignatureScheme, version: cipher.Version) ?sig.Algorithm {
     return switch (scheme) {
         .ecdsa_secp256r1_sha256 => .ecdsa_sha256,
         .ecdsa_secp384r1_sha384 => .ecdsa_sha384,
@@ -62,30 +66,39 @@ pub fn schemeAlgorithm(scheme: proto.SignatureScheme) ?sig.Algorithm {
         .rsa_pss_rsae_sha256 => .rsa_pss_sha256,
         .rsa_pss_rsae_sha384 => .rsa_pss_sha384,
         .rsa_pss_rsae_sha512 => .rsa_pss_sha512,
+        .rsa_pkcs1_sha256 => if (version == .tls12) .rsa_pkcs1_sha256 else null,
+        .rsa_pkcs1_sha384 => if (version == .tls12) .rsa_pkcs1_sha384 else null,
+        .rsa_pkcs1_sha512 => if (version == .tls12) .rsa_pkcs1_sha512 else null,
         else => null,
     };
 }
 
-/// Whether a key of `key_type` may sign a TLS 1.3 CertificateVerify under
-/// `scheme`: the algorithm must suit the kind of key, and an ECDSA scheme
-/// names the key's curve too (§4.2.3).
-pub fn schemeSuits(scheme: proto.SignatureScheme, key_type: sig.KeyType) bool {
-    const algorithm = schemeAlgorithm(scheme) orelse return false;
+/// Whether a key of `key_type` may sign a handshake under `scheme` in
+/// `version`: the algorithm must suit the kind of key, and in TLS 1.3 an
+/// ECDSA scheme names the key's curve too (§4.2.3). TLS 1.2 schemes name
+/// only the hash (RFC 5246 §7.4.1.4.1); there the leaf's curve is checked
+/// against supported_groups instead.
+pub fn schemeSuits(scheme: proto.SignatureScheme, key_type: sig.KeyType, version: cipher.Version) bool {
+    const algorithm = schemeAlgorithm(scheme, version) orelse return false;
     if (!algorithm.suits(key_type)) return false;
-    const curve: ?sig.Curve = switch (scheme) {
+    if (version == .tls12) return true;
+    const curve: sig.Curve = switch (scheme) {
         .ecdsa_secp256r1_sha256 => .p256,
         .ecdsa_secp384r1_sha384 => .p384,
         .ecdsa_secp521r1_sha512 => .p521,
-        else => null,
+        else => return true,
     };
-    return curve == null or key_type.ecdsa == curve.?;
+    return switch (key_type) {
+        .ecdsa => |key_curve| key_curve == curve,
+        else => false,
+    };
 }
 
-/// The scheme to sign a CertificateVerify with: our most preferred one
-/// that the peer offered and that suits the key.
-pub fn selectScheme(key_type: sig.KeyType, offered: []const proto.SignatureScheme) ?proto.SignatureScheme {
+/// The scheme to sign with in `version`: our most preferred one that the
+/// peer offered and that suits the key.
+pub fn selectScheme(key_type: sig.KeyType, offered: []const proto.SignatureScheme, version: cipher.Version) ?proto.SignatureScheme {
     for (signature_algorithms) |scheme| {
-        if (!schemeSuits(scheme, key_type)) continue;
+        if (!schemeSuits(scheme, key_type, version)) continue;
         if (std.mem.indexOfScalar(proto.SignatureScheme, offered, scheme) != null) return scheme;
     }
     return null;
@@ -259,6 +272,13 @@ pub const Handshake = struct {
     /// A change_cipher_spec may arrive once the first ClientHello has been
     /// sent or received (§5).
     ccs_allowed: bool = false,
+    /// Warning alerts other than close_notify are ignored, as TLS 1.2 has
+    /// them (RFC 5246 §7.2): set by a client that offers TLS 1.2, until a
+    /// TLS 1.3 ServerHello. A server sends one (unrecognized_name, often)
+    /// before it knows which version it will speak.
+    tolerate_warnings: bool = false,
+    /// Warning alerts in a row, capped as on an open connection.
+    warning_alerts: u32 = 0,
 
     pub fn init(conn: *Connection, allocator: Allocator, max_message_len: usize) Handshake {
         return .{
@@ -311,31 +331,51 @@ pub const Handshake = struct {
         }
         // Not between the fragments of a message: nothing may come between
         // those (§5.1).
-        h.conn.read.accept_ccs = h.ccs_allowed and h.inbox.items.len == 0;
+        h.conn.read.ccs = if (h.ccs_allowed and h.inbox.items.len == 0) .drop else .refuse;
+        const record = try h.readRecord();
+        if (record.content_type != .handshake) return error.TlsUnexpectedMessage;
+        if (record.payload.len == 0) return error.TlsUnexpectedMessage;
+        if (h.inbox.items.len + record.payload.len > h.max_message_len + 4 + cipher.max_plaintext_len) return error.TlsIllegalParameter;
+        try h.inbox.appendSlice(h.allocator, record.payload);
+    }
+
+    /// The next record that is not an alert to carry on past. Alerts end
+    /// the handshake otherwise; application data is out of place.
+    fn readRecord(h: *Handshake) Error!Connection.Record {
         while (true) {
             const record = h.conn.readRecord(null) catch |err| switch (err) {
                 error.EndOfStream => return error.EndOfStream,
                 error.ReadFailed => return error.ReadFailed,
                 else => |e| return e,
             };
-            switch (record.content_type) {
-                .handshake => {
-                    if (record.payload.len == 0) return error.TlsUnexpectedMessage;
-                    if (h.inbox.items.len + record.payload.len > h.max_message_len + 4 + cipher.max_plaintext_len) return error.TlsIllegalParameter;
-                    try h.inbox.appendSlice(h.allocator, record.payload);
-                    return;
-                },
-                .alert => {
-                    if (record.payload.len != 2) return error.TlsDecodeError;
-                    const alert = proto.Alert.decode(record.payload[0..2]);
-                    if (alert.toError()) |err| return err;
-                    // close_notify during the handshake: the peer gave up.
-                    if (alert == .close_notify) return error.EndOfStream;
-                    continue; // user_canceled, with close_notify to follow
-                },
-                else => return error.TlsUnexpectedMessage,
+            if (record.content_type != .alert) {
+                h.warning_alerts = 0;
+                if (record.content_type == .application_data) return error.TlsUnexpectedMessage;
+                return record;
             }
+            if (record.payload.len != 2) return error.TlsDecodeError;
+            const alert = proto.Alert.decode(record.payload[0..2]);
+            if (h.tolerate_warnings and record.payload[0] == @intFromEnum(proto.Alert.Level.warning) and alert != .close_notify) {
+                h.warning_alerts += 1;
+                if (h.warning_alerts > connection.max_warning_alerts) return error.TlsUnexpectedMessage;
+                continue;
+            }
+            if (alert.toError()) |err| return err;
+            // close_notify during the handshake: the peer gave up.
+            if (alert == .close_notify) return error.EndOfStream;
+            // user_canceled, with close_notify to follow
         }
+    }
+
+    /// TLS 1.2: the peer's change_cipher_spec, which has to be next, on a
+    /// message boundary (RFC 5246 §7.1); the caller then switches the read
+    /// keys.
+    pub fn readChangeCipherSpec(h: *Handshake) Error!void {
+        if (h.inbox_pos != h.inbox.items.len) return error.TlsUnexpectedMessage;
+        h.conn.read.ccs = .deliver;
+        defer h.conn.read.ccs = .refuse;
+        const record = try h.readRecord();
+        if (record.content_type != .change_cipher_spec) return error.TlsUnexpectedMessage;
     }
 
     /// Fails unless the message is of the expected type.
@@ -448,14 +488,16 @@ pub const Handshake = struct {
 
     // Key schedule
 
-    /// Fixes the suite: the transcript hash and the schedule follow it.
+    /// Fixes the suite, and with it the version: the transcript hash
+    /// follows it, and in TLS 1.3 the key schedule.
     pub fn setSuite(h: *Handshake, suite: proto.CipherSuite) void {
         assert(h.schedule == null);
         const hash_algorithm = cipher.suiteHash(suite).?;
         h.suite = suite;
         h.conn.suite = suite;
+        h.conn.version = suite.version().?;
         h.transcript.select(hash_algorithm);
-        h.schedule = key_schedule.KeySchedule.init(hash_algorithm);
+        if (suite.version() == .tls_1_3) h.schedule = key_schedule.KeySchedule.init(hash_algorithm);
     }
 
     pub fn transcriptHash(h: *const Handshake, out: *[crypto.hash.max_digest_length]u8) []const u8 {
@@ -563,7 +605,7 @@ pub const Handshake = struct {
         const content = h.certificateVerifyContent(side, &content_buf);
         var signature_buf: [1024]u8 = undefined;
         if (pair.key.maxSignatureLength() > signature_buf.len) return error.TlsInternalError;
-        const algorithm = schemeAlgorithm(scheme).?;
+        const algorithm = schemeAlgorithm(scheme, .tls13).?;
         const signature = if (pair.signer) |s| blk: {
             const signed = s.sign(s.context, &pair.key, algorithm, content, &signature_buf) catch return error.TlsInternalError;
             // The hook's result has to be a slice of the buffer it was
@@ -609,7 +651,25 @@ pub const Handshake = struct {
         var list = try d.vector(u24);
         try d.expectEof();
         if (list.eof()) return null;
+        var peer = try h.parseChain(&list, .tls13);
+        errdefer peer.deinit();
+        if (!peer.chain[0].allowsDigitalSignature()) return error.TlsBadCertificate;
+        return peer;
+    }
 
+    /// Parses a TLS 1.2 Certificate message (RFC 5246 §7.4.2): the bare
+    /// list, with no context and no extensions. Null for an empty one.
+    /// The leaf's key usage is the caller's to check, against the suite.
+    pub fn parseCertificateTls12(h: *Handshake, body: []const u8) Error!?PeerCertificate {
+        var d = codec.Decoder.init(body);
+        var list = try d.vector(u24);
+        try d.expectEof();
+        if (list.eof()) return null;
+        return try h.parseChain(&list, .tls12);
+    }
+
+    /// The certificates of a non-empty certificate_list, and the leaf's key.
+    fn parseChain(h: *Handshake, list: *codec.Decoder, version: cipher.Version) Error!PeerCertificate {
         var peer: PeerCertificate = .{ .public_key = undefined };
         errdefer for (peer.chain[0..peer.len]) |*cert| cert.deinit();
         var copies: std.ArrayList([]const u8) = .empty;
@@ -620,15 +680,17 @@ pub const Handshake = struct {
         while (!list.eof()) {
             if (peer.len == peer.chain.len) return error.TlsBadCertificate;
             const der = try list.vectorBytes(u24);
-            // Extensions here answer a request (status_request, SCTs) we
-            // never make (§4.5.1), so none may come.
-            const extensions = try list.vector(u16);
-            if (!extensions.eof()) return error.TlsUnsupportedExtension;
+            if (der.len == 0) return error.TlsDecodeError;
+            if (version == .tls13) {
+                // Extensions here answer a request (status_request, SCTs)
+                // we never make (§4.5.1), so none may come.
+                const extensions = try list.vector(u16);
+                if (!extensions.eof()) return error.TlsUnsupportedExtension;
+            }
             peer.chain[peer.len] = x509.Certificate.parseDer(der) catch return error.TlsDecodeError;
             peer.len += 1;
             try copies.append(h.allocator, try h.allocator.dupe(u8, der));
         }
-        if (!peer.chain[0].allowsDigitalSignature()) return error.TlsBadCertificate;
         peer.public_key = peer.chain[0].publicKey() catch |err| switch (err) {
             error.UnsupportedKey => return error.TlsUnsupportedCertificate,
             error.CryptoFailed => return error.TlsInternalError,
@@ -671,8 +733,8 @@ pub const Handshake = struct {
         const signature = try d.vectorBytes(u16);
         try d.expectEof();
         if (std.mem.indexOfScalar(proto.SignatureScheme, &signature_algorithms, scheme) == null) return error.TlsIllegalParameter;
-        if (!schemeSuits(scheme, public_key.key_type)) return error.TlsIllegalParameter;
-        const algorithm = schemeAlgorithm(scheme).?;
+        if (!schemeSuits(scheme, public_key.key_type, .tls13)) return error.TlsIllegalParameter;
+        const algorithm = schemeAlgorithm(scheme, .tls13).?;
         h.conn.peer_signature_scheme = scheme;
 
         var content_buf: [64 + 33 + 1 + crypto.hash.max_digest_length]u8 = undefined;
@@ -727,23 +789,35 @@ test "key shares agree for every group" {
 }
 
 test "scheme selection" {
-    try testing.expectEqual(proto.SignatureScheme.ecdsa_secp256r1_sha256, selectScheme(.{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp256r1_sha256 }).?);
-    try testing.expectEqual(null, selectScheme(.{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp384r1_sha384 }));
-    try testing.expectEqual(proto.SignatureScheme.rsa_pss_rsae_sha384, selectScheme(.{ .rsa = 2048 }, &.{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha384 }).?);
-    try testing.expectEqual(null, selectScheme(.{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256})); // pkcs1 may not sign a CertificateVerify
-    try testing.expectEqual(proto.SignatureScheme.ed25519, selectScheme(.ed25519, &.{.ed25519}).?);
+    try testing.expectEqual(proto.SignatureScheme.ecdsa_secp256r1_sha256, selectScheme(.{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp256r1_sha256 }, .tls13).?);
+    try testing.expectEqual(null, selectScheme(.{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp384r1_sha384 }, .tls13));
+    try testing.expectEqual(proto.SignatureScheme.rsa_pss_rsae_sha384, selectScheme(.{ .rsa = 2048 }, &.{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha384 }, .tls13).?);
+    try testing.expectEqual(null, selectScheme(.{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls13)); // pkcs1 may not sign a CertificateVerify
+    try testing.expectEqual(proto.SignatureScheme.ed25519, selectScheme(.ed25519, &.{.ed25519}, .tls13).?);
 }
 
 test "TLS 1.3 binds each ECDSA scheme to a curve" {
-    try testing.expect(schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p256 }));
-    try testing.expect(!schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p384 }));
-    try testing.expect(schemeSuits(.ecdsa_secp384r1_sha384, .{ .ecdsa = .p384 }));
-    try testing.expect(!schemeSuits(.ecdsa_secp384r1_sha384, .{ .ecdsa = .p521 }));
-    try testing.expect(schemeSuits(.ecdsa_secp521r1_sha512, .{ .ecdsa = .p521 }));
-    try testing.expect(!schemeSuits(.ecdsa_secp521r1_sha512, .{ .rsa = 2048 }));
-    try testing.expect(schemeSuits(.rsa_pss_rsae_sha256, .{ .rsa = 4096 }));
-    try testing.expect(!schemeSuits(.rsa_pkcs1_sha256, .{ .rsa = 2048 }));
-    try testing.expect(!schemeSuits(.ed25519, .{ .ecdsa = .p256 }));
+    try testing.expect(schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p256 }, .tls13));
+    try testing.expect(!schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p384 }, .tls13));
+    try testing.expect(schemeSuits(.ecdsa_secp384r1_sha384, .{ .ecdsa = .p384 }, .tls13));
+    try testing.expect(!schemeSuits(.ecdsa_secp384r1_sha384, .{ .ecdsa = .p521 }, .tls13));
+    try testing.expect(schemeSuits(.ecdsa_secp521r1_sha512, .{ .ecdsa = .p521 }, .tls13));
+    try testing.expect(!schemeSuits(.ecdsa_secp521r1_sha512, .{ .rsa = 2048 }, .tls13));
+    try testing.expect(schemeSuits(.rsa_pss_rsae_sha256, .{ .rsa = 4096 }, .tls13));
+    try testing.expect(!schemeSuits(.rsa_pkcs1_sha256, .{ .rsa = 2048 }, .tls13));
+    try testing.expect(!schemeSuits(.ed25519, .{ .ecdsa = .p256 }, .tls13));
+}
+
+test "TLS 1.2 schemes name the hash only, and take PKCS#1 v1.5" {
+    try testing.expect(schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p384 }, .tls12));
+    try testing.expect(schemeSuits(.ecdsa_secp521r1_sha512, .{ .ecdsa = .p256 }, .tls12));
+    try testing.expect(!schemeSuits(.ecdsa_secp256r1_sha256, .{ .rsa = 2048 }, .tls12));
+    try testing.expect(schemeSuits(.rsa_pkcs1_sha256, .{ .rsa = 2048 }, .tls12));
+    try testing.expect(schemeSuits(.rsa_pss_rsae_sha512, .{ .rsa = 2048 }, .tls12));
+    try testing.expect(!schemeSuits(.rsa_pkcs1_sha384, .{ .ecdsa = .p384 }, .tls12));
+    try testing.expect(schemeSuits(.ed25519, .ed25519, .tls12));
+    try testing.expect(!schemeSuits(.rsa_pkcs1_sha1, .{ .rsa = 2048 }, .tls12));
+    try testing.expectEqual(proto.SignatureScheme.rsa_pkcs1_sha256, selectScheme(.{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls12).?);
 }
 
 test "a CertificateVerify under another curve's scheme is refused" {

@@ -52,20 +52,29 @@ pub const Tls13 = struct {
     secret: Secret,
 };
 
+/// The record AEAD of a TLS 1.3 or TLS 1.2 suite.
 pub fn suiteAead(suite: proto.CipherSuite) ?aead.Algorithm {
     return switch (suite) {
-        .aes_128_gcm_sha256 => .aes_128_gcm,
-        .aes_256_gcm_sha384 => .aes_256_gcm,
-        .chacha20_poly1305_sha256 => .chacha20_poly1305,
-        _ => null,
+        .aes_128_gcm_sha256, .ecdhe_ecdsa_with_aes_128_gcm_sha256, .ecdhe_rsa_with_aes_128_gcm_sha256 => .aes_128_gcm,
+        .aes_256_gcm_sha384, .ecdhe_ecdsa_with_aes_256_gcm_sha384, .ecdhe_rsa_with_aes_256_gcm_sha384 => .aes_256_gcm,
+        .chacha20_poly1305_sha256, .ecdhe_ecdsa_with_chacha20_poly1305_sha256, .ecdhe_rsa_with_chacha20_poly1305_sha256 => .chacha20_poly1305,
+        else => null,
     };
 }
 
+/// The hash of a suite's key schedule and transcript: HKDF's in TLS 1.3,
+/// the PRF's in TLS 1.2.
 pub fn suiteHash(suite: proto.CipherSuite) ?hash.Algorithm {
     return switch (suite) {
-        .aes_128_gcm_sha256, .chacha20_poly1305_sha256 => .sha256,
-        .aes_256_gcm_sha384 => .sha384,
-        _ => null,
+        .aes_128_gcm_sha256,
+        .chacha20_poly1305_sha256,
+        .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .ecdhe_rsa_with_aes_128_gcm_sha256,
+        .ecdhe_ecdsa_with_chacha20_poly1305_sha256,
+        .ecdhe_rsa_with_chacha20_poly1305_sha256,
+        => .sha256,
+        .aes_256_gcm_sha384, .ecdhe_ecdsa_with_aes_256_gcm_sha384, .ecdhe_rsa_with_aes_256_gcm_sha384 => .sha384,
+        else => null,
     };
 }
 

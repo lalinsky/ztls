@@ -41,9 +41,45 @@ pub const CipherSuite = enum(u16) {
     aes_128_gcm_sha256 = 0x1301,
     aes_256_gcm_sha384 = 0x1302,
     chacha20_poly1305_sha256 = 0x1303,
+    // TLS 1.2: ECDHE with an AEAD (RFC 5289, RFC 7905).
+    ecdhe_ecdsa_with_aes_128_gcm_sha256 = 0xc02b,
+    ecdhe_ecdsa_with_aes_256_gcm_sha384 = 0xc02c,
+    ecdhe_rsa_with_aes_128_gcm_sha256 = 0xc02f,
+    ecdhe_rsa_with_aes_256_gcm_sha384 = 0xc030,
+    ecdhe_rsa_with_chacha20_poly1305_sha256 = 0xcca8,
+    ecdhe_ecdsa_with_chacha20_poly1305_sha256 = 0xcca9,
+    /// Not a suite: a client's signal of secure renegotiation (RFC 5746).
+    empty_renegotiation_info_scsv = 0x00ff,
     _,
 
+    /// The TLS 1.3 suites.
     pub const all = [_]CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
+    /// The TLS 1.2 suites a client may offer, in preference order. Listing
+    /// any of them in a client's `cipher_suites` offers TLS 1.2.
+    pub const tls12 = [_]CipherSuite{
+        .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .ecdhe_rsa_with_aes_128_gcm_sha256,
+        .ecdhe_ecdsa_with_chacha20_poly1305_sha256,
+        .ecdhe_rsa_with_chacha20_poly1305_sha256,
+        .ecdhe_ecdsa_with_aes_256_gcm_sha384,
+        .ecdhe_rsa_with_aes_256_gcm_sha384,
+    };
+
+    /// The protocol version a suite belongs to, null for one ztls does
+    /// not implement.
+    pub fn version(suite: CipherSuite) ?Version {
+        return switch (suite) {
+            .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 => .tls_1_3,
+            .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+            .ecdhe_ecdsa_with_aes_256_gcm_sha384,
+            .ecdhe_rsa_with_aes_128_gcm_sha256,
+            .ecdhe_rsa_with_aes_256_gcm_sha384,
+            .ecdhe_rsa_with_chacha20_poly1305_sha256,
+            .ecdhe_ecdsa_with_chacha20_poly1305_sha256,
+            => .tls_1_2,
+            else => null,
+        };
+    }
 };
 
 pub const Extension = enum(u16) {
@@ -51,10 +87,13 @@ pub const Extension = enum(u16) {
     max_fragment_length = 1,
     status_request = 5,
     supported_groups = 10,
+    ec_point_formats = 11, // TLS 1.2
     signature_algorithms = 13,
     application_layer_protocol_negotiation = 16,
     signed_certificate_timestamp = 18,
     padding = 21,
+    extended_master_secret = 23, // TLS 1.2
+    session_ticket = 35, // TLS 1.2
     pre_shared_key = 41,
     early_data = 42,
     supported_versions = 43,
@@ -65,6 +104,7 @@ pub const Extension = enum(u16) {
     post_handshake_auth = 49,
     signature_algorithms_cert = 50,
     key_share = 51,
+    renegotiation_info = 0xff01, // TLS 1.2
     _,
 };
 

@@ -45,7 +45,7 @@ const max_key_updates: u64 = (1 << 48) - 1;
 /// Warning alerts a peer may send in a row, with no other record between
 /// them, as AWS-LC counts them; TLS 1.3 has only user_canceled. TLS 1.2
 /// peers send others (unrecognized_name, say), each ignored.
-const max_warning_alerts = 4;
+pub const max_warning_alerts = 4;
 
 /// What a read or write can fail with: the transport's own failure,
 /// something the record layer found, or an alert the peer sent.
@@ -59,6 +59,7 @@ pub const Failure = error{
     TlsIllegalParameter,
     TlsInternalError,
     TlsNoRenegotiation,
+    TlsProtocolVersion,
 } || proto.Alert.Error;
 /// What a read can fail with: the transport reader's failure, which does
 /// not end the connection, or a `Failure`, which does.
@@ -90,7 +91,9 @@ pub const Connection = struct {
 
     /// The protocol agreed through ALPN, pointing into the configuration.
     alpn_protocol: ?[]const u8 = null,
-    /// What the handshake settled on.
+    /// What the handshake settled on: TLS 1.3 or 1.2, the suite, the
+    /// (EC)DHE group.
+    version: ?proto.Version = null,
     suite: ?proto.CipherSuite = null,
     group: ?proto.NamedGroup = null,
     /// A HelloRetryRequest was needed.
@@ -120,9 +123,21 @@ pub const Connection = struct {
         /// each capped.
         ccs_records: u32 = 0,
         warning_alerts: u32 = 0,
-        /// Whether a change_cipher_spec may arrive: the handshake says so
-        /// while §5 allows one, never afterwards.
-        accept_ccs: bool = false,
+        /// What a change_cipher_spec does, as the handshake says.
+        ccs: CcsMode = .refuse,
+        /// Every record must carry legacy_record_version 0x0303, as a TLS
+        /// 1.2 handshake demands once the version is agreed. TLS 1.3
+        /// ignores the field (RFC 9846 §5.1).
+        check_record_version: bool = false,
+    };
+
+    pub const CcsMode = enum {
+        /// Not now: unexpected_message.
+        refuse,
+        /// TLS 1.3 middlebox compatibility (§5): one byte of 0x01, dropped.
+        drop,
+        /// TLS 1.2: handed to the handshake, whose read keys it switches.
+        deliver,
     };
 
     /// Touched by the writing task only.
@@ -196,6 +211,8 @@ pub const Connection = struct {
         TlsDecodeError,
         TlsUnexpectedMessage,
         TlsInternalError,
+        TlsIllegalParameter,
+        TlsProtocolVersion,
     };
 
     /// The next record. With keys it is opened in place, or into `dest` when
@@ -210,7 +227,9 @@ pub const Connection = struct {
                 error.ReadFailed => return error.ReadFailed,
             };
             const content_type: proto.ContentType = @enumFromInt(header[0]);
-            // legacy_record_version is ignored, as RFC 9846 §5.1 says.
+            if (c.read.check_record_version and std.mem.readInt(u16, header[1..3], .big) != @intFromEnum(proto.Version.tls_1_2)) {
+                return error.TlsProtocolVersion;
+            }
             const body_len = std.mem.readInt(u16, header[3..5], .big);
             if (body_len > cipher.max_ciphertext_len) return error.TlsRecordOverflow;
             const record = c.input.take(cipher.header_len + body_len) catch |err| switch (err) {
@@ -242,13 +261,7 @@ pub const Connection = struct {
                     return .{ .content_type = opened.content_type, .payload = out[0..opened.len] };
                 }
                 switch (content_type) {
-                    .change_cipher_spec => {
-                        // Middlebox compatibility (§5): one byte of 0x01,
-                        // dropped, where the handshake allows it.
-                        if (!c.read.accept_ccs or body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
-                        try c.countChangeCipherSpec();
-                        continue;
-                    },
+                    .change_cipher_spec => if (try c.changeCipherSpec(body)) |r| return r else continue,
                     else => return error.TlsUnexpectedMessage,
                 }
             } else {
@@ -263,11 +276,7 @@ pub const Connection = struct {
                         if (body_len > cipher.max_plaintext_len) return error.TlsRecordOverflow;
                         return .{ .content_type = content_type, .payload = body };
                     },
-                    .change_cipher_spec => {
-                        if (!c.read.accept_ccs or body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
-                        try c.countChangeCipherSpec();
-                        continue;
-                    },
+                    .change_cipher_spec => if (try c.changeCipherSpec(body)) |r| return r else continue,
                     else => return error.TlsUnexpectedMessage,
                 }
             }
@@ -395,10 +404,24 @@ pub const Connection = struct {
         }
     }
 
-    /// One per side is the norm; a flood is a peer wasting our time.
-    fn countChangeCipherSpec(c: *Connection) error{TlsUnexpectedMessage}!void {
-        c.read.ccs_records += 1;
-        if (c.read.ccs_records > max_idle_records) return error.TlsUnexpectedMessage;
+    /// A change_cipher_spec record, as `read.ccs` says: refused, dropped
+    /// (null), or returned to the handshake. Its body is one byte of 0x01.
+    fn changeCipherSpec(c: *Connection, body: []u8) ReadRecordError!?Record {
+        const valid = body.len == 1 and body[0] == 1;
+        switch (c.read.ccs) {
+            .refuse => return error.TlsUnexpectedMessage,
+            .drop => {
+                if (!valid) return error.TlsUnexpectedMessage;
+                // One per side is the norm; a flood is a peer wasting our time.
+                c.read.ccs_records += 1;
+                if (c.read.ccs_records > max_idle_records) return error.TlsUnexpectedMessage;
+                return null;
+            },
+            .deliver => {
+                if (!valid) return error.TlsIllegalParameter;
+                return .{ .content_type = .change_cipher_spec, .payload = body };
+            },
+        }
     }
 
     fn countIdleRecord(c: *Connection) Failure!void {
