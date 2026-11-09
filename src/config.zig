@@ -191,6 +191,22 @@ pub const ClientAuth = struct {
 /// TLS 1.3's suites, then TLS 1.2's, for servers that have nothing newer,
 /// when the TLS 1.2 client is built in (`proto.tls12_enabled`).
 pub const default_cipher_suites = if (proto.tls12_enabled) proto.CipherSuite.all ++ proto.CipherSuite.tls12 else proto.CipherSuite.all;
+/// `default_cipher_suites` with ChaCha20-Poly1305 first in each version,
+/// what a client offers on a machine without AES instructions.
+pub const default_cipher_suites_chacha_first = [_]proto.CipherSuite{
+    .chacha20_poly1305_sha256,
+    .aes_128_gcm_sha256,
+    .aes_256_gcm_sha384,
+} ++ if (proto.tls12_enabled) [_]proto.CipherSuite{
+    .ecdhe_ecdsa_with_chacha20_poly1305_sha256,
+    .ecdhe_rsa_with_chacha20_poly1305_sha256,
+    .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+    .ecdhe_rsa_with_aes_128_gcm_sha256,
+    .ecdhe_ecdsa_with_aes_256_gcm_sha384,
+    .ecdhe_rsa_with_aes_256_gcm_sha384,
+} else [_]proto.CipherSuite{};
+/// The server's preference when ChaCha20-Poly1305 is the better choice.
+pub const default_server_cipher_suites_chacha_first = default_cipher_suites_chacha_first[0..proto.CipherSuite.all.len].*;
 /// The groups a client supports, in preference order.
 pub const default_named_groups = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1 };
 pub const default_server_named_groups = default_named_groups;
@@ -217,7 +233,10 @@ pub const Client = struct {
     /// Offered in this order. Any of `CipherSuite.tls12` among them offers
     /// TLS 1.2 too, after TLS 1.3; with only those, TLS 1.2 alone.
     /// `CipherSuite.all` offers TLS 1.3 alone. TLS 1.2 suites in a build
-    /// without TLS 1.2 fail the handshake before anything is sent.
+    /// without TLS 1.2 fail the handshake before anything is sent. The
+    /// default puts ChaCha20-Poly1305 first on a machine without AES
+    /// instructions (`default_cipher_suites_chacha_first`), as does a list
+    /// equal to it; any other list is offered as given.
     cipher_suites: []const proto.CipherSuite = &default_cipher_suites,
     named_groups: []const proto.NamedGroup = &default_named_groups,
     /// Groups to send key shares for; each must be in `named_groups`.
@@ -250,7 +269,11 @@ pub const Server = struct {
     /// `auth` are tried. Null leaves the choice to them.
     select_certificate: ?SelectCertificate = null,
     client_auth: ?ClientAuth = null,
-    /// The server speaks TLS 1.3 only; TLS 1.2 suites here are skipped.
+    /// In preference order. The server speaks TLS 1.3 only; TLS 1.2 suites
+    /// here are skipped. The default prefers ChaCha20-Poly1305 when either
+    /// side lacks AES instructions: this machine, or a client that lists
+    /// it first among the TLS 1.3 suites. So does a list equal to the
+    /// default; any other is followed as given.
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
     /// Supported, in preference order. A client whose offer shares none

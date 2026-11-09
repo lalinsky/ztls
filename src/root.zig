@@ -254,6 +254,32 @@ test "client and server handshake with every suite, group and certificate type" 
     }
 }
 
+test "a default server takes ChaCha20-Poly1305 from a client that lists it first" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    const aes_hardware = crypto.aead.hasAesHardware();
+    for ([_][]const proto.CipherSuite{
+        &.{ .chacha20_poly1305_sha256, .aes_128_gcm_sha256 },
+        &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 },
+    }) |offered| {
+        var run: Run = .{ .loopback = undefined };
+        try run.start(io, .{ .allocator = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
+        const conn = try clientOnce(&run.loopback, .{
+            .allocator = testing.allocator,
+            .host = "localhost",
+            .root_ca = &pki.ca,
+            .now = valid_now,
+            .cipher_suites = offered,
+        });
+        const outcome = try run.finish(io);
+        try outcome.handshake;
+        // AES-GCM first only when both sides have AES instructions.
+        const expected: proto.CipherSuite = if (offered[0] == .aes_128_gcm_sha256 and aes_hardware) .aes_128_gcm_sha256 else .chacha20_poly1305_sha256;
+        try testing.expectEqual(expected, conn.suite.?);
+    }
+}
+
 test "a HelloRetryRequest when the client sent no share the server takes" {
     const io = testing.io;
     var pki = try Pki.init();
