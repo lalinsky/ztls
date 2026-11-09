@@ -64,7 +64,7 @@ defer conn.deinit(); // after both tasks are done
 
 var read_buffer: [16 * 1024]u8 = undefined;
 var reader = conn.reader(&read_buffer);
-var writer = conn.inPlaceWriter();      // encrypts inside the transport buffer
+var writer = conn.writer();           // encrypts inside the transport buffer
 
 while (try reader.interface.takeDelimiter('\n')) |line| {
     try writer.interface.print("echo: {s}\n", .{line});
@@ -100,8 +100,8 @@ the peer asked for, goes out with the next written record.
 The transport buffers must hold a whole record: `input_buffer_len` for the
 reader and `output_buffer_len` for the writer. The buffer given to `reader`
 is an ordinary `std.Io.Reader` buffer owned by the application.
-`inPlaceWriter` has no buffer of its own and seals records inside the
-transport buffer. The `Connection` must not move once readers or writers
+The writer has no buffer of its own and seals records inside the transport
+buffer. The `Connection` must not move once readers or writers
 exist.
 
 The handshake keeps about 16 KiB on the stack of the task that runs it, plus
