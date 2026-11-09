@@ -1,6 +1,7 @@
-//! Private and public keys for CertificateVerify: ECDSA, RSA-PSS and
-//! Ed25519 through AWS-LC's EVP interface, with each TLS 1.3 signature
-//! algorithm tied to the key it is defined for.
+//! Private and public keys for CertificateVerify and the TLS 1.2
+//! ServerKeyExchange: ECDSA, RSA-PSS, RSA PKCS#1 v1.5 and Ed25519 through
+//! AWS-LC's EVP interface, with each signature algorithm tied to the keys
+//! it is defined for.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -8,9 +9,10 @@ const c = @import("c");
 const err = @import("err.zig");
 const pem = @import("pem.zig");
 
-/// The signature algorithms of RFC 9846 §4.3.3 that may sign a
-/// CertificateVerify. The rsa_pkcs1 ones may only appear in certificates,
-/// where X.509 verification handles them.
+/// The signature algorithms a handshake signs with: those of RFC 9846
+/// §4.3.3 that may sign a TLS 1.3 CertificateVerify, and the TLS 1.2-only
+/// ones below them. In TLS 1.3 the rsa_pkcs1 schemes appear only in
+/// certificates, where X.509 verification handles them.
 pub const Algorithm = enum {
     ecdsa_p256_sha256,
     ecdsa_p384_sha384,
@@ -20,11 +22,20 @@ pub const Algorithm = enum {
     rsa_pss_sha512,
     ed25519,
 
+    // TLS 1.2 only (RFC 5246 §7.4.1.4.1, RFC 8422 §5.1.1): RSA PKCS#1 v1.5,
+    // and ECDSA with the hash alone named, on whatever curve the key is.
+    rsa_pkcs1_sha256,
+    rsa_pkcs1_sha384,
+    rsa_pkcs1_sha512,
+    ecdsa_sha256,
+    ecdsa_sha384,
+    ecdsa_sha512,
+
     fn md(a: Algorithm) ?*const c.EVP_MD {
         return switch (a) {
-            .ecdsa_p256_sha256, .rsa_pss_sha256 => c.EVP_sha256(),
-            .ecdsa_p384_sha384, .rsa_pss_sha384 => c.EVP_sha384(),
-            .ecdsa_p521_sha512, .rsa_pss_sha512 => c.EVP_sha512(),
+            .ecdsa_p256_sha256, .rsa_pss_sha256, .rsa_pkcs1_sha256, .ecdsa_sha256 => c.EVP_sha256(),
+            .ecdsa_p384_sha384, .rsa_pss_sha384, .rsa_pkcs1_sha384, .ecdsa_sha384 => c.EVP_sha384(),
+            .ecdsa_p521_sha512, .rsa_pss_sha512, .rsa_pkcs1_sha512, .ecdsa_sha512 => c.EVP_sha512(),
             .ed25519 => null,
         };
     }
@@ -44,6 +55,8 @@ pub const Algorithm = enum {
             .ecdsa_p521_sha512 => key_type == .ecdsa and key_type.ecdsa == .p521,
             .rsa_pss_sha256, .rsa_pss_sha384, .rsa_pss_sha512 => key_type == .rsa,
             .ed25519 => key_type == .ed25519,
+            .rsa_pkcs1_sha256, .rsa_pkcs1_sha384, .rsa_pkcs1_sha512 => key_type == .rsa,
+            .ecdsa_sha256, .ecdsa_sha384, .ecdsa_sha512 => key_type == .ecdsa,
         };
     }
 };
@@ -205,7 +218,7 @@ pub const PublicKey = struct {
     }
 
     /// Fails with `AlgorithmMismatch` unless `algorithm.suits(self.key_type)`:
-    /// TLS 1.3 ties each ECDSA curve to one hash.
+    /// TLS 1.3 ties each ECDSA curve to one hash, TLS 1.2 does not.
     pub fn verify(self: *const PublicKey, algorithm: Algorithm, message: []const u8, signature: []const u8) error{ SignatureInvalid, AlgorithmMismatch, CryptoFailed }!void {
         if (!algorithm.suits(self.key_type)) return error.AlgorithmMismatch;
         var md_ctx: c.EVP_MD_CTX = undefined;
@@ -222,7 +235,8 @@ pub const PublicKey = struct {
 };
 
 /// RSA-PSS as TLS 1.3 wants it: MGF1 with the same hash (AWS-LC's default)
-/// and a salt as long as the digest.
+/// and a salt as long as the digest. PKCS#1 v1.5 is AWS-LC's default
+/// padding for RSA keys and needs nothing.
 fn setPss(pctx: ?*c.EVP_PKEY_CTX, algorithm: Algorithm) err.Error!void {
     if (!algorithm.isRsaPss()) return;
     if (c.EVP_PKEY_CTX_set_rsa_padding(pctx, c.RSA_PKCS1_PSS_PADDING) != 1) return err.fail();
@@ -289,6 +303,44 @@ test "an algorithm must suit the key" {
     var public = try publicOf(&p384);
     defer public.deinit();
     try testing.expectError(error.AlgorithmMismatch, public.verify(.ecdsa_p256_sha256, "m", signature));
+}
+
+test "TLS 1.2 algorithms: PKCS#1 v1.5, and ECDSA on any curve" {
+    var rsa = try PrivateKey.parsePem(testing.allocator, test_keys[4].pem);
+    defer rsa.deinit();
+    var rsa_public = try publicOf(&rsa);
+    defer rsa_public.deinit();
+    var sig_buf: [512]u8 = undefined;
+    for ([_]Algorithm{ .rsa_pkcs1_sha256, .rsa_pkcs1_sha384, .rsa_pkcs1_sha512 }) |algorithm| {
+        const signature = try rsa.sign(algorithm, "ServerKeyExchange", &sig_buf);
+        try rsa_public.verify(algorithm, "ServerKeyExchange", signature);
+        try testing.expectError(error.SignatureInvalid, rsa_public.verify(algorithm, "other", signature));
+        // PKCS#1 v1.5 and PSS are not interchangeable.
+        try testing.expectError(error.SignatureInvalid, rsa_public.verify(.rsa_pss_sha256, "ServerKeyExchange", signature));
+    }
+    // PKCS#1 v1.5 is deterministic: the same message, the same signature.
+    const a = try rsa.sign(.rsa_pkcs1_sha256, "m", &sig_buf);
+    var other_buf: [512]u8 = undefined;
+    const b = try rsa.sign(.rsa_pkcs1_sha256, "m", &other_buf);
+    try testing.expectEqualSlices(u8, a, b);
+
+    // A P-384 key signs with SHA-256 in TLS 1.2, which TLS 1.3 forbids.
+    var p384 = try PrivateKey.parsePem(testing.allocator, test_keys[1].pem);
+    defer p384.deinit();
+    var p384_public = try publicOf(&p384);
+    defer p384_public.deinit();
+    for ([_]Algorithm{ .ecdsa_sha256, .ecdsa_sha384, .ecdsa_sha512 }) |algorithm| {
+        const signature = try p384.sign(algorithm, "ServerKeyExchange", &sig_buf);
+        try p384_public.verify(algorithm, "ServerKeyExchange", signature);
+    }
+    try testing.expectError(error.AlgorithmMismatch, p384.sign(.ecdsa_p256_sha256, "m", &sig_buf));
+
+    // Each still needs its kind of key.
+    try testing.expectError(error.AlgorithmMismatch, rsa.sign(.ecdsa_sha256, "m", &sig_buf));
+    try testing.expectError(error.AlgorithmMismatch, p384.sign(.rsa_pkcs1_sha256, "m", &sig_buf));
+    var ed = try PrivateKey.parsePem(testing.allocator, test_keys[3].pem);
+    defer ed.deinit();
+    try testing.expectError(error.AlgorithmMismatch, ed.sign(.ecdsa_sha256, "m", &sig_buf));
 }
 
 test "ed25519 signatures verify with std.crypto" {

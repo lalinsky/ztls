@@ -1,6 +1,7 @@
 //! The record-protection AEADs, keyed once per direction. AWS-LC's contexts
 //! are immutable after `init`, so one context serves any number of seals or
-//! opens, concurrently if need be.
+//! opens, concurrently if need be; the TLS 1.2 AES-GCM sealing context is the
+//! exception (see `initTls12`).
 //!
 //! Each call encrypts or decrypts one record in one pass, either exactly in
 //! place or between two disjoint buffers. A shifted overlap is forbidden
@@ -35,6 +36,15 @@ pub const Algorithm = enum {
             .chacha20_poly1305 => c.EVP_aead_chacha20_poly1305().?,
         };
     }
+
+    fn evpTls12(a: Algorithm) *const c.EVP_AEAD {
+        return switch (a) {
+            .aes_128_gcm => c.EVP_aead_aes_128_gcm_tls12().?,
+            .aes_256_gcm => c.EVP_aead_aes_256_gcm_tls12().?,
+            // TLS 1.2 ChaCha20 builds its nonce as TLS 1.3 does (RFC 7905).
+            .chacha20_poly1305 => c.EVP_aead_chacha20_poly1305().?,
+        };
+    }
 };
 
 pub const max_key_length = 32;
@@ -51,9 +61,23 @@ pub const Context = struct {
     ctx: c.EVP_AEAD_CTX,
 
     pub fn init(algorithm: Algorithm, key: []const u8) err.Error!Context {
+        return initWith(algorithm.evp(), algorithm, key);
+    }
+
+    /// For TLS 1.2 records. AES-GCM then takes AWS-LC's TLS 1.2 variant,
+    /// whose seal refuses a nonce whose last 8 bytes (the explicit nonce,
+    /// the sequence number) do not increase, a guard against nonce reuse.
+    /// That makes sealing stateful: one task seals with the context, and a
+    /// sealing context must not be copied once used, or the copies would
+    /// each accept the same nonces. Opening is unaffected.
+    pub fn initTls12(algorithm: Algorithm, key: []const u8) err.Error!Context {
+        return initWith(algorithm.evpTls12(), algorithm, key);
+    }
+
+    fn initWith(evp: *const c.EVP_AEAD, algorithm: Algorithm, key: []const u8) err.Error!Context {
         assert(key.len == algorithm.keyLength());
         var self: Context = undefined;
-        if (c.EVP_AEAD_CTX_init(&self.ctx, algorithm.evp(), key.ptr, key.len, tag_length, null) != 1) return err.fail();
+        if (c.EVP_AEAD_CTX_init(&self.ctx, evp, key.ptr, key.len, tag_length, null) != 1) return err.fail();
         return self;
     }
 
@@ -71,8 +95,8 @@ pub const Context = struct {
         assert(disjoint(tag, plaintext) and disjoint(tag, out));
         var tag_len: usize = 0;
         const ok = c.EVP_AEAD_CTX_seal_scatter(&self.ctx, out.ptr, tag, &tag_len, tag_length, nonce, nonce_length, plaintext.ptr, plaintext.len, null, 0, ad.ptr, ad.len);
-        // Fails only on misuse (nonce or length limits), which the record
-        // layer rules out.
+        // Fails only on misuse (nonce or length limits, or a TLS 1.2 nonce
+        // that does not increase), which the record layer rules out.
         assert(ok == 1 and tag_len == tag_length);
     }
 
@@ -151,6 +175,39 @@ test "empty plaintext" {
     try ctx.open(&nonce, "", "", &tag, &.{});
     tag[15] ^= 1;
     try testing.expectError(error.AuthenticationFailed, ctx.open(&nonce, "", "", &tag, &.{}));
+}
+
+test "TLS 1.2 AES-GCM: the same cipher, nonces that must increase" {
+    for ([_]Algorithm{ .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305 }) |alg| {
+        const key: [max_key_length]u8 = @splat(0x24);
+        var plain = try Context.init(alg, key[0..alg.keyLength()]);
+        defer plain.deinit();
+        var tls12 = try Context.initTls12(alg, key[0..alg.keyLength()]);
+        defer tls12.deinit();
+
+        // Salt, then the explicit nonce: the sequence number.
+        var nonce: Nonce = .{ 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 5 };
+        var a: [5]u8 = undefined;
+        var tag_a: Tag = undefined;
+        plain.seal(&nonce, "ad", "hello", &a, &tag_a);
+        var b: [5]u8 = undefined;
+        var tag_b: Tag = undefined;
+        tls12.seal(&nonce, "ad", "hello", &b, &tag_b);
+        try testing.expectEqualSlices(u8, &a, &b);
+        try testing.expectEqualSlices(u8, &tag_a, &tag_b);
+        var opened: [5]u8 = undefined;
+        try tls12.open(&nonce, "ad", &b, &tag_b, &opened);
+        try testing.expectEqualSlices(u8, "hello", &opened);
+
+        // AWS-LC refuses the same nonce again, or a smaller one, for
+        // AES-GCM; `seal` would assert, so the raw call shows it.
+        var tag_len: usize = 0;
+        const again = c.EVP_AEAD_CTX_seal_scatter(&tls12.ctx, &b, &tag_b, &tag_len, tag_length, &nonce, nonce_length, "hello", 5, null, 0, "ad", 2);
+        _ = err.take();
+        try testing.expectEqual(@as(c_int, if (alg == .chacha20_poly1305) 1 else 0), again);
+        nonce[11] = 6;
+        tls12.seal(&nonce, "ad", "hello", &b, &tag_b);
+    }
 }
 
 /// Opens one TLS 1.3 record (header + ciphertext + tag) with sequence
