@@ -41,6 +41,9 @@ const seal_spill = cipher.seal_overhead + key_update_record_len;
 const max_idle_records = 32;
 /// KeyUpdates a sender may make over a connection's life (§4.7.3).
 const max_key_updates: u64 = (1 << 48) - 1;
+/// The longest NewSessionTicket body (§4.6.1): lifetime, age_add, a nonce,
+/// a ticket and extensions, each at its largest.
+const max_ticket_len = 4 + 4 + (1 + 255) + (2 + 0xffff) + (2 + 0xffff);
 
 /// Warning alerts a peer may send in a row, with no other record between
 /// them, as BoringSSL counts them; TLS 1.3 has only user_canceled. TLS 1.2
@@ -111,6 +114,8 @@ pub const Connection = struct {
     /// Treat a transport that ends between records without close_notify as
     /// truncated rather than as a clean end.
     strict_close_notify: bool = false,
+    /// Which end this is: only a client takes a NewSessionTicket.
+    side: proto.Side,
 
     /// Touched by the reading task only.
     pub const ReadHalf = struct {
@@ -129,6 +134,20 @@ pub const Connection = struct {
         /// 1.2 handshake demands once the version is agreed. TLS 1.3
         /// ignores the field (RFC 9846 §5.1).
         check_record_version: bool = false,
+        /// A post-handshake message split across records.
+        message: PartialMessage = .{},
+    };
+
+    /// A TLS 1.3 post-handshake message whose records have not all come
+    /// (§5.1). Nothing is kept of a NewSessionTicket but how much of it
+    /// is still to be skipped, so no message needs a buffer.
+    pub const PartialMessage = struct {
+        /// The header, then a KeyUpdate's one-byte body.
+        head: [key_update_msg_len]u8 = undefined,
+        /// How much of `head` has come; 0 between messages.
+        len: u8 = 0,
+        /// The NewSessionTicket body bytes still to skip.
+        skip: u32 = 0,
     };
 
     pub const CcsMode = enum {
@@ -160,12 +179,17 @@ pub const Connection = struct {
         pending_alert: std.atomic.Value(u8) = .init(0),
         /// The peer asked for a KeyUpdate; the write side answers.
         key_update_requested: std.atomic.Value(bool) = .init(false),
+        /// We asked the peer for a KeyUpdate and none has come since: no
+        /// other request may go out until one does (§4.7.3). Set by the
+        /// write side before it sends the request, cleared by the read
+        /// side on any KeyUpdate from the peer.
+        key_update_awaited: std.atomic.Value(bool) = .init(false),
     };
 
-    pub fn init(input: *Io.Reader, output: *Io.Writer) Connection {
+    pub fn init(input: *Io.Reader, output: *Io.Writer, side: proto.Side) Connection {
         assert(input.buffer.len >= input_buffer_len);
         assert(output.buffer.len >= output_buffer_len);
-        return .{ .input = input, .output = output, .read = .{}, .write = .{}, .shared = .{} };
+        return .{ .input = input, .output = output, .side = side, .read = .{}, .write = .{}, .shared = .{} };
     }
 
     /// Wipes the keys. Sends nothing; both tasks must be done.
@@ -316,6 +340,11 @@ pub const Connection = struct {
         while (true) {
             const record = c.readRecord(dest) catch |err| switch (err) {
                 error.EndOfStream => {
+                    // Not in the middle of a message (§5.1).
+                    if (c.read.message.len != 0) {
+                        c.failRead(error.TlsUnexpectedMessage);
+                        return error.TlsUnexpectedMessage;
+                    }
                     c.shared.read_state.store(.closed, .release);
                     return error.EndOfStream;
                 },
@@ -329,6 +358,12 @@ pub const Connection = struct {
                     return e;
                 },
             };
+            // A message split across records has nothing between its
+            // pieces (§5.1).
+            if (c.read.message.len != 0 and record.content_type != .handshake) {
+                c.failRead(error.TlsUnexpectedMessage);
+                return error.TlsUnexpectedMessage;
+            }
             // Empty records leave the count be, as in BoringSSL: they are
             // capped on their own.
             if (record.content_type != .alert and record.payload.len > 0) c.read.warning_alerts = 0;
@@ -436,14 +471,13 @@ pub const Connection = struct {
     }
 
     /// Handshake messages after the handshake. In TLS 1.3: KeyUpdate, and
-    /// NewSessionTicket, which v1 drops. Each must be whole within its
-    /// record (every known stack sends them so; a ticket split across
-    /// records would be an interop failure rather than a violation), and
-    /// KeyUpdate must be the record's last message (§4.7.3). In TLS 1.2
-    /// only HelloRequest, the server asking to renegotiate, which we never
-    /// do: it is refused with a fatal no_renegotiation (RFC 5746 §4.2),
-    /// as AWS-LC and Go do by default, so a server waiting for it fails at
-    /// once rather than at its timeout.
+    /// for a client NewSessionTicket, which v1 drops. A message may be
+    /// split across records or share one with others (§5.1), but a
+    /// KeyUpdate changes the read keys, so it must end its record. In TLS
+    /// 1.2 only HelloRequest, the server asking to renegotiate, which we
+    /// never do: it is refused with a fatal no_renegotiation (RFC 5746
+    /// §4.2), as AWS-LC and Go do by default, so a server waiting for it
+    /// fails at once rather than at its timeout.
     fn handlePostHandshake(c: *Connection, payload: []const u8) Failure!void {
         const keys = &c.read.keys.?;
         const tls13 = switch (keys.version) {
@@ -458,25 +492,46 @@ pub const Connection = struct {
                 return error.TlsNoRenegotiation;
             },
         };
-        var d = codec.Decoder.init(payload);
-        while (!d.eof()) {
-            const handshake_type = d.decode(proto.HandshakeType) catch return error.TlsDecodeError;
-            var body = d.vector(u24) catch return error.TlsDecodeError;
-            switch (handshake_type) {
-                .key_update => {
-                    const request = body.decode(proto.KeyUpdateRequest) catch return error.TlsDecodeError;
-                    if (!body.eof()) return error.TlsDecodeError;
-                    if (!d.eof()) return error.TlsUnexpectedMessage;
-                    switch (request) {
-                        .update_not_requested => {},
-                        .update_requested => c.shared.key_update_requested.store(true, .monotonic),
-                        _ => return error.TlsIllegalParameter,
-                    }
-                    keys.update(tls13) catch return error.TlsInternalError;
-                },
-                .new_session_ticket => {},
-                else => return error.TlsUnexpectedMessage,
+        const m = &c.read.message;
+        var in = payload;
+        while (in.len > 0) {
+            if (m.len < 4) {
+                const n = @min(4 - m.len, in.len);
+                @memcpy(m.head[m.len..][0..n], in[0..n]);
+                m.len += @intCast(n);
+                in = in[n..];
+                if (m.len < 4) return;
+                const body_len = std.mem.readInt(u24, m.head[1..4], .big);
+                switch (m.head[0]) {
+                    @intFromEnum(proto.HandshakeType.key_update) => if (body_len != 1) return error.TlsDecodeError,
+                    @intFromEnum(proto.HandshakeType.new_session_ticket) => {
+                        if (c.side == .server) return error.TlsUnexpectedMessage;
+                        if (body_len > max_ticket_len) return error.TlsDecodeError;
+                        m.skip = body_len;
+                    },
+                    else => return error.TlsUnexpectedMessage,
+                }
             }
+            if (m.head[0] == @intFromEnum(proto.HandshakeType.new_session_ticket)) {
+                const n: u32 = @intCast(@min(m.skip, in.len));
+                m.skip -= n;
+                in = in[n..];
+                if (m.skip == 0) m.len = 0;
+                continue;
+            }
+            // A KeyUpdate, waiting for its body.
+            if (in.len == 0) return;
+            const request: proto.KeyUpdateRequest = @enumFromInt(in[0]);
+            m.len = 0;
+            if (in.len != 1) return error.TlsUnexpectedMessage;
+            in = in[1..];
+            switch (request) {
+                .update_not_requested => {},
+                .update_requested => c.shared.key_update_requested.store(true, .monotonic),
+                _ => return error.TlsIllegalParameter,
+            }
+            c.shared.key_update_awaited.store(false, .monotonic);
+            keys.update(tls13) catch return error.TlsInternalError;
         }
     }
 
@@ -666,8 +721,10 @@ pub const Connection = struct {
     }
 
     /// Asks the peer to update its keys, updating ours first (§4.7.3).
-    /// For the writing task. Does nothing past `max_key_updates`, nor in
-    /// TLS 1.2, which has no KeyUpdate.
+    /// For the writing task. While an earlier request is still unanswered
+    /// only our keys are updated: §4.7.3 allows one request at a time.
+    /// Does nothing past `max_key_updates`, nor in TLS 1.2, which has no
+    /// KeyUpdate.
     pub fn requestKeyUpdate(c: *Connection) WriteError!void {
         try c.checkWritable();
         const tls13 = switch (c.write.keys.?.version) {
@@ -675,7 +732,11 @@ pub const Connection = struct {
             .tls12 => return,
         };
         if (c.write.key_updates >= max_key_updates) return;
-        c.sendKeyUpdate(.update_requested, tls13) catch |err| return c.failWrite(err);
+        // Set before the request goes out, so the answer cannot be
+        // read before it is.
+        const awaited = c.shared.key_update_awaited.swap(true, .monotonic);
+        const request: proto.KeyUpdateRequest = if (awaited) .update_not_requested else .update_requested;
+        c.sendKeyUpdate(request, tls13) catch |err| return c.failWrite(err);
         try c.flushOutput();
     }
 
@@ -981,7 +1042,7 @@ const SelfTalk = struct {
         fn setUp(end: *End, self: *const SelfTalk, side: proto.Side) !void {
             end.input = end.stream.reader(end.io, &end.input_buffer);
             end.output = end.stream.writer(end.io, &end.output_buffer);
-            end.conn = Connection.init(&end.input.interface, &end.output.interface);
+            end.conn = Connection.init(&end.input.interface, &end.output.interface, side);
             end.conn.read.keys = try self.keys(if (side == .client) .server_application else .client_application);
             end.conn.write.keys = try self.keys(if (side == .client) .client_application else .server_application);
         }
@@ -1254,30 +1315,95 @@ test "a plaintext record over 2^14 bytes is record_overflow" {
     var output_buffer: [output_buffer_len]u8 = undefined;
     var input: Io.Reader = .fixed(&input_buffer);
     var discard: Io.Writer.Discarding = .init(&output_buffer);
-    var conn = Connection.init(&input, &discard.writer);
+    var conn = Connection.init(&input, &discard.writer, .client);
     defer conn.deinit();
     try testing.expectError(error.TlsRecordOverflow, conn.readRecord(null));
 }
 
-test "malformed post-handshake records: empty, and a KeyUpdate with trailing bytes" {
+test "post-handshake messages split across records and sharing them" {
     const io = testing.io;
-    const Case = struct { payload: []const u8, expected: Failure };
+    var st = try SelfTalk.init(io, .{ .tls13 = .aes_128_gcm_sha256 });
+    defer st.deinit();
+
+    const nst = @intFromEnum(proto.HandshakeType.new_session_ticket);
+    const ku = @intFromEnum(proto.HandshakeType.key_update);
+    const Peer = struct {
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            // A ticket in three pieces, the header itself split; then a
+            // KeyUpdate that starts in the ticket's last record and ends
+            // a record of its own; then an empty ticket and a KeyUpdate
+            // whole in one record.
+            const records = [_][]const u8{
+                &.{ nst, 0 },
+                &.{ 0, 6, 1, 2 },
+                &.{ 3, 4, 5, 6, ku, 0 },
+                &.{ 0, 1, 0 },
+            };
+            for (records) |payload| try end.conn.writeRecord(.handshake, payload);
+            try end.conn.advanceWriteKeys(&end.conn.write.keys.?.version.tls13);
+            try end.conn.writeRecord(.handshake, &.{ nst, 0, 0, 0, ku, 0, 0, 1, 0 });
+            try end.conn.advanceWriteKeys(&end.conn.write.keys.?.version.tls13);
+            try end.conn.writeRecord(.application_data, "hi\n");
+            try end.conn.flushOutput();
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    const read_gen0 = end.conn.read.keys.?.version.tls13.secret;
+    var rbuf: [256]u8 = undefined;
+    var r = end.conn.reader(&rbuf);
+    try testing.expectEqualStrings("hi", (try r.interface.takeDelimiter('\n')).?);
+    const expected = key_schedule.nextTrafficSecret(.sha256, &key_schedule.nextTrafficSecret(.sha256, &read_gen0));
+    try testing.expectEqualSlices(u8, expected.slice(), end.conn.read.keys.?.version.tls13.secret.slice());
+    try testing.expectEqual(0, end.conn.read.message.len);
+    try peer.await(io);
+}
+
+test "malformed post-handshake records" {
+    const io = testing.io;
+    const nst = @intFromEnum(proto.HandshakeType.new_session_ticket);
+    const ku = @intFromEnum(proto.HandshakeType.key_update);
+    const Record = struct { content_type: proto.ContentType = .handshake, payload: []const u8 };
+    const Case = struct { side: proto.Side = .client, records: []const Record, expected: Failure };
     const cases = [_]Case{
-        .{ .payload = &.{}, .expected = error.TlsUnexpectedMessage },
-        .{ .payload = &.{ @intFromEnum(proto.HandshakeType.key_update), 0, 0, 2, 0, 0 }, .expected = error.TlsDecodeError },
+        // Empty.
+        .{ .records = &.{.{ .payload = &.{} }}, .expected = error.TlsUnexpectedMessage },
+        // A KeyUpdate with a two-byte body.
+        .{ .records = &.{.{ .payload = &.{ ku, 0, 0, 2, 0, 0 } }}, .expected = error.TlsDecodeError },
+        // A KeyUpdate that does not end its record.
+        .{ .records = &.{.{ .payload = &.{ ku, 0, 0, 1, 0, nst } }}, .expected = error.TlsUnexpectedMessage },
+        // A request that is neither.
+        .{ .records = &.{.{ .payload = &.{ ku, 0, 0, 1, 2 } }}, .expected = error.TlsIllegalParameter },
+        // A ticket longer than any can be.
+        .{ .records = &.{.{ .payload = &.{ nst, 0xff, 0xff, 0xff } }}, .expected = error.TlsDecodeError },
+        // A message only a handshake has.
+        .{ .records = &.{.{ .payload = &.{ @intFromEnum(proto.HandshakeType.finished), 0, 0, 0 } }}, .expected = error.TlsUnexpectedMessage },
+        // Application data, or an alert, between a message's pieces.
+        .{ .records = &.{ .{ .payload = &.{ nst, 0, 0, 2, 0 } }, .{ .content_type = .application_data, .payload = "x" } }, .expected = error.TlsUnexpectedMessage },
+        .{ .records = &.{ .{ .payload = &.{ ku, 0 } }, .{ .content_type = .alert, .payload = &.{ 1, 0 } } }, .expected = error.TlsUnexpectedMessage },
+        // A ticket sent to a server.
+        .{ .side = .server, .records = &.{.{ .payload = &.{ nst, 0, 0, 0 } }}, .expected = error.TlsUnexpectedMessage },
     };
     for (cases) |case| {
         var st = try SelfTalk.init(io, .{ .tls13 = .aes_128_gcm_sha256 });
         defer st.deinit();
 
+        // The peer sends the records; this end's reader fails and its
+        // writer sends the alert.
         const Peer = struct {
             fn run(s: *SelfTalk, c: Case) !void {
                 var end: SelfTalk.End = undefined;
-                try s.server(&end);
+                if (c.side == .client) try s.server(&end) else try s.client(&end);
                 defer end.deinit();
-                try end.conn.writeRecord(.handshake, c.payload);
+                for (c.records) |record| try end.conn.writeRecord(record.content_type, record.payload);
                 try end.conn.flushOutput();
-                // The client's reader fails and its writer sends the alert.
                 var rbuf: [256]u8 = undefined;
                 var r = end.conn.reader(&rbuf);
                 try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
@@ -1288,7 +1414,7 @@ test "malformed post-handshake records: empty, and a KeyUpdate with trailing byt
         defer peer.cancel(io) catch {};
 
         var end: SelfTalk.End = undefined;
-        try st.client(&end);
+        if (case.side == .client) try st.client(&end) else try st.server(&end);
         defer end.deinit();
         var rbuf: [256]u8 = undefined;
         var r = end.conn.reader(&rbuf);
@@ -1299,6 +1425,50 @@ test "malformed post-handshake records: empty, and a KeyUpdate with trailing byt
         try testing.expectError(error.WriteFailed, w.interface.flush());
         try peer.await(io);
     }
+}
+
+test "only one KeyUpdate request is outstanding at a time" {
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .{ .tls13 = .aes_128_gcm_sha256 });
+    defer st.deinit();
+
+    const ku = @intFromEnum(proto.HandshakeType.key_update);
+    const Peer = struct {
+        fn expectKeyUpdate(end: *SelfTalk.End, request: proto.KeyUpdateRequest) !void {
+            const record = try end.conn.readRecord(null);
+            try testing.expectEqual(proto.ContentType.handshake, record.content_type);
+            try testing.expectEqualSlices(u8, &.{ ku, 0, 0, 1, @intFromEnum(request) }, record.payload);
+            try end.conn.handlePostHandshake(record.payload);
+        }
+
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            // The second request waits on an answer to the first, so it
+            // only updates the client's keys.
+            try expectKeyUpdate(&end, .update_requested);
+            try expectKeyUpdate(&end, .update_not_requested);
+            // Our KeyUpdate lets the client ask again.
+            try end.conn.sendKeyUpdate(.update_not_requested, &end.conn.write.keys.?.version.tls13);
+            try end.conn.writeRecord(.application_data, "go\n");
+            try end.conn.flushOutput();
+            try expectKeyUpdate(&end, .update_requested);
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    try end.conn.requestKeyUpdate();
+    try end.conn.requestKeyUpdate();
+    var rbuf: [256]u8 = undefined;
+    var r = end.conn.reader(&rbuf);
+    try testing.expectEqualStrings("go", (try r.interface.takeDelimiter('\n')).?);
+    try end.conn.requestKeyUpdate();
+    try peer.await(io);
 }
 
 test "a bad record fails the reader, and the writer sends the alert" {

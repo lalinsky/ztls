@@ -46,7 +46,7 @@ pub const output_buffer_len = connection.output_buffer_len;
 /// on its stack keeps the keys as residue; that is accepted, like the
 /// shared secrets on the way to the key schedule.
 pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Error!Connection {
-    var conn = Connection.init(input, output);
+    var conn = Connection.init(input, output, .client);
     errdefer conn.deinit();
     try handshake_client.run(&conn, options);
     return conn;
@@ -54,7 +54,7 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Err
 
 /// Runs the server side of a handshake over `input` and `output`.
 pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Error!Connection {
-    var conn = Connection.init(input, output);
+    var conn = Connection.init(input, output, .server);
     errdefer conn.deinit();
     try handshake_server.run(&conn, options);
     return conn;

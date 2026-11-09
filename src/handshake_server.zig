@@ -104,7 +104,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     try h.expectFlightEnd();
     var hello = try parseClientHello(msg.body);
     const auth = try selectCertificate(&hello, opt);
-    var choices = try choose(&hello, opt, auth);
+    const choices = try choose(&hello, opt, auth);
     h.setSuite(choices.suite);
     h.conn.group = choices.group;
     h.conn.setServerName(hello.server_name);
@@ -135,13 +135,13 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
         try h.expect(msg, .client_hello);
         try h.expectFlightEnd();
         hello = try parseClientHello(msg.body);
-        const second = try choose(&hello, opt, auth);
-        // The second hello may differ only in its key share (§4.2.2).
-        if (second.suite != choices.suite or second.group != choices.group or second.scheme != choices.scheme) return error.TlsIllegalParameter;
+        // The second hello may differ only in its key share (§4.1.2).
+        // As in BoringSSL, what the first one settled stands, ALPN
+        // included, and only the share is taken from this one; beyond the
+        // session id and server name the rest is not compared.
         if (!std.mem.eql(u8, hello.session_id, session_id) or hello.has_cookie) return error.TlsIllegalParameter;
         if (!std.mem.eql(u8, hello.server_name orelse "", server_name_buf[0..server_name_len])) return error.TlsIllegalParameter;
         if (hello.key_shares_len != 1 or hello.shareFor(choices.group) == null) return error.TlsIllegalParameter;
-        choices = second;
         try h.hashMessage(msg);
     }
 

@@ -897,7 +897,7 @@ test "a CertificateVerify under another curve's scheme is refused" {
     var input: Io.Reader = .fixed(&unused_input);
     var unused_output: [@import("connection.zig").output_buffer_len]u8 = undefined;
     var output: Io.Writer = .fixed(&unused_output);
-    var conn = Connection.init(&input, &output);
+    var conn = Connection.init(&input, &output, .client);
     defer conn.deinit();
     var h = Handshake.init(&conn, testing.allocator, 1024);
     defer h.deinit();
@@ -930,7 +930,7 @@ test "certificate, certificate verify and finished round-trip through records" {
     var output: Io.Writer = .fixed(&wire);
     var unused_input: [@import("connection.zig").input_buffer_len]u8 = undefined;
     var input: Io.Reader = .fixed(&unused_input);
-    var sender_conn = Connection.init(&input, &output);
+    var sender_conn = Connection.init(&input, &output, .client);
     var sender = Handshake.init(&sender_conn, testing.allocator, 64 * 1024);
     defer sender.deinit();
     sender.setSuite(.aes_128_gcm_sha256);
@@ -952,7 +952,7 @@ test "certificate, certificate verify and finished round-trip through records" {
     var limited = fixed.limited(.unlimited, &input_buffer);
     var unused_output: [@import("connection.zig").output_buffer_len]u8 = undefined;
     var discard: Io.Writer = .fixed(&unused_output);
-    var receiver_conn = Connection.init(&limited.interface, &discard);
+    var receiver_conn = Connection.init(&limited.interface, &discard, .client);
     defer receiver_conn.deinit();
     var receiver = Handshake.init(&receiver_conn, testing.allocator, 64 * 1024);
     defer receiver.deinit();
@@ -1013,7 +1013,7 @@ test "a handshake message that spans a key change is refused" {
     var limited = input.limited(.unlimited, &input_buffer);
     var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
     var output: Io.Writer = .fixed(&output_buffer);
-    var conn = Connection.init(&limited.interface, &output);
+    var conn = Connection.init(&limited.interface, &output, .client);
     var h = Handshake.init(&conn, testing.allocator, 1024);
     defer h.deinit();
     h.setSuite(.aes_128_gcm_sha256);
@@ -1029,7 +1029,7 @@ test "an empty certificate and the request context" {
     var output: Io.Writer = .fixed(&wire);
     var unused_input: [@import("connection.zig").input_buffer_len]u8 = undefined;
     var input: Io.Reader = .fixed(&unused_input);
-    var conn = Connection.init(&input, &output);
+    var conn = Connection.init(&input, &output, .client);
     var h = Handshake.init(&conn, testing.allocator, 1024);
     defer h.deinit();
     h.setSuite(.aes_128_gcm_sha256);
@@ -1075,7 +1075,7 @@ test "messages are taken from records whole, split, or several to a record" {
         var limited = input.limited(.unlimited, &input_buffer);
         var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
         var output: Io.Writer = .fixed(&output_buffer);
-        var conn = Connection.init(&limited.interface, &output);
+        var conn = Connection.init(&limited.interface, &output, .client);
         var counting: testu.CountingAllocator = .init(testing.allocator);
         var h = Handshake.init(&conn, counting.allocator(), 1024);
         defer h.deinit();
