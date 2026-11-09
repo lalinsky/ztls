@@ -188,9 +188,9 @@ pub const ClientAuth = struct {
     };
 };
 
-/// The groups a client supports, in preference order.
 /// TLS 1.3's suites, then TLS 1.2's, for servers that have nothing newer.
 pub const default_cipher_suites = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
+/// The groups a client supports, in preference order.
 pub const default_named_groups = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1 };
 pub const default_server_named_groups = default_named_groups;
 /// The groups a client sends key shares for in its first ClientHello:
