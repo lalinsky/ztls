@@ -46,6 +46,14 @@ fn referencePrf(comptime Hmac: type, secret: []const u8, label: []const u8, seed
     }
 }
 
+test "the PRF's known answer" {
+    // The TLS 1.2 PRF test vector circulated on the IETF TLS list, for
+    // SHA-256, also recomputed independently from RFC 5246 §5.
+    var out: [100]u8 = undefined;
+    tls12(.sha256, &hex("9bbe436ba940f017b17652849a71db35"), "test label", &hex("a0ba9f936cda311827a6f796ffd5198c"), "", &out);
+    try testing.expectEqualSlices(u8, &hex("e3f229ba727be17b8d122620557cd453c2aab21d07c3d495329b52d4e61edb5a6b301791e90d35c9c9a46b4e14baf9af0fa022f7077def17abfd3797c0564bab4fbc91666e9def9b97fce34f796789baa48082d122ee42c5a72e5a5110fff70187347b66"), &out);
+}
+
 test "the PRF matches RFC 5246 written out, for both hashes" {
     const secret = "\x9b\xbe\x43\x6b\xa9\x40\xf0\x17\xb1\x76\x52\x84\x9a\x71\xdb\x35";
     const client_random: [32]u8 = @splat(0xa0);
@@ -73,4 +81,10 @@ test "the seed is the two parts joined" {
     try testing.expectEqualSlices(u8, &a, &b);
     tls12(.sha256, "secret", "extended master secret", "session hash!", "", &b);
     try testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+fn hex(comptime s: []const u8) [s.len / 2]u8 {
+    var out: [s.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
+    return out;
 }

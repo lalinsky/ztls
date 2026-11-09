@@ -95,9 +95,16 @@ pub const Context = struct {
         assert(disjoint(tag, plaintext) and disjoint(tag, out));
         var tag_len: usize = 0;
         const ok = c.EVP_AEAD_CTX_seal_scatter(&self.ctx, out.ptr, tag, &tag_len, tag_length, nonce, nonce_length, plaintext.ptr, plaintext.len, null, 0, ad.ptr, ad.len);
-        // Fails only on misuse (nonce or length limits, or a TLS 1.2 nonce
-        // that does not increase), which the record layer rules out.
-        assert(ok == 1 and tag_len == tag_length);
+        // Fails only on misuse: nonce or length limits, or a TLS 1.2 nonce
+        // that does not increase, which is a sequence number used twice.
+        // The record layer rules them out, and a bug there must stop the
+        // program in every build mode, not become an optimizer assumption.
+        // AWS-LC has zeroed `out` and `tag`, so nothing leaks meanwhile.
+        if (ok != 1) {
+            _ = err.take();
+            @panic("AEAD seal refused: nonce reused or limit exceeded");
+        }
+        assert(tag_len == tag_length);
     }
 
     /// Checks the tag and decrypts `ciphertext` to `out` (the same length).
@@ -200,7 +207,7 @@ test "TLS 1.2 AES-GCM: the same cipher, nonces that must increase" {
         try testing.expectEqualSlices(u8, "hello", &opened);
 
         // AWS-LC refuses the same nonce again, or a smaller one, for
-        // AES-GCM; `seal` would assert, so the raw call shows it.
+        // AES-GCM; `seal` would panic, so the raw call shows it.
         var tag_len: usize = 0;
         const again = c.EVP_AEAD_CTX_seal_scatter(&tls12.ctx, &b, &tag_b, &tag_len, tag_length, &nonce, nonce_length, "hello", 5, null, 0, "ad", 2);
         _ = err.take();

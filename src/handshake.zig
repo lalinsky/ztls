@@ -51,13 +51,13 @@ pub const signature_algorithms = [_]proto.SignatureScheme{
     .rsa_pkcs1_sha512,
 };
 
-/// The algorithm a scheme stands for in a CertificateVerify, or null for
-/// one that may not sign it.
+/// The algorithm a scheme stands for in a TLS 1.3 CertificateVerify, or
+/// null for one that may not sign it there (the rsa_pkcs1 ones, §4.2.3).
 pub fn schemeAlgorithm(scheme: proto.SignatureScheme) ?sig.Algorithm {
     return switch (scheme) {
-        .ecdsa_secp256r1_sha256 => .ecdsa_p256_sha256,
-        .ecdsa_secp384r1_sha384 => .ecdsa_p384_sha384,
-        .ecdsa_secp521r1_sha512 => .ecdsa_p521_sha512,
+        .ecdsa_secp256r1_sha256 => .ecdsa_sha256,
+        .ecdsa_secp384r1_sha384 => .ecdsa_sha384,
+        .ecdsa_secp521r1_sha512 => .ecdsa_sha512,
         .ed25519 => .ed25519,
         .rsa_pss_rsae_sha256 => .rsa_pss_sha256,
         .rsa_pss_rsae_sha384 => .rsa_pss_sha384,
@@ -66,12 +66,26 @@ pub fn schemeAlgorithm(scheme: proto.SignatureScheme) ?sig.Algorithm {
     };
 }
 
+/// Whether a key of `key_type` may sign a TLS 1.3 CertificateVerify under
+/// `scheme`: the algorithm must suit the kind of key, and an ECDSA scheme
+/// names the key's curve too (§4.2.3).
+pub fn schemeSuits(scheme: proto.SignatureScheme, key_type: sig.KeyType) bool {
+    const algorithm = schemeAlgorithm(scheme) orelse return false;
+    if (!algorithm.suits(key_type)) return false;
+    const curve: ?sig.Curve = switch (scheme) {
+        .ecdsa_secp256r1_sha256 => .p256,
+        .ecdsa_secp384r1_sha384 => .p384,
+        .ecdsa_secp521r1_sha512 => .p521,
+        else => null,
+    };
+    return curve == null or key_type.ecdsa == curve.?;
+}
+
 /// The scheme to sign a CertificateVerify with: our most preferred one
 /// that the peer offered and that suits the key.
 pub fn selectScheme(key_type: sig.KeyType, offered: []const proto.SignatureScheme) ?proto.SignatureScheme {
     for (signature_algorithms) |scheme| {
-        const algorithm = schemeAlgorithm(scheme) orelse continue;
-        if (!algorithm.suits(key_type)) continue;
+        if (!schemeSuits(scheme, key_type)) continue;
         if (std.mem.indexOfScalar(proto.SignatureScheme, offered, scheme) != null) return scheme;
     }
     return null;
@@ -650,8 +664,8 @@ pub const Handshake = struct {
         const signature = try d.vectorBytes(u16);
         try d.expectEof();
         if (std.mem.indexOfScalar(proto.SignatureScheme, &signature_algorithms, scheme) == null) return error.TlsIllegalParameter;
-        const algorithm = schemeAlgorithm(scheme) orelse return error.TlsIllegalParameter;
-        if (!algorithm.suits(public_key.key_type)) return error.TlsIllegalParameter;
+        if (!schemeSuits(scheme, public_key.key_type)) return error.TlsIllegalParameter;
+        const algorithm = schemeAlgorithm(scheme).?;
         h.conn.peer_signature_scheme = scheme;
 
         var content_buf: [64 + 33 + 1 + crypto.hash.max_digest_length]u8 = undefined;
@@ -711,6 +725,55 @@ test "scheme selection" {
     try testing.expectEqual(proto.SignatureScheme.rsa_pss_rsae_sha384, selectScheme(.{ .rsa = 2048 }, &.{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha384 }).?);
     try testing.expectEqual(null, selectScheme(.{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256})); // pkcs1 may not sign a CertificateVerify
     try testing.expectEqual(proto.SignatureScheme.ed25519, selectScheme(.ed25519, &.{.ed25519}).?);
+}
+
+test "TLS 1.3 binds each ECDSA scheme to a curve" {
+    try testing.expect(schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p256 }));
+    try testing.expect(!schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p384 }));
+    try testing.expect(schemeSuits(.ecdsa_secp384r1_sha384, .{ .ecdsa = .p384 }));
+    try testing.expect(!schemeSuits(.ecdsa_secp384r1_sha384, .{ .ecdsa = .p521 }));
+    try testing.expect(schemeSuits(.ecdsa_secp521r1_sha512, .{ .ecdsa = .p521 }));
+    try testing.expect(!schemeSuits(.ecdsa_secp521r1_sha512, .{ .rsa = 2048 }));
+    try testing.expect(schemeSuits(.rsa_pss_rsae_sha256, .{ .rsa = 4096 }));
+    try testing.expect(!schemeSuits(.rsa_pkcs1_sha256, .{ .rsa = 2048 }));
+    try testing.expect(!schemeSuits(.ed25519, .{ .ecdsa = .p256 }));
+}
+
+test "a CertificateVerify under another curve's scheme is refused" {
+    // A P-384 key's genuine ECDSA-SHA256 signature, labelled
+    // ecdsa_secp256r1_sha256: valid cryptography, but not in TLS 1.3.
+    var key = try sig.PrivateKey.parsePem(testing.allocator, @embedFile("testdata/keys/ec_secp384r1_private_key.pem"));
+    defer key.deinit();
+    _ = crypto.c.EVP_PKEY_up_ref(key.pkey);
+    var public = try sig.PublicKey.fromPkey(key.pkey);
+    defer public.deinit();
+
+    var unused_input: [@import("connection.zig").input_buffer_len]u8 = undefined;
+    var input: Io.Reader = .fixed(&unused_input);
+    var unused_output: [@import("connection.zig").output_buffer_len]u8 = undefined;
+    var output: Io.Writer = .fixed(&unused_output);
+    var conn = Connection.init(&input, &output);
+    defer conn.deinit();
+    var h = Handshake.init(&conn, testing.allocator, 1024);
+    defer h.deinit();
+    h.setSuite(.aes_128_gcm_sha256);
+
+    var content_buf: [64 + 33 + 1 + crypto.hash.max_digest_length]u8 = undefined;
+    const content = h.certificateVerifyContent(.server, &content_buf);
+    var sig_buf: [256]u8 = undefined;
+    const signature = try key.sign(.ecdsa_sha256, content, &sig_buf);
+    var body_buf: [4 + sig_buf.len]u8 = undefined;
+    var w = codec.Writer.init(&body_buf);
+    try w.enumValue(proto.SignatureScheme.ecdsa_secp256r1_sha256);
+    try w.vector(u16, signature);
+    try testing.expectError(error.TlsIllegalParameter, h.verifyCertificateVerify(w.written(), &public, .server));
+
+    // The same key under its own curve's scheme passes.
+    const good = try key.sign(.ecdsa_sha384, content, &sig_buf);
+    w = codec.Writer.init(&body_buf);
+    try w.enumValue(proto.SignatureScheme.ecdsa_secp384r1_sha384);
+    try w.vector(u16, good);
+    try h.verifyCertificateVerify(w.written(), &public, .server);
 }
 
 test "certificate, certificate verify and finished round-trip through records" {
