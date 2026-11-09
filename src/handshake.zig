@@ -385,10 +385,10 @@ pub const Handshake = struct {
         fn flushRecord(w: *MessageWriter) Error!void {
             const c = w.h.conn;
             const unused = c.output.unusedCapacitySlice();
-            assert(w.window.ptr == unused.ptr + cipher.header_len);
+            assert(w.window.ptr == unused.ptr + payloadOffset(c));
             const record_len = if (c.write.keys) |*keys| blk: {
                 keys.seal(unused, .handshake, w.len) catch return error.TlsInternalError;
-                break :blk cipher.Keys.sealedLen(w.len);
+                break :blk keys.sealedLen(w.len);
             } else blk: {
                 unused[0] = @intFromEnum(proto.ContentType.handshake);
                 std.mem.writeInt(u16, unused[1..3], @intFromEnum(proto.Version.tls_1_2), .big);
@@ -404,12 +404,19 @@ pub const Handshake = struct {
         }
     };
 
+    /// Where a record's plaintext starts: after the header, and after the
+    /// explicit nonce of TLS 1.2 AES-GCM.
+    fn payloadOffset(c: *const Connection) usize {
+        return if (c.write.keys) |*keys| keys.payloadOffset() else cipher.header_len;
+    }
+
     /// Where the next record's plaintext goes in `output`.
     fn recordWindow(c: *Connection) []u8 {
         const unused = c.output.unusedCapacitySlice();
-        const overhead: usize = if (c.write.keys != null) cipher.header_len + cipher.seal_overhead else cipher.header_len;
+        const offset = payloadOffset(c);
+        const overhead: usize = if (c.write.keys) |*keys| offset + keys.trailerLen() else offset;
         assert(unused.len > overhead);
-        return unused[cipher.header_len..][0..@min(cipher.max_plaintext_len, unused.len - overhead)];
+        return unused[offset..][0..@min(cipher.max_plaintext_len, unused.len - overhead)];
     }
 
     pub fn messageWriter(h: *Handshake) Error!MessageWriter {
