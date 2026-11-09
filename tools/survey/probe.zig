@@ -1,11 +1,13 @@
 //! One connection to a public server with ztls, for the TLS 1.3 survey in
-//! this directory. Usage: survey-probe HOST [PORT] [--groups a,b,...].
+//! this directory. Usage: survey-probe HOST [PORT] [--groups a,b,...]
+//! [--tls12].
 //! Prints tab-separated fields: HOST ok SUITE GROUP RETRIED KEY SCHEME
 //! ALPN STATUS, first with STATUS "-" as soon as the handshake is done and
 //! again with the HTTP status line, or with "error: NAME" when the request
 //! failed; or HOST fail ERROR when the handshake did.
 //! --groups replaces the client's default groups, the first one getting
-//! the key share.
+//! the key share. --tls12 offers TLS 1.2 after TLS 1.3; the suite shows
+//! which was agreed.
 
 const std = @import("std");
 const ztls = @import("ztls");
@@ -20,9 +22,12 @@ pub fn main(init: std.process.Init) !void {
     var host: ?[]const u8 = null;
     var port: u16 = 443;
     var groups: std.ArrayList(ztls.protocol.NamedGroup) = .empty;
+    var tls12 = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--groups") and i + 1 < args.len) {
+        if (std.mem.eql(u8, args[i], "--tls12")) {
+            tls12 = true;
+        } else if (std.mem.eql(u8, args[i], "--groups") and i + 1 < args.len) {
             i += 1;
             var names = std.mem.splitScalar(u8, args[i], ',');
             while (names.next()) |name| {
@@ -37,17 +42,17 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const name = host orelse return usage(out);
-    probe(init.gpa, io, name, port, groups.items, out) catch |err| {
+    probe(init.gpa, io, name, port, groups.items, tls12, out) catch |err| {
         try out.print("{s}\tfail\t{t}\n", .{ name, err });
     };
 }
 
 fn usage(out: *std.Io.Writer) !void {
-    try out.writeAll("usage: survey-probe HOST [PORT] [--groups a,b,...]\n");
+    try out.writeAll("usage: survey-probe HOST [PORT] [--groups a,b,...] [--tls12]\n");
     std.process.exit(2);
 }
 
-fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, groups: []const ztls.protocol.NamedGroup, out: *std.Io.Writer) !void {
+fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, groups: []const ztls.protocol.NamedGroup, tls12: bool, out: *std.Io.Writer) !void {
     var trust = try ztls.TrustStore.init();
     defer trust.deinit();
     try trust.addSystemBundle(gpa, io);
@@ -67,6 +72,8 @@ fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, groups
         .alpn_protocols = &.{"http/1.1"},
         .now = std.Io.Clock.real.now(io),
     };
+    const both = ztls.protocol.CipherSuite.all ++ ztls.protocol.CipherSuite.tls12;
+    if (tls12) options.cipher_suites = &both;
     if (groups.len > 0) {
         options.named_groups = groups;
         options.key_shares = groups[0..1];
