@@ -42,9 +42,9 @@ const max_idle_records = 32;
 /// KeyUpdates a sender may make over a connection's life (§4.7.3).
 const max_key_updates: u64 = (1 << 48) - 1;
 
-/// Warning alerts a peer may send over a connection's life; TLS 1.3 has
-/// only user_canceled, and that once. TLS 1.2 peers send others
-/// (no_renegotiation, say), each ignored; AWS-LC allows the same four.
+/// Warning alerts a peer may send in a row, with no other record between
+/// them, as AWS-LC counts them; TLS 1.3 has only user_canceled. TLS 1.2
+/// peers send others (unrecognized_name, say), each ignored.
 const max_warning_alerts = 4;
 
 /// What a read or write can fail with: the transport's own failure,
@@ -58,6 +58,7 @@ pub const Failure = error{
     TlsUnexpectedMessage,
     TlsIllegalParameter,
     TlsInternalError,
+    TlsNoRenegotiation,
 } || proto.Alert.Error;
 /// What a read can fail with: the transport reader's failure, which does
 /// not end the connection, or a `Failure`, which does.
@@ -115,7 +116,8 @@ pub const Connection = struct {
         cleartext: []u8 = &.{},
         /// Records in a row that carried no application data.
         idle_records: u32 = 0,
-        /// change_cipher_spec records and warning alerts seen, each capped.
+        /// change_cipher_spec records seen, and warning alerts in a row,
+        /// each capped.
         ccs_records: u32 = 0,
         warning_alerts: u32 = 0,
         /// Whether a change_cipher_spec may arrive: the handshake says so
@@ -318,6 +320,7 @@ pub const Connection = struct {
                     return e;
                 },
             };
+            if (record.content_type != .alert) c.read.warning_alerts = 0;
             switch (record.content_type) {
                 .application_data => {
                     if (record.payload.len == 0) {
@@ -411,18 +414,24 @@ pub const Connection = struct {
     /// record (every known stack sends them so; a ticket split across
     /// records would be an interop failure rather than a violation), and
     /// KeyUpdate must be the record's last message (§4.7.3). In TLS 1.2
-    /// only HelloRequest, which is ignored: we do not renegotiate, and
-    /// ignoring it is what RFC 5246 §7.4.1.1 allows and s2n does.
+    /// only HelloRequest, the server asking to renegotiate, which we never
+    /// do: it is refused with a fatal no_renegotiation (RFC 5746 §4.2),
+    /// as AWS-LC and Go do by default, so a server waiting for it fails at
+    /// once rather than at its timeout.
     fn handlePostHandshake(c: *Connection, payload: []const u8) Failure!void {
+        const keys = &c.read.keys.?;
         var d = codec.Decoder.init(payload);
         while (!d.eof()) {
             const handshake_type = d.decode(proto.HandshakeType) catch return error.TlsDecodeError;
             var body = d.vector(u24) catch return error.TlsDecodeError;
-            if (c.read.keys.?.version == .tls12) {
-                if (handshake_type != .hello_request) return error.TlsUnexpectedMessage;
-                if (!body.eof()) return error.TlsDecodeError;
-                continue;
-            }
+            const tls13 = switch (keys.version) {
+                .tls13 => |*tls13| tls13,
+                .tls12 => {
+                    if (handshake_type != .hello_request) return error.TlsUnexpectedMessage;
+                    if (!body.eof()) return error.TlsDecodeError;
+                    return error.TlsNoRenegotiation;
+                },
+            };
             switch (handshake_type) {
                 .key_update => {
                     const request = body.decode(proto.KeyUpdateRequest) catch return error.TlsDecodeError;
@@ -433,7 +442,7 @@ pub const Connection = struct {
                         .update_requested => c.shared.key_update_requested.store(true, .monotonic),
                         _ => return error.TlsIllegalParameter,
                     }
-                    c.read.keys.?.update() catch return error.TlsInternalError;
+                    keys.update(tls13) catch return error.TlsInternalError;
                 },
                 .new_session_ticket => {},
                 else => return error.TlsUnexpectedMessage,
@@ -587,7 +596,8 @@ pub const Connection = struct {
         c.output.flush() catch return error.WriteFailed;
     }
 
-    /// Whether a KeyUpdate has to go out before the next record, claiming
+    /// The TLS 1.3 key state a KeyUpdate has to go out with before the next
+    /// record, or null when none is due, claiming
     /// the peer's request if there is one. The claim happens before the
     /// update is sent, so a request arriving in between stays set and is
     /// answered before the record after this one. A request is answered
@@ -596,18 +606,22 @@ pub const Connection = struct {
     /// Past `max_key_updates` there is no update (§4.7.3): a request is
     /// ignored and the keys stay until `seal` refuses them. TLS 1.2 has no
     /// KeyUpdate; its keys last until the sequence number runs out.
-    fn claimKeyUpdate(c: *Connection) bool {
-        if (c.write.keys.?.version == .tls12) return false;
+    fn claimKeyUpdate(c: *Connection) ?*const cipher.Tls13 {
+        const keys = &c.write.keys.?;
+        const tls13 = switch (keys.version) {
+            .tls13 => |*tls13| tls13,
+            .tls12 => return null,
+        };
         const requested = c.shared.key_update_requested.load(.monotonic) and
             c.shared.key_update_requested.swap(false, .monotonic);
-        if (c.write.key_updates >= max_key_updates) return false;
-        return requested or c.write.keys.?.seq >= c.write.keys.?.recordLimit();
+        if (c.write.key_updates >= max_key_updates) return null;
+        return if (requested or keys.seq >= keys.recordLimit()) tls13 else null;
     }
 
     /// Moves the write keys to the next generation, after the KeyUpdate
     /// announcing it was sealed with the old ones.
-    fn advanceWriteKeys(c: *Connection) error{TlsInternalError}!void {
-        c.write.keys.?.update() catch return error.TlsInternalError;
+    fn advanceWriteKeys(c: *Connection, tls13: *const cipher.Tls13) error{TlsInternalError}!void {
+        c.write.keys.?.update(tls13) catch return error.TlsInternalError;
         c.write.key_updates += 1;
     }
 
@@ -616,9 +630,9 @@ pub const Connection = struct {
     }
 
     /// Sends a KeyUpdate and moves the write keys to the next generation.
-    fn sendKeyUpdate(c: *Connection, request: proto.KeyUpdateRequest) WriteError!void {
+    fn sendKeyUpdate(c: *Connection, request: proto.KeyUpdateRequest, tls13: *const cipher.Tls13) WriteError!void {
         try c.writeRecord(.handshake, &keyUpdateMessage(request));
-        try c.advanceWriteKeys();
+        try c.advanceWriteKeys(tls13);
     }
 
     /// Asks the peer to update its keys, updating ours first (§4.7.3).
@@ -626,9 +640,12 @@ pub const Connection = struct {
     /// TLS 1.2, which has no KeyUpdate.
     pub fn requestKeyUpdate(c: *Connection) WriteError!void {
         try c.checkWritable();
-        if (c.write.keys.?.version == .tls12) return;
+        const tls13 = switch (c.write.keys.?.version) {
+            .tls13 => |*tls13| tls13,
+            .tls12 => return,
+        };
         if (c.write.key_updates >= max_key_updates) return;
-        c.sendKeyUpdate(.update_requested) catch |err| return c.failWrite(err);
+        c.sendKeyUpdate(.update_requested, tls13) catch |err| return c.failWrite(err);
         try c.flushOutput();
     }
 
@@ -686,13 +703,13 @@ pub const Connection = struct {
         const keys = &c.write.keys.?;
         const buf = c.output.unusedCapacitySlice();
         var at: usize = 0;
-        if (c.claimKeyUpdate()) {
+        if (c.claimKeyUpdate()) |tls13| {
             // TLS 1.3 only, so the plaintext starts right after the header.
             std.mem.copyBackwards(u8, buf[key_update_record_len + cipher.header_len ..][0..len], buf[cipher.header_len..][0..len]);
             const msg = keyUpdateMessage(.update_not_requested);
             buf[cipher.header_len..][0..msg.len].* = msg;
             keys.seal(buf[0..key_update_record_len], .handshake, msg.len) catch |err| return c.failWrite(err);
-            c.advanceWriteKeys() catch |err| return c.failWrite(err);
+            c.advanceWriteKeys(tls13) catch |err| return c.failWrite(err);
             at = key_update_record_len;
         }
         if (len > 0) {
@@ -1181,8 +1198,8 @@ test "key updates from both sides" {
     var rbuf: [256]u8 = undefined;
     var r = end.conn.reader(&rbuf);
     var w = end.conn.inPlaceWriter();
-    const write_gen0 = end.conn.write.keys.?.secret;
-    const read_gen0 = end.conn.read.keys.?.secret;
+    const write_gen0 = end.conn.write.keys.?.version.tls13.secret;
+    const read_gen0 = end.conn.read.keys.?.version.tls13.secret;
     for (0..6) |i| {
         if (i == 4) try end.conn.requestKeyUpdate();
         try w.interface.print("message {d}\n", .{i});
@@ -1194,10 +1211,10 @@ test "key updates from both sides" {
     // before message 3 went out; our request before message 4 rotated
     // them again, and the peer's answer rotated its write keys, our read
     // keys, twice in all.
-    try testing.expect(!std.mem.eql(u8, write_gen0.slice(), end.conn.write.keys.?.secret.slice()));
-    try testing.expect(!std.mem.eql(u8, read_gen0.slice(), end.conn.read.keys.?.secret.slice()));
+    try testing.expect(!std.mem.eql(u8, write_gen0.slice(), end.conn.write.keys.?.version.tls13.secret.slice()));
+    try testing.expect(!std.mem.eql(u8, read_gen0.slice(), end.conn.read.keys.?.version.tls13.secret.slice()));
     const expected_write = key_schedule.nextTrafficSecret(.sha256, &key_schedule.nextTrafficSecret(.sha256, &write_gen0));
-    try testing.expectEqualSlices(u8, expected_write.slice(), end.conn.write.keys.?.secret.slice());
+    try testing.expectEqualSlices(u8, expected_write.slice(), end.conn.write.keys.?.version.tls13.secret.slice());
     try end.conn.close();
     try peer.await(io);
 }
@@ -1229,7 +1246,7 @@ test "past the key update cap a sender ignores requests and keeps its keys" {
     try st.client(&end);
     defer end.deinit();
     end.conn.write.key_updates = max_key_updates;
-    const before = end.conn.write.keys.?.secret;
+    const before = end.conn.write.keys.?.version.tls13.secret;
     var rbuf: [256]u8 = undefined;
     var r = end.conn.reader(&rbuf);
     var w = end.conn.inPlaceWriter();
@@ -1237,7 +1254,7 @@ test "past the key update cap a sender ignores requests and keeps its keys" {
     try end.conn.requestKeyUpdate(); // nothing happens at the cap
     try w.interface.writeAll("pong\n");
     try w.interface.flush();
-    try testing.expectEqualSlices(u8, before.slice(), end.conn.write.keys.?.secret.slice());
+    try testing.expectEqualSlices(u8, before.slice(), end.conn.write.keys.?.version.tls13.secret.slice());
     try testing.expectEqual(max_key_updates, end.conn.write.key_updates);
     try end.conn.close();
     try peer.await(io);
@@ -1452,7 +1469,7 @@ fn concurrentTasks(mode: Mode) !void {
     try peer.await(io);
 }
 
-test "TLS 1.2: warning alerts and HelloRequest are ignored, KeyUpdate is not" {
+test "TLS 1.2: warning alerts are ignored, KeyUpdate is not" {
     const io = testing.io;
     var st = try SelfTalk.init(io, .{ .tls12 = .aes_128_gcm });
     defer st.deinit();
@@ -1462,11 +1479,12 @@ test "TLS 1.2: warning alerts and HelloRequest are ignored, KeyUpdate is not" {
             var end: SelfTalk.End = undefined;
             try s.server(&end);
             defer end.deinit();
-            // A warning unrecognized_name and a HelloRequest, each in its
-            // own protected record under its own content type, then data.
-            try end.conn.writeRecord(.alert, &.{ 1, @intFromEnum(proto.Alert.unrecognized_name) });
-            try end.conn.writeRecord(.handshake, &.{ @intFromEnum(proto.HandshakeType.hello_request), 0, 0, 0 });
-            try end.conn.writeRecord(.application_data, "data\n");
+            // Warnings in protected alert records, more than the cap over
+            // the connection but never more than it in a row.
+            for (0..max_warning_alerts + 2) |_| {
+                try end.conn.writeRecord(.alert, &.{ 1, @intFromEnum(proto.Alert.unrecognized_name) });
+                try end.conn.writeRecord(.application_data, "data\n");
+            }
             try end.conn.flushOutput();
             var rbuf: [256]u8 = undefined;
             var r = end.conn.reader(&rbuf);
@@ -1487,8 +1505,9 @@ test "TLS 1.2: warning alerts and HelloRequest are ignored, KeyUpdate is not" {
     var rbuf: [256]u8 = undefined;
     var r = end.conn.reader(&rbuf);
     var w = end.conn.inPlaceWriter();
-    try testing.expectEqualStrings("data", (try r.interface.takeDelimiter('\n')).?);
-    try testing.expectEqual(1, end.conn.read.warning_alerts);
+    for (0..max_warning_alerts + 2) |_| {
+        try testing.expectEqualStrings("data", (try r.interface.takeDelimiter('\n')).?);
+    }
     // No KeyUpdate in TLS 1.2: asking for one does nothing.
     const seq = end.conn.write.keys.?.seq;
     try end.conn.requestKeyUpdate();
@@ -1504,7 +1523,43 @@ test "TLS 1.2: warning alerts and HelloRequest are ignored, KeyUpdate is not" {
     try peer.await(io);
 }
 
-test "TLS 1.2: a fifth warning alert is too many" {
+test "TLS 1.2: HelloRequest is refused with no_renegotiation" {
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .{ .tls12 = .aes_256_gcm });
+    defer st.deinit();
+
+    const Peer = struct {
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            try end.conn.writeRecord(.handshake, &.{ @intFromEnum(proto.HandshakeType.hello_request), 0, 0, 0 });
+            try end.conn.flushOutput();
+            var rbuf: [256]u8 = undefined;
+            var r = end.conn.reader(&rbuf);
+            try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+            try testing.expectEqual(error.TlsAlertNoRenegotiation, r.err.?);
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = end.conn.reader(&rbuf);
+    var w = end.conn.inPlaceWriter();
+    try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+    try testing.expectEqual(error.TlsNoRenegotiation, r.err.?);
+    // The fatal alert goes out with the next write.
+    try w.interface.writeAll("x");
+    try testing.expectError(error.WriteFailed, w.interface.flush());
+    try testing.expectEqual(error.TlsNoRenegotiation, w.err.?);
+    try peer.await(io);
+}
+
+test "TLS 1.2: a fifth warning alert in a row is too many" {
     const io = testing.io;
     var st = try SelfTalk.init(io, .{ .tls12 = .chacha20_poly1305 });
     defer st.deinit();

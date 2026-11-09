@@ -45,6 +45,13 @@ pub fn tls12FixedIvLen(algorithm: aead.Algorithm) usize {
 
 pub const Version = enum { tls13, tls12 };
 
+/// What TLS 1.3 keys keep for KeyUpdate: the traffic secret they came
+/// from and its hash.
+pub const Tls13 = struct {
+    hash_algorithm: hash.Algorithm,
+    secret: Secret,
+};
+
 pub fn suiteAead(suite: proto.CipherSuite) ?aead.Algorithm {
     return switch (suite) {
         .aes_128_gcm_sha256 => .aes_128_gcm,
@@ -84,15 +91,16 @@ pub const Opened = struct {
     len: usize,
 };
 
-/// One direction's keys: the traffic secret they came from, the keyed AEAD,
-/// the IV and the record sequence number.
+/// One direction's keys: the keyed AEAD, the IV, the record sequence
+/// number, and in TLS 1.3 the traffic secret they came from.
 pub const Keys = struct {
-    version: Version = .tls13,
-    algorithm: aead.Algorithm,
-    hash_algorithm: hash.Algorithm,
-    /// The TLS 1.3 traffic secret, for KeyUpdate. Empty in TLS 1.2, which
+    /// The record format, and for TLS 1.3 what KeyUpdate needs; TLS 1.2
     /// has no key updates.
-    secret: Secret,
+    version: union(Version) {
+        tls13: Tls13,
+        tls12,
+    },
+    algorithm: aead.Algorithm,
     ctx: aead.Context,
     /// TLS 1.3 and TLS 1.2 ChaCha20: the IV the sequence number is XORed
     /// into. TLS 1.2 AES-GCM: the 4-byte salt, then zeros where the
@@ -101,15 +109,7 @@ pub const Keys = struct {
     seq: u64 = 0,
 
     pub fn init(suite: proto.CipherSuite, traffic_secret: Secret) crypto.err.Error!Keys {
-        var keys: Keys = .{
-            .algorithm = suiteAead(suite).?,
-            .hash_algorithm = suiteHash(suite).?,
-            .secret = traffic_secret,
-            .ctx = undefined,
-            .iv = undefined,
-        };
-        try keys.deriveKeys();
-        return keys;
+        return fromSecret(suiteAead(suite).?, .{ .hash_algorithm = suiteHash(suite).?, .secret = traffic_secret });
     }
 
     /// TLS 1.2 keys from the key block's write key and fixed IV
@@ -120,8 +120,6 @@ pub const Keys = struct {
         var keys: Keys = .{
             .version = .tls12,
             .algorithm = algorithm,
-            .hash_algorithm = undefined,
-            .secret = .{ .bytes = @splat(0), .len = 0 },
             .ctx = try aead.Context.initTls12(algorithm, key),
             .iv = @splat(0),
         };
@@ -129,37 +127,41 @@ pub const Keys = struct {
         return keys;
     }
 
-    fn deriveKeys(keys: *Keys) crypto.err.Error!void {
+    /// TLS 1.3 keys from a traffic secret (§7.3). On failure the secret
+    /// is left to the caller.
+    fn fromSecret(algorithm: aead.Algorithm, tls13: Tls13) crypto.err.Error!Keys {
         var key: [aead.max_key_length]u8 = undefined;
         defer std.crypto.secureZero(u8, &key);
-        const key_len = keys.algorithm.keyLength();
-        hkdf.expandLabel(keys.hash_algorithm, keys.secret.slice(), "key", "", key[0..key_len]);
-        hkdf.expandLabel(keys.hash_algorithm, keys.secret.slice(), "iv", "", &keys.iv);
-        keys.ctx = try aead.Context.init(keys.algorithm, key[0..key_len]);
-        keys.seq = 0;
+        const key_len = algorithm.keyLength();
+        var iv: aead.Nonce = undefined;
+        hkdf.expandLabel(tls13.hash_algorithm, tls13.secret.slice(), "key", "", key[0..key_len]);
+        hkdf.expandLabel(tls13.hash_algorithm, tls13.secret.slice(), "iv", "", &iv);
+        return .{
+            .version = .{ .tls13 = tls13 },
+            .algorithm = algorithm,
+            .ctx = try aead.Context.init(algorithm, key[0..key_len]),
+            .iv = iv,
+        };
     }
 
     pub fn deinit(keys: *Keys) void {
         keys.ctx.deinit();
-        keys.secret.wipe();
+        switch (keys.version) {
+            .tls13 => |*tls13| tls13.secret.wipe(),
+            .tls12 => {},
+        }
         std.crypto.secureZero(u8, &keys.iv);
         keys.* = undefined;
     }
 
     /// Moves to the next generation of keys (§7.2), after a KeyUpdate was
-    /// sent or received. TLS 1.3 only. On failure the keys are left as
-    /// they were.
-    pub fn update(keys: *Keys) crypto.err.Error!void {
-        assert(keys.version == .tls13);
-        var next: Keys = .{
-            .algorithm = keys.algorithm,
-            .hash_algorithm = keys.hash_algorithm,
-            .secret = key_schedule.nextTrafficSecret(keys.hash_algorithm, &keys.secret),
-            .ctx = undefined,
-            .iv = undefined,
-        };
-        next.deriveKeys() catch |err| {
-            next.secret.wipe();
+    /// sent or received. Only TLS 1.3 keys have a next generation, so the
+    /// caller passes `&keys.version.tls13`, having switched on the version.
+    /// On failure the keys are left as they were.
+    pub fn update(keys: *Keys, tls13: *const Tls13) crypto.err.Error!void {
+        var next_secret = key_schedule.nextTrafficSecret(tls13.hash_algorithm, &tls13.secret);
+        const next = fromSecret(keys.algorithm, .{ .hash_algorithm = tls13.hash_algorithm, .secret = next_secret }) catch |err| {
+            next_secret.wipe();
             return err;
         };
         keys.deinit();
@@ -353,15 +355,12 @@ const data13 = @import("testdata/tls13.zig");
 fn exampleKeys(secret_key: []const u8, iv: *const [12]u8) !Keys {
     // The example gives the key and IV rather than the traffic secret, so
     // build the keys directly.
-    var keys: Keys = .{
+    return .{
+        .version = .{ .tls13 = .{ .hash_algorithm = .sha384, .secret = .{ .bytes = @splat(0), .len = 48 } } },
         .algorithm = .aes_256_gcm,
-        .hash_algorithm = .sha384,
-        .secret = .{ .bytes = @splat(0), .len = 48 },
         .ctx = try aead.Context.init(.aes_256_gcm, secret_key),
         .iv = iv.*,
     };
-    _ = &keys;
-    return keys;
 }
 
 test "opening the example connection's records" {
@@ -417,13 +416,13 @@ test "round trip through a derived generation and a key update" {
             try testing.expect(std.mem.allEqual(u8, out[0..len], 'x'));
         }
 
-        try sender.update();
+        try sender.update(&sender.version.tls13);
         try testing.expectEqual(0, sender.seq);
         record[header_len..][0..5].* = "hello".*;
         try sender.seal(&record, .application_data, 5);
         var out: [64]u8 = undefined;
         try testing.expectError(error.TlsBadRecordMac, receiver.open(record[0..Keys.sealedLenTls13(5)], &out));
-        try receiver.update();
+        try receiver.update(&receiver.version.tls13);
         receiver.seq = 0;
         const opened = try receiver.open(record[0..Keys.sealedLenTls13(5)], &out);
         try testing.expectEqualSlices(u8, "hello", out[0..opened.len]);

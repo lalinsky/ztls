@@ -282,12 +282,12 @@ test "our client against openssl s_server" {
         if (case.key_update) {
             // We update and ask; OpenSSL must answer with its own update
             // before its next record, which the reply below is.
-            const read_secret = conn.read.keys.?.secret;
+            const read_secret = conn.read.keys.?.version.tls13.secret;
             try conn.requestKeyUpdate();
             try w.interface.writeAll("after update\n");
             try w.interface.flush();
             try testing.expectEqualStrings("etadpu retfa", (try r.interface.takeDelimiter('\n')).?);
-            try testing.expect(!std.mem.eql(u8, read_secret.slice(), conn.read.keys.?.secret.slice()));
+            try testing.expect(!std.mem.eql(u8, read_secret.slice(), conn.read.keys.?.version.tls13.secret.slice()));
         }
         if (case.transfer > 0) {
             var sender = try io.concurrent(writePattern, .{ &w.interface, case.transfer });
@@ -322,9 +322,9 @@ fn serveOnce(loopback: *testu.Loopback, options: config.Server, outcome: *Outcom
     defer conn.deinit();
     outcome.alpn = conn.alpn_protocol;
     outcome.peer_key_type = conn.peer_key_type;
-    const read_secret = conn.read.keys.?.secret;
+    const read_secret = conn.read.keys.?.version.tls13.secret;
     outcome.echo = echo(&conn);
-    outcome.read_keys_updated = !std.mem.eql(u8, read_secret.slice(), conn.read.keys.?.secret.slice());
+    outcome.read_keys_updated = !std.mem.eql(u8, read_secret.slice(), conn.read.keys.?.version.tls13.secret.slice());
 }
 
 fn echo(conn: *ztls.Connection) !void {
