@@ -475,6 +475,103 @@ test "no common ALPN protocol, suite or group ends the handshake" {
     }
 }
 
+test "signature scheme lists decide what each side signs with and accepts" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+
+    const Case = struct {
+        server_signing: []const proto.SignatureScheme = &config.default_signature_schemes,
+        client_verify: []const proto.SignatureScheme = &config.default_signature_schemes,
+        expected: ?proto.SignatureScheme,
+    };
+    const cases = [_]Case{
+        // The server's order wins among what the client takes.
+        .{ .server_signing = &.{ .rsa_pss_rsae_sha512, .rsa_pss_rsae_sha256 }, .expected = .rsa_pss_rsae_sha512 },
+        .{ .client_verify = &.{ .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha384 }, .expected = .rsa_pss_rsae_sha384 },
+        // Nothing in common for an RSA key.
+        .{ .client_verify = &.{.ecdsa_secp256r1_sha256}, .expected = null },
+        .{ .server_signing = &.{.ed25519}, .expected = null },
+    };
+    for (cases) |case| {
+        var run: Run = .{ .loopback = undefined };
+        try run.start(io, .{ .allocator = testing.allocator, .auth = &pki.server_rsa, .now = valid_now, .signing_schemes = case.server_signing });
+        const result = clientOnce(&run.loopback, .{
+            .allocator = testing.allocator,
+            .host = "localhost",
+            .root_ca = &pki.ca,
+            .now = valid_now,
+            .verify_schemes = case.client_verify,
+        });
+        const outcome = try run.finish(io);
+        if (case.expected) |scheme| {
+            const conn = try result;
+            try testing.expectEqual(scheme, conn.peer_signature_scheme.?);
+            try outcome.handshake;
+        } else {
+            try testing.expectError(error.TlsAlertHandshakeFailure, result);
+            try testing.expectError(error.TlsHandshakeFailure, outcome.handshake);
+        }
+    }
+
+    // A client certificate the server would not take is left out.
+    var run: Run = .{ .loopback = undefined };
+    try run.start(io, .{
+        .allocator = testing.allocator,
+        .auth = &pki.server_ec,
+        .now = valid_now,
+        .client_auth = .{ .root_ca = &pki.ca, .auth_type = .require },
+        .verify_schemes = &.{.ed25519},
+    });
+    try testing.expectError(error.TlsAlertCertificateRequired, clientOnce(&run.loopback, .{
+        .allocator = testing.allocator,
+        .host = "localhost",
+        .root_ca = &pki.ca,
+        .now = valid_now,
+        .auth = &pki.client,
+    }));
+    const outcome = try run.finish(io);
+    try testing.expectError(error.TlsCertificateRequired, outcome.handshake);
+}
+
+test "signature scheme lists must be ones we implement, each once" {
+    var input_buffer: [input_buffer_len]u8 = undefined;
+    var output_buffer: [output_buffer_len]u8 = undefined;
+    const bad = [_][]const proto.SignatureScheme{
+        &.{},
+        &.{.rsa_pkcs1_sha1},
+        &.{ .ed25519, .ed25519 },
+    };
+    for (bad, 0..) |schemes, i| {
+        // An empty list is fine only for a client's signing.
+        const Side = enum { client_verify, client_signing, server_verify, server_signing };
+        for (std.enums.values(Side)) |side| {
+            if (i == 0 and side == .client_signing) continue;
+            var input: Io.Reader = .fixed(&input_buffer);
+            var discard: Io.Writer.Discarding = .init(&output_buffer);
+            const result = switch (side) {
+                .client_verify, .client_signing => client(&input, &discard.writer, .{
+                    .allocator = testing.allocator,
+                    .host = "localhost",
+                    .insecure_skip_verify = true,
+                    .now = valid_now,
+                    .verify_schemes = if (side == .client_verify) schemes else &config.default_signature_schemes,
+                    .signing_schemes = if (side == .client_signing) schemes else &config.default_signature_schemes,
+                }),
+                .server_verify, .server_signing => server(&input, &discard.writer, .{
+                    .allocator = testing.allocator,
+                    .auth = null,
+                    .now = valid_now,
+                    .verify_schemes = if (side == .server_verify) schemes else &config.default_signature_schemes,
+                    .signing_schemes = if (side == .server_signing) schemes else &config.default_signature_schemes,
+                }),
+            };
+            try testing.expectError(error.TlsInternalError, result);
+            try testing.expectEqual(0, discard.count + discard.writer.end);
+        }
+    }
+}
+
 test "the server picks its certificate by server name" {
     const io = testing.io;
     var pki = try Pki.init();

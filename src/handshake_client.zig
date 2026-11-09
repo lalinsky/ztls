@@ -74,6 +74,8 @@ fn checkOptions(opt: config.Client) error{TlsInternalError}!void {
     if (opt.root_ca == null and !opt.insecure_skip_verify) return error.TlsInternalError;
     if (opt.host.len == 0 and !opt.insecure_skip_verify) return error.TlsInternalError;
     if (opt.named_groups.len == 0) return error.TlsInternalError;
+    if (opt.verify_schemes.len == 0) return error.TlsInternalError;
+    if (!handshake.schemesSupported(opt.verify_schemes) or !handshake.schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
     if (!proto.tls12_enabled) {
         for (opt.cipher_suites) |suite| if (suite.version() == .tls_1_2) return error.TlsInternalError;
     }
@@ -204,7 +206,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     msg = try h.nextMessage();
     var request: ?CertificateRequest = null;
     if (msg.handshake_type == .certificate_request) {
-        request = try parseCertificateRequest(msg.body, opt.auth);
+        request = try parseCertificateRequest(msg.body, opt.auth, opt.signing_schemes);
         try h.hashMessage(msg);
         msg = try h.nextMessage();
     }
@@ -221,7 +223,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 
     msg = try h.nextMessage();
     try h.expect(msg, .certificate_verify);
-    try h.verifyCertificateVerify(msg.body, &peer.public_key, .server);
+    try h.verifyCertificateVerify(msg.body, &peer.public_key, .server, opt.verify_schemes);
     try h.hashMessage(msg);
 
     msg = try h.nextMessage();
@@ -329,7 +331,7 @@ fn build(
     {
         try w.enumValue(proto.Extension.signature_algorithms);
         const ext = try w.beginLength(u16);
-        try w.enumList(&handshake.signature_algorithms);
+        try w.enumList(opt.verify_schemes);
         try ext.end(w);
     }
     if (offers(opt, .tls_1_3)) {
@@ -553,7 +555,7 @@ fn parseAlpn(data: *codec.Decoder, opt: config.Client) Error![]const u8 {
     return error.TlsIllegalParameter;
 }
 
-fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair) Error!CertificateRequest {
+fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair, signing: []const proto.SignatureScheme) Error!CertificateRequest {
     var d = codec.Decoder.init(body);
     const context = try d.vectorBytes(u8);
     var extensions = try d.vector(u16);
@@ -597,7 +599,7 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair) E
         }
     }
     const n = offered_len orelse return error.TlsMissingExtension;
-    if (auth) |pair| request.scheme = handshake.selectScheme(pair.key.key_type, offered[0..n], .tls13);
+    if (auth) |pair| request.scheme = handshake.selectScheme(signing, pair.key.key_type, offered[0..n], .tls13);
     return request;
 }
 

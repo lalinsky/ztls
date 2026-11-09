@@ -36,23 +36,6 @@ pub const hello_retry_request_random = [32]u8{
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 };
 
-/// What we put in signature_algorithms, in preference order. In TLS 1.3
-/// the rsa_pkcs1 ones are for certificate signatures only, which X.509
-/// verification checks; they never sign a CertificateVerify. In TLS 1.2
-/// they sign handshakes too.
-pub const signature_algorithms = [_]proto.SignatureScheme{
-    .ecdsa_secp256r1_sha256,
-    .ecdsa_secp384r1_sha384,
-    .ecdsa_secp521r1_sha512,
-    .ed25519,
-    .rsa_pss_rsae_sha256,
-    .rsa_pss_rsae_sha384,
-    .rsa_pss_rsae_sha512,
-    .rsa_pkcs1_sha256,
-    .rsa_pkcs1_sha384,
-    .rsa_pkcs1_sha512,
-};
-
 /// The algorithm a scheme stands for when it signs a handshake in
 /// `version`: a CertificateVerify, or in TLS 1.2 a ServerKeyExchange too.
 /// Null for one that may not: the rsa_pkcs1 ones in TLS 1.3 (§4.2.3), and
@@ -94,10 +77,19 @@ pub fn schemeSuits(scheme: proto.SignatureScheme, key_type: sig.KeyType, version
     };
 }
 
-/// The scheme to sign with in `version`: our most preferred one that the
+/// Whether `schemes` are all ones we implement, none twice.
+pub fn schemesSupported(schemes: []const proto.SignatureScheme) bool {
+    for (schemes, 0..) |scheme, i| {
+        if (std.mem.indexOfScalar(proto.SignatureScheme, &config.default_signature_schemes, scheme) == null) return false;
+        if (std.mem.indexOfScalar(proto.SignatureScheme, schemes[0..i], scheme) != null) return false;
+    }
+    return true;
+}
+
+/// The scheme to sign with in `version`: the first of `ours` that the
 /// peer offered and that suits the key.
-pub fn selectScheme(key_type: sig.KeyType, offered: []const proto.SignatureScheme, version: cipher.Version) ?proto.SignatureScheme {
-    for (signature_algorithms) |scheme| {
+pub fn selectScheme(ours: []const proto.SignatureScheme, key_type: sig.KeyType, offered: []const proto.SignatureScheme, version: cipher.Version) ?proto.SignatureScheme {
+    for (ours) |scheme| {
         if (!schemeSuits(scheme, key_type, version)) continue;
         if (std.mem.indexOfScalar(proto.SignatureScheme, offered, scheme) != null) return scheme;
     }
@@ -793,13 +785,14 @@ pub const Handshake = struct {
     }
 
     /// Checks a CertificateVerify against the transcript so far and the
-    /// peer's key. The scheme must be one we offered and suit the key.
-    pub fn verifyCertificateVerify(h: *Handshake, body: []const u8, public_key: *const sig.PublicKey, side: proto.Side) Error!void {
+    /// peer's key. The scheme must be one of `accepted`, the ones we
+    /// offered, and suit the key.
+    pub fn verifyCertificateVerify(h: *Handshake, body: []const u8, public_key: *const sig.PublicKey, side: proto.Side, accepted: []const proto.SignatureScheme) Error!void {
         var d = codec.Decoder.init(body);
         const scheme = try d.decode(proto.SignatureScheme);
         const signature = try d.vectorBytes(u16);
         try d.expectEof();
-        if (std.mem.indexOfScalar(proto.SignatureScheme, &signature_algorithms, scheme) == null) return error.TlsIllegalParameter;
+        if (std.mem.indexOfScalar(proto.SignatureScheme, accepted, scheme) == null) return error.TlsIllegalParameter;
         if (!schemeSuits(scheme, public_key.key_type, .tls13)) return error.TlsIllegalParameter;
         const algorithm = schemeAlgorithm(scheme, .tls13).?;
         h.conn.peer_signature_scheme = scheme;
@@ -856,11 +849,14 @@ test "key shares agree for every group" {
 }
 
 test "scheme selection" {
-    try testing.expectEqual(proto.SignatureScheme.ecdsa_secp256r1_sha256, selectScheme(.{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp256r1_sha256 }, .tls13).?);
-    try testing.expectEqual(null, selectScheme(.{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp384r1_sha384 }, .tls13));
-    try testing.expectEqual(proto.SignatureScheme.rsa_pss_rsae_sha384, selectScheme(.{ .rsa = 2048 }, &.{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha384 }, .tls13).?);
-    try testing.expectEqual(null, selectScheme(.{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls13)); // pkcs1 may not sign a CertificateVerify
-    try testing.expectEqual(proto.SignatureScheme.ed25519, selectScheme(.ed25519, &.{.ed25519}, .tls13).?);
+    try testing.expectEqual(proto.SignatureScheme.ecdsa_secp256r1_sha256, selectScheme(&config.default_signature_schemes, .{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp256r1_sha256 }, .tls13).?);
+    try testing.expectEqual(null, selectScheme(&config.default_signature_schemes, .{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp384r1_sha384 }, .tls13));
+    try testing.expectEqual(proto.SignatureScheme.rsa_pss_rsae_sha384, selectScheme(&config.default_signature_schemes, .{ .rsa = 2048 }, &.{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha384 }, .tls13).?);
+    try testing.expectEqual(null, selectScheme(&config.default_signature_schemes, .{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls13)); // pkcs1 may not sign a CertificateVerify
+    try testing.expectEqual(proto.SignatureScheme.ed25519, selectScheme(&config.default_signature_schemes, .ed25519, &.{.ed25519}, .tls13).?);
+    // Our order, not the peer's; and only what we list.
+    try testing.expectEqual(proto.SignatureScheme.rsa_pss_rsae_sha512, selectScheme(&.{ .rsa_pss_rsae_sha512, .rsa_pss_rsae_sha256 }, .{ .rsa = 2048 }, &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha512 }, .tls13).?);
+    try testing.expectEqual(null, selectScheme(&.{.rsa_pss_rsae_sha384}, .{ .rsa = 2048 }, &.{.rsa_pss_rsae_sha256}, .tls13));
 }
 
 test "TLS 1.3 binds each ECDSA scheme to a curve" {
@@ -885,7 +881,7 @@ test "TLS 1.2 schemes name the hash only, and take PKCS#1 v1.5" {
     try testing.expect(!schemeSuits(.rsa_pkcs1_sha384, .{ .ecdsa = .p384 }, .tls12));
     try testing.expect(schemeSuits(.ed25519, .ed25519, .tls12));
     try testing.expect(!schemeSuits(.rsa_pkcs1_sha1, .{ .rsa = 2048 }, .tls12));
-    try testing.expectEqual(proto.SignatureScheme.rsa_pkcs1_sha256, selectScheme(.{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls12).?);
+    try testing.expectEqual(proto.SignatureScheme.rsa_pkcs1_sha256, selectScheme(&config.default_signature_schemes, .{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls12).?);
 }
 
 test "a CertificateVerify under another curve's scheme is refused" {
@@ -915,14 +911,14 @@ test "a CertificateVerify under another curve's scheme is refused" {
     var w = codec.Writer.init(&body_buf);
     try w.enumValue(proto.SignatureScheme.ecdsa_secp256r1_sha256);
     try w.vector(u16, signature);
-    try testing.expectError(error.TlsIllegalParameter, h.verifyCertificateVerify(w.written(), &public, .server));
+    try testing.expectError(error.TlsIllegalParameter, h.verifyCertificateVerify(w.written(), &public, .server, &config.default_signature_schemes));
 
     // The same key under its own curve's scheme passes.
     const good = try key.sign(.ecdsa_sha384, content, &sig_buf);
     w = codec.Writer.init(&body_buf);
     try w.enumValue(proto.SignatureScheme.ecdsa_secp384r1_sha384);
     try w.vector(u16, good);
-    try h.verifyCertificateVerify(w.written(), &public, .server);
+    try h.verifyCertificateVerify(w.written(), &public, .server, &config.default_signature_schemes);
 }
 
 test "certificate, certificate verify and finished round-trip through records" {
@@ -982,8 +978,8 @@ test "certificate, certificate verify and finished round-trip through records" {
 
     msg = try receiver.nextMessage();
     try receiver.expect(msg, .certificate_verify);
-    try receiver.verifyCertificateVerify(msg.body, &peer.public_key, .server);
-    try testing.expectError(error.TlsDecryptError, receiver.verifyCertificateVerify(msg.body, &peer.public_key, .client));
+    try receiver.verifyCertificateVerify(msg.body, &peer.public_key, .server, &config.default_signature_schemes);
+    try testing.expectError(error.TlsDecryptError, receiver.verifyCertificateVerify(msg.body, &peer.public_key, .client, &config.default_signature_schemes));
     try receiver.hashMessage(msg);
 
     msg = try receiver.nextMessage();

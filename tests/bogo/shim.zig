@@ -45,6 +45,8 @@ const Options = struct {
     curves: std.ArrayList(u16) = .empty,
     key_shares: ?std.ArrayList(u16) = null,
     tls13_ciphers: std.ArrayList(u16) = .empty,
+    signing_prefs: std.ArrayList(u16) = .empty,
+    verify_prefs: std.ArrayList(u16) = .empty,
     min_version: u16 = 0,
     max_version: u16 = 0,
     no_tls12: bool = false,
@@ -159,6 +161,8 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
             .{ .name = "-curves", .kind = .int_list, .field = "curves" },
             .{ .name = "-key-shares", .kind = .optional_int_list, .field = "key_shares" },
             .{ .name = "-tls13-ciphers", .kind = .int_list, .field = "tls13_ciphers" },
+            .{ .name = "-signing-prefs", .kind = .int_list, .field = "signing_prefs" },
+            .{ .name = "-verify-prefs", .kind = .int_list, .field = "verify_prefs" },
             .{ .name = "-min-version", .kind = .int, .field = "min_version" },
             .{ .name = "-max-version", .kind = .int, .field = "max_version" },
             .{ .name = "-no-tls12", .kind = .bool_flag, .field = "no_tls12" },
@@ -268,6 +272,18 @@ fn suiteFromName(name: []const u8) ?ztls.protocol.CipherSuite {
 
 fn groupFromId(id: u16) ?ztls.protocol.NamedGroup {
     return fromWire(ztls.protocol.NamedGroup, id);
+}
+
+/// The schemes in `ids`, which must be ones ztls implements, each once.
+fn schemesFromIds(arena: std.mem.Allocator, ids: []const u16) ![]const ztls.protocol.SignatureScheme {
+    var schemes: std.ArrayList(ztls.protocol.SignatureScheme) = .empty;
+    for (ids) |id| {
+        const scheme = fromWire(ztls.protocol.SignatureScheme, id) orelse unimplemented("signature scheme {x}", .{id});
+        if (std.mem.indexOfScalar(ztls.protocol.SignatureScheme, &ztls.config.default_signature_schemes, scheme) == null) unimplemented("signature scheme {x}", .{id});
+        if (std.mem.indexOfScalar(ztls.protocol.SignatureScheme, schemes.items, scheme) != null) unimplemented("signature scheme {x} twice", .{id});
+        try schemes.append(arena, scheme);
+    }
+    return schemes.items;
 }
 
 fn suiteFromId(id: u16) ?ztls.protocol.CipherSuite {
@@ -395,6 +411,8 @@ pub fn main(init: std.process.Init) !void {
         };
         if (suites.items.len > 0) options.cipher_suites = suites.items;
         if (named_groups.items.len > 0) options.named_groups = named_groups.items;
+        if (o.signing_prefs.items.len > 0) options.signing_schemes = try schemesFromIds(arena, o.signing_prefs.items);
+        if (o.verify_prefs.items.len > 0) options.verify_schemes = try schemesFromIds(arena, o.verify_prefs.items);
         if (o.require_any_client_certificate or o.verify_peer or o.verify_fail) {
             options.client_auth = .{ .root_ca = &trust, .auth_type = if (o.require_any_client_certificate) .require else .request };
         }
@@ -433,6 +451,8 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         if (o.key_shares != null) options.key_shares = key_shares.items;
+        if (o.signing_prefs.items.len > 0) options.signing_schemes = try schemesFromIds(arena, o.signing_prefs.items);
+        if (o.verify_prefs.items.len > 0) options.verify_schemes = try schemesFromIds(arena, o.verify_prefs.items);
         break :blk ztls.client(&tcp_reader.interface, &tcp_writer.interface, options);
     }) catch |err| switch (err) {
         error.ReadFailed => fail("handshake: transport read failed: {s}", .{@errorName(tcp_reader.err orelse error.Unknown)}),
