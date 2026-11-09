@@ -66,9 +66,9 @@ pub fn schemeAlgorithm(scheme: proto.SignatureScheme, version: cipher.Version) ?
         .rsa_pss_rsae_sha256 => .rsa_pss_sha256,
         .rsa_pss_rsae_sha384 => .rsa_pss_sha384,
         .rsa_pss_rsae_sha512 => .rsa_pss_sha512,
-        .rsa_pkcs1_sha256 => if (version == .tls12) .rsa_pkcs1_sha256 else null,
-        .rsa_pkcs1_sha384 => if (version == .tls12) .rsa_pkcs1_sha384 else null,
-        .rsa_pkcs1_sha512 => if (version == .tls12) .rsa_pkcs1_sha512 else null,
+        .rsa_pkcs1_sha256 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha256 else null,
+        .rsa_pkcs1_sha384 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha384 else null,
+        .rsa_pkcs1_sha512 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha512 else null,
         else => null,
     };
 }
@@ -399,6 +399,7 @@ pub const Handshake = struct {
     /// `raw_transcript` is on.
     fn addTranscript(h: *Handshake, bytes: []const u8) Error!void {
         h.transcript.update(bytes);
+        if (!proto.tls12_enabled) return;
         if (h.raw_transcript) |*raw| try raw.appendSlice(h.allocator, bytes);
     }
 
@@ -846,6 +847,7 @@ test "TLS 1.3 binds each ECDSA scheme to a curve" {
 }
 
 test "TLS 1.2 schemes name the hash only, and take PKCS#1 v1.5" {
+    if (!proto.tls12_enabled) return error.SkipZigTest;
     try testing.expect(schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p384 }, .tls12));
     try testing.expect(schemeSuits(.ecdsa_secp521r1_sha512, .{ .ecdsa = .p256 }, .tls12));
     try testing.expect(!schemeSuits(.ecdsa_secp256r1_sha256, .{ .rsa = 2048 }, .tls12));

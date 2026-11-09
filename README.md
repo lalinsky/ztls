@@ -18,7 +18,8 @@ Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system.
 - TLS 1.3 client and server per [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846).
 - A TLS 1.2 client, for servers that have nothing newer: ECDHE with
   AES-GCM or ChaCha20-Poly1305 and the extended master secret, and no
-  renegotiation. Older versions are refused.
+  renegotiation. Older versions are refused. The `tls12` build option,
+  set to false, leaves it out.
 - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305.
 - X25519MLKEM768, X25519, P-256 and P-384 key exchange, with
   HelloRetryRequest on both sides.

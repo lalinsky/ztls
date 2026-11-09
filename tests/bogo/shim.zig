@@ -316,7 +316,7 @@ pub fn main(init: std.process.Init) !void {
     const max_version: u16 = if (o.max_version == 0) 0x0304 else o.max_version;
     const min_version: u16 = if (o.min_version == 0) 0x0301 else o.min_version;
     const offer13 = !o.no_tls13 and min_version <= 0x0304 and max_version >= 0x0304;
-    const offer12 = !o.no_tls12 and !o.server and min_version <= 0x0303 and max_version >= 0x0303;
+    const offer12 = ztls.protocol.tls12_enabled and !o.no_tls12 and !o.server and min_version <= 0x0303 and max_version >= 0x0303;
     if (!offer13 and !offer12) unimplemented("versions {x} to {x}", .{ min_version, max_version });
 
     var named_groups: std.ArrayList(ztls.protocol.NamedGroup) = .empty;

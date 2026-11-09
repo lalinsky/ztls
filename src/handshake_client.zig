@@ -64,6 +64,9 @@ fn checkOptions(opt: config.Client) error{TlsInternalError}!void {
     if (opt.root_ca == null and !opt.insecure_skip_verify) return error.TlsInternalError;
     if (opt.host.len == 0 and !opt.insecure_skip_verify) return error.TlsInternalError;
     if (opt.named_groups.len == 0) return error.TlsInternalError;
+    if (!proto.tls12_enabled) {
+        for (opt.cipher_suites) |suite| if (suite.version() == .tls_1_2) return error.TlsInternalError;
+    }
     if (!offers(opt, .tls_1_3) and !offers(opt, .tls_1_2)) return error.TlsInternalError;
     if (offers(opt, .tls_1_3)) {
         if (opt.key_shares.len == 0) return error.TlsInternalError;
@@ -73,8 +76,11 @@ fn checkOptions(opt: config.Client) error{TlsInternalError}!void {
     }
 }
 
-/// Whether `cipher_suites` offers `version`: it does with any of its suites.
-fn offers(opt: config.Client, version: proto.Version) bool {
+/// Whether `cipher_suites` offers `version`: it does with any of its
+/// suites. Never TLS 1.2 in a build without it, which is known at compile
+/// time, so the code behind it is left out.
+fn offers(opt: config.Client, comptime version: proto.Version) bool {
+    if (version == .tls_1_2 and !proto.tls12_enabled) return false;
     for (opt.cipher_suites) |suite| {
         if (suite.version() == version) return true;
     }
@@ -109,6 +115,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     var hello = switch (try parseServerHello(msg.body, opt, session_id)) {
         .tls13 => |hello| hello,
         .tls12 => |hello| {
+            if (!proto.tls12_enabled) unreachable;
             h.setSuite(hello.suite);
             try h.hashMessage(msg);
             try tls12.run(h, opt, &random, hello);
@@ -394,12 +401,17 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
             version = .tls_1_3;
         }
     }
-    if (!offers(opt, version)) return error.TlsProtocolVersion;
+    const offered = switch (version) {
+        .tls_1_3 => offers(opt, .tls_1_3),
+        .tls_1_2 => offers(opt, .tls_1_2),
+        else => unreachable,
+    };
+    if (!offered) return error.TlsProtocolVersion;
     // One of ours, and one of the version's.
     if (std.mem.indexOfScalar(proto.CipherSuite, opt.cipher_suites, suite) == null) return error.TlsIllegalParameter;
     if (suite.version() != version) return error.TlsIllegalParameter;
 
-    if (version == .tls_1_2) return .{ .tls12 = try parseServerHelloTls12(opt, random, session_id, echoed_session_id, suite, extensions) };
+    if (version == .tls_1_2) return if (!proto.tls12_enabled) unreachable else .{ .tls12 = try parseServerHelloTls12(opt, random, session_id, echoed_session_id, suite, extensions) };
 
     const is_retry = std.mem.eql(u8, &random, &handshake.hello_retry_request_random);
     if (!std.mem.eql(u8, echoed_session_id, session_id)) return error.TlsIllegalParameter;
@@ -631,6 +643,7 @@ fn testServerHello(buf: []u8, version: proto.Version, random: *const [32]u8, ses
 }
 
 test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
+    if (!proto.tls12_enabled) return error.SkipZigTest;
     const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
     const opt: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
     const only13: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
@@ -690,4 +703,15 @@ test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
     // ALPN, as in TLS 1.3's EncryptedExtensions, but with none offered.
     const alpn = [_]u8{ 0, 16, 0, 5, 0, 3, 2, 'h', '2' };
     try testing.expectError(error.TlsUnsupportedExtension, parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, &alpn), opt, &ours));
+}
+
+test "TLS 1.2 suites are refused in a build without TLS 1.2" {
+    const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
+    const opt: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
+    if (proto.tls12_enabled) {
+        try checkOptions(opt);
+    } else {
+        try testing.expectError(error.TlsInternalError, checkOptions(opt));
+        try checkOptions(.{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined });
+    }
 }

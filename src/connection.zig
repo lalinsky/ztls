@@ -227,7 +227,7 @@ pub const Connection = struct {
                 error.ReadFailed => return error.ReadFailed,
             };
             const content_type: proto.ContentType = @enumFromInt(header[0]);
-            if (c.read.check_record_version and std.mem.readInt(u16, header[1..3], .big) != @intFromEnum(proto.Version.tls_1_2)) {
+            if (proto.tls12_enabled and c.read.check_record_version and std.mem.readInt(u16, header[1..3], .big) != @intFromEnum(proto.Version.tls_1_2)) {
                 return error.TlsProtocolVersion;
             }
             const body_len = std.mem.readInt(u16, header[3..5], .big);
@@ -356,7 +356,7 @@ pub const Connection = struct {
                     const alert = proto.Alert.decode(record.payload[0..2]);
                     // TLS 1.2 warnings other than close_notify are notes,
                     // not failures (RFC 5246 §7.2), within the cap.
-                    if (level == 1 and alert != .close_notify and c.read.keys.?.version == .tls12) {
+                    if (proto.tls12_enabled and level == 1 and alert != .close_notify and c.read.keys.?.version == .tls12) {
                         c.read.warning_alerts += 1;
                         if (c.read.warning_alerts > max_warning_alerts) {
                             c.failRead(error.TlsUnexpectedMessage);
@@ -452,6 +452,7 @@ pub const Connection = struct {
             // split its four bytes across records, and the rest changes
             // nothing.
             .tls12 => {
+                if (!proto.tls12_enabled) unreachable;
                 if (payload[0] != @intFromEnum(proto.HandshakeType.hello_request)) return error.TlsUnexpectedMessage;
                 for (payload[0..@min(payload.len, 4)]) |b| if (b != 0) return error.TlsDecodeError;
                 return error.TlsNoRenegotiation;
@@ -974,10 +975,11 @@ const every_mode = [_]Mode{
     .{ .tls13 = .aes_128_gcm_sha256 },
     .{ .tls13 = .aes_256_gcm_sha384 },
     .{ .tls13 = .chacha20_poly1305_sha256 },
+} ++ if (proto.tls12_enabled) [_]Mode{
     .{ .tls12 = .aes_128_gcm },
     .{ .tls12 = .aes_256_gcm },
     .{ .tls12 = .chacha20_poly1305 },
-};
+} else [_]Mode{};
 
 /// Both ends of a connection with pre-derived keys, over a loopback
 /// socket: the peer runs as a concurrent task.
@@ -1098,6 +1100,7 @@ test "application data both ways, then close_notify" {
 
 test "large transfers through both writers, with small and swapped reader buffers" {
     for ([_]Mode{ .{ .tls13 = .aes_128_gcm_sha256 }, .{ .tls12 = .aes_128_gcm }, .{ .tls12 = .chacha20_poly1305 } }) |mode| {
+        if (mode == .tls12 and !proto.tls12_enabled) continue;
         try largeTransfer(mode);
     }
 }
@@ -1447,6 +1450,7 @@ test "transport ending without close_notify: clean at a record boundary, truncat
 
 test "concurrent reading and writing tasks on both ends" {
     for ([_]Mode{ .{ .tls13 = .aes_128_gcm_sha256 }, .{ .tls12 = .aes_256_gcm } }) |mode| {
+        if (mode == .tls12 and !proto.tls12_enabled) continue;
         try concurrentTasks(mode);
     }
 }
@@ -1499,6 +1503,7 @@ fn concurrentTasks(mode: Mode) !void {
 }
 
 test "TLS 1.2: warning alerts are ignored, KeyUpdate is not" {
+    if (!proto.tls12_enabled) return error.SkipZigTest;
     const io = testing.io;
     var st = try SelfTalk.init(io, .{ .tls12 = .aes_128_gcm });
     defer st.deinit();
@@ -1553,6 +1558,7 @@ test "TLS 1.2: warning alerts are ignored, KeyUpdate is not" {
 }
 
 test "TLS 1.2: HelloRequest is refused with no_renegotiation" {
+    if (!proto.tls12_enabled) return error.SkipZigTest;
     const io = testing.io;
     var st = try SelfTalk.init(io, .{ .tls12 = .aes_256_gcm });
     defer st.deinit();
@@ -1589,6 +1595,7 @@ test "TLS 1.2: HelloRequest is refused with no_renegotiation" {
 }
 
 test "TLS 1.2: a fifth warning alert in a row is too many" {
+    if (!proto.tls12_enabled) return error.SkipZigTest;
     const io = testing.io;
     var st = try SelfTalk.init(io, .{ .tls12 = .chacha20_poly1305 });
     defer st.deinit();
