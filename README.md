@@ -98,11 +98,20 @@ to the transport. An alert for a failure found while reading, or a KeyUpdate
 the peer asked for, goes out with the next written record.
 
 The transport buffers must hold a whole record: `input_buffer_len` for the
-reader and `output_buffer_len` for the writer. The buffer given to `reader`
-is an ordinary `std.Io.Reader` buffer owned by the application.
-The writer has no buffer of its own and seals records inside the transport
-buffer. The `Connection` must not move once readers or writers
-exist.
+reader and `output_buffer_len` for the writer. The `Connection` must not
+move once readers or writers exist.
+
+The buffer given to `reader` is an ordinary `std.Io.Reader` buffer owned by
+the application, sized to what it needs: its size sets how far ahead the
+application can peek, for example to see a whole HTTP header. A record
+that fits in it is decrypted straight into it; a larger one is decrypted
+in the transport buffer and copied out in pieces as it is read.
+
+The writer has no buffer of its own: its buffer is the plaintext of the
+next record, inside the transport buffer, where it is sealed. A record
+carries at most 16 KiB, so that is as large as the writer's buffer gets,
+and `output_buffer_len` is all the transport needs. A larger transport
+buffer only lets several sealed records go out in one transport write.
 
 The handshake keeps about 16 KiB on the stack of the task that runs it, plus
 AWS-LC's ML-KEM working memory, so give that task at least 64 KiB of stack.
