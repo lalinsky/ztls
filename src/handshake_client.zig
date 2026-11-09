@@ -112,7 +112,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     var shares: KeyShares = if (offers(opt, .tls_1_3)) try KeyShares.generate(opt.key_shares) else .{};
     defer shares.deinit();
     // A TLS 1.2 client certificate signs the messages themselves.
-    if (offers(opt, .tls_1_2) and opt.auth != null) h.keepRawTranscript();
+    if (offers(opt, .tls_1_2) and opt.auth != null and opt.signing_schemes.len > 0) h.keepRawTranscript();
     h.record_version = @enumFromInt(0x0301);
     try writeClientHello(h, opt, &random, session_id, &shares, opt.key_shares, null);
     h.record_version = .tls_1_2;

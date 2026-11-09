@@ -169,7 +169,8 @@ pub const SelectCertificate = struct {
         accepts: *const fn (hello: *const Hello, key_type: crypto.sig.KeyType) bool,
         /// The client's signature_algorithms.
         schemes: []const proto.SignatureScheme,
-        /// The server's `signing_schemes`.
+        /// The server's `signing_schemes`, for `accepts`; a callback that
+        /// uses `acceptsKey` need not look at it.
         signing_schemes: []const proto.SignatureScheme,
 
         pub fn acceptsKey(hello: *const Hello, key_type: crypto.sig.KeyType) bool {
@@ -265,12 +266,14 @@ pub const Client = struct {
     /// Sent as signature_algorithms, and the only schemes the server may
     /// sign the handshake with: its CertificateVerify, or in TLS 1.2 its
     /// ServerKeyExchange. Signatures inside the certificate chain are
-    /// left to X.509 verification and not held to this list. Not empty,
-    /// and each one of `default_signature_schemes`.
+    /// checked by X.509 verification, not against this list, but in TLS
+    /// 1.3 the list also tells the server which chain signatures we take:
+    /// leaving out rsa_pkcs1_* may make it pick another certificate or
+    /// fail. Not empty, and each one of `default_signature_schemes`.
     verify_schemes: []const proto.SignatureScheme = &default_signature_schemes,
     /// What a client certificate's key signs with, in preference order:
     /// the first the server accepts that suits the key. Each must be one
-    /// of `default_signature_schemes`.
+    /// of `default_signature_schemes`. Empty never presents `auth`.
     signing_schemes: []const proto.SignatureScheme = &default_signature_schemes,
     /// Offered through ALPN, in preference order. Empty sends no ALPN.
     alpn_protocols: []const []const u8 = &.{},
@@ -309,8 +312,9 @@ pub const Server = struct {
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
     /// Sent in a CertificateRequest, and the only schemes a client
     /// certificate's key may sign with. Signatures inside the chain are
-    /// left to X.509 verification. Not empty, and each one of
-    /// `default_signature_schemes`.
+    /// checked by X.509 verification, not against this list, but in TLS
+    /// 1.3 the list also tells the client which chain signatures we take.
+    /// Not empty, and each one of `default_signature_schemes`.
     verify_schemes: []const proto.SignatureScheme = &default_signature_schemes,
     /// What the server signs with, in preference order: the first the
     /// client accepts that suits the certificate's key. A certificate
