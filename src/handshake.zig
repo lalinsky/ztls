@@ -266,9 +266,15 @@ pub const Handshake = struct {
     transcript: key_schedule.Transcript,
     schedule: ?key_schedule.KeySchedule = null,
     suite: proto.CipherSuite = undefined,
-    /// Received handshake bytes not yet taken as messages.
+    /// Received handshake bytes not yet taken as messages: in the last
+    /// record, where it was opened in the transport's buffer, or in
+    /// `inbox` when a message spans records. The former relies on nothing
+    /// reading `input` between handshake records.
+    pending: []const u8 = &.{},
+    /// A message that spans records, gathered from them, and what follows
+    /// it in the record it ends in. Empty otherwise, so that most
+    /// handshakes allocate nothing for it.
     inbox: std.ArrayList(u8) = .empty,
-    inbox_pos: usize = 0,
     /// A change_cipher_spec may arrive once the first ClientHello has been
     /// sent or received (§5).
     ccs_allowed: bool = false,
@@ -305,18 +311,18 @@ pub const Handshake = struct {
     // Receiving
 
     /// The next handshake message from the peer, whole, reassembled across
-    /// records if need be. It lives until the next call. The caller hashes
+    /// records if need be. It is valid until the next record is read, by
+    /// the next `nextMessage` or `readChangeCipherSpec`. The caller hashes
     /// it into the transcript (`hashMessage`) once it is dealt with.
     pub fn nextMessage(h: *Handshake) Error!Message {
         while (true) {
-            const pending = h.inbox.items[h.inbox_pos..];
-            if (pending.len >= 4) {
-                const len = std.mem.readInt(u24, pending[1..4], .big);
+            if (h.pending.len >= 4) {
+                const len = std.mem.readInt(u24, h.pending[1..4], .big);
                 // Bigger than we take; the peer's doing, so it hears so.
                 if (len > h.max_message_len) return error.TlsIllegalParameter;
-                if (pending.len >= 4 + len) {
-                    const raw = pending[0 .. 4 + len];
-                    h.inbox_pos += raw.len;
+                if (h.pending.len >= 4 + len) {
+                    const raw = h.pending[0 .. 4 + len];
+                    h.pending = h.pending[raw.len..];
                     return .{ .handshake_type = @enumFromInt(raw[0]), .body = raw[4..], .raw = raw };
                 }
             }
@@ -324,26 +330,49 @@ pub const Handshake = struct {
         }
     }
 
-    /// Appends the next handshake record's payload to the inbox. Alerts
-    /// end the handshake; application data is out of place.
+    /// Reads the next handshake record. Its payload is used where it was
+    /// opened, unless part of a message is pending: then it joins that in
+    /// the inbox. Alerts end the handshake; application data is out of
+    /// place.
     fn readHandshakeRecord(h: *Handshake) Error!void {
-        if (h.inbox_pos == h.inbox.items.len) {
-            h.inbox.clearRetainingCapacity();
-            h.inbox_pos = 0;
-        } else if (h.inbox_pos > 0) {
-            const kept = h.inbox.items.len - h.inbox_pos;
-            std.mem.copyForwards(u8, h.inbox.items[0..kept], h.inbox.items[h.inbox_pos..]);
-            h.inbox.shrinkRetainingCapacity(kept);
-            h.inbox_pos = 0;
-        }
+        // The next read may reuse the transport buffer that pending bytes
+        // from the last record are in: they move to the inbox first. With
+        // nothing pending, the last message is done with, and the inbox
+        // is free for the next one that spans records.
+        if (h.pending.len > 0) try h.spill() else h.inbox.clearRetainingCapacity();
         // Not between the fragments of a message: nothing may come between
         // those (§5.1).
-        h.conn.read.ccs = if (h.ccs_allowed and h.inbox.items.len == 0) .drop else .refuse;
+        h.conn.read.ccs = if (h.ccs_allowed and h.pending.len == 0) .drop else .refuse;
         const record = try h.readRecord();
         if (record.content_type != .handshake) return error.TlsUnexpectedMessage;
         if (record.payload.len == 0) return error.TlsUnexpectedMessage;
-        if (h.inbox.items.len + record.payload.len > h.max_message_len + 4 + cipher.max_plaintext_len) return error.TlsIllegalParameter;
+        if (h.pending.len == 0) {
+            h.pending = record.payload;
+            return;
+        }
+        // The inbox holds less than one message, which `nextMessage` caps
+        // at `max_message_len`, so it stays bounded.
         try h.inbox.appendSlice(h.allocator, record.payload);
+        h.pending = h.inbox.items;
+    }
+
+    /// Moves the pending bytes, a message not yet whole, to the start of
+    /// the inbox, with room for all of it once its length is known.
+    fn spill(h: *Handshake) Error!void {
+        const len = h.pending.len;
+        // In the inbox, pending is what is left at its end.
+        assert(h.inbox.items.len == 0 or h.pending.ptr + len == h.inbox.items.ptr + h.inbox.items.len);
+        const total = if (len >= 4) 4 + @as(usize, std.mem.readInt(u24, h.pending[1..4], .big)) else len;
+        if (h.inbox.items.len > 0) {
+            // Already in the inbox, at its end.
+            std.mem.copyForwards(u8, h.inbox.items[0..len], h.pending);
+            h.inbox.shrinkRetainingCapacity(len);
+            try h.inbox.ensureTotalCapacityPrecise(h.allocator, total);
+        } else {
+            try h.inbox.ensureTotalCapacityPrecise(h.allocator, total);
+            h.inbox.appendSliceAssumeCapacity(h.pending);
+        }
+        h.pending = h.inbox.items;
     }
 
     /// The next record that is not an alert to carry on past. Alerts end
@@ -378,7 +407,7 @@ pub const Handshake = struct {
     /// message boundary (RFC 5246 §7.1); the caller then switches the read
     /// keys.
     pub fn readChangeCipherSpec(h: *Handshake) Error!void {
-        if (h.inbox_pos != h.inbox.items.len) return error.TlsUnexpectedMessage;
+        if (h.pending.len != 0) return error.TlsUnexpectedMessage;
         h.conn.read.ccs = .deliver;
         defer h.conn.read.ccs = .refuse;
         const record = try h.readRecord();
@@ -569,14 +598,14 @@ pub const Handshake = struct {
     /// same record is the peer getting ahead of what it can know, and is
     /// refused (as with a key change).
     pub fn expectFlightEnd(h: *Handshake) Error!void {
-        if (h.inbox_pos != h.inbox.items.len) return error.TlsUnexpectedMessage;
+        if (h.pending.len != 0) return error.TlsUnexpectedMessage;
     }
 
     /// A key change must fall on a record boundary (§5.1): a message
     /// already received under the old keys that would be read under the
     /// new ones is a violation.
     pub fn installReadKeys(h: *Handshake, secret: Secret) Error!void {
-        if (h.inbox_pos != h.inbox.items.len) return error.TlsUnexpectedMessage;
+        if (h.pending.len != 0) return error.TlsUnexpectedMessage;
         if (h.conn.read.keys) |*old| old.deinit();
         h.conn.read.keys = cipher.Keys.init(h.suite, secret) catch return error.TlsInternalError;
     }
@@ -1012,4 +1041,63 @@ test "an empty certificate and the request context" {
     try testing.expectEqualSlices(u8, &.{ 22, 3, 3, 0, 11, 11, 0, 0, 7, 3, 'c', 't', 'x', 0, 0, 0 }, output.buffered());
     try testing.expectEqual(null, try h.parseCertificate(output.buffered()[9..], "ctx"));
     try testing.expectError(error.TlsIllegalParameter, h.parseCertificate(output.buffered()[9..], ""));
+}
+
+/// Plaintext handshake records of at most `fragment` bytes each, carrying
+/// `messages` back to back.
+fn testFragments(buf: []u8, messages: []const u8, fragment: usize) ![]const u8 {
+    var w = codec.Writer.init(buf);
+    var rest = messages;
+    while (rest.len > 0) {
+        const n = @min(fragment, rest.len);
+        try w.enumValue(proto.ContentType.handshake);
+        try w.enumValue(proto.Version.tls_1_2);
+        try w.vector(u16, rest[0..n]);
+        rest = rest[n..];
+    }
+    return w.written();
+}
+
+test "messages are taken from records whole, split, or several to a record" {
+    var messages: [4 + 3 + 4 + 300 + 4 + 0 + 4 + 40]u8 = undefined;
+    {
+        var w = codec.Writer.init(&messages);
+        try w.enumValue(proto.HandshakeType.server_hello);
+        try w.vector(u24, "abc");
+        try w.enumValue(proto.HandshakeType.certificate);
+        try w.vector(u24, &@as([300]u8, @splat(7)));
+        try w.enumValue(proto.HandshakeType.server_hello_done);
+        try w.vector(u24, "");
+        try w.enumValue(proto.HandshakeType.finished);
+        try w.vector(u24, &@as([40]u8, @splat(9)));
+        assert(w.written().len == messages.len);
+    }
+    for ([_]usize{ 1, 2, 3, 5, 7, 100, 305, 311, messages.len }) |fragment| {
+        var wire: [4096]u8 = undefined;
+        var input: Io.Reader = .fixed(try testFragments(&wire, &messages, fragment));
+        var input_buffer: [@import("connection.zig").input_buffer_len]u8 = undefined;
+        var limited = input.limited(.unlimited, &input_buffer);
+        var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
+        var output: Io.Writer = .fixed(&output_buffer);
+        var conn = Connection.init(&limited.interface, &output);
+        var counting: testu.CountingAllocator = .init(testing.allocator);
+        var h = Handshake.init(&conn, counting.allocator(), 1024);
+        defer h.deinit();
+
+        var at: usize = 0;
+        for ([_]proto.HandshakeType{ .server_hello, .certificate, .server_hello_done, .finished }) |expected| {
+            const msg = try h.nextMessage();
+            try testing.expectEqual(expected, msg.handshake_type);
+            try testing.expectEqualSlices(u8, messages[at..][0..msg.raw.len], msg.raw);
+            at += msg.raw.len;
+        }
+        try testing.expectEqual(messages.len, at);
+        try h.expectFlightEnd();
+        // Each message whole in a record: nothing copied. Split: an
+        // allocation for a message once its length is known, and a few
+        // more when even its header comes a byte at a time.
+        if (fragment >= 311) try testing.expectEqual(0, counting.allocs);
+        if (fragment >= 7) try testing.expect(counting.allocs <= 2);
+        try testing.expect(counting.allocs <= 4);
+    }
 }

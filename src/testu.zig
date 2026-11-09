@@ -12,6 +12,47 @@ pub fn hexToBytes(comptime hex: []const u8) [removeNonHex(hex).len / 2]u8 {
     return res;
 }
 
+/// Wraps an allocator and counts how often it gets memory: allocations,
+/// and resizes and remaps that grow, since either may have to map pages.
+/// A resize that fails, before an allocation, is not counted.
+pub const CountingAllocator = struct {
+    child: std.mem.Allocator,
+    allocs: usize = 0,
+
+    pub fn init(child: std.mem.Allocator) CountingAllocator {
+        return .{ .child = child };
+    }
+
+    pub fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.allocs += 1;
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ok = self.child.rawResize(memory, alignment, new_len, ret_addr);
+        if (ok and new_len > memory.len) self.allocs += 1;
+        return ok;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const new = self.child.rawRemap(memory, alignment, new_len, ret_addr);
+        if (new != null and new_len > memory.len) self.allocs += 1;
+        return new;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 fn removeNonHex(comptime hex: []const u8) []const u8 {
     @setEvalBranchQuota(1000 * 100);
     var res: [hex.len]u8 = undefined;
