@@ -41,8 +41,10 @@ const seal_spill = cipher.seal_overhead + key_update_record_len;
 const max_idle_records = 32;
 /// KeyUpdates a sender may make over a connection's life (§4.7.3).
 const max_key_updates: u64 = (1 << 48) - 1;
-/// The longest NewSessionTicket body (§4.6.1): lifetime, age_add, a nonce,
-/// a ticket and extensions, each at its largest.
+/// The shortest and longest NewSessionTicket bodies (§4.6.1): lifetime,
+/// age_add, a nonce, a ticket and extensions, each at its least and its
+/// largest. The ticket has at least one byte.
+const min_ticket_len = 4 + 4 + 1 + (2 + 1) + 2;
 const max_ticket_len = 4 + 4 + (1 + 255) + (2 + 0xffff) + (2 + 0xffff);
 
 /// Warning alerts a peer may send in a row, with no other record between
@@ -140,10 +142,11 @@ pub const Connection = struct {
 
     /// A TLS 1.3 post-handshake message whose records have not all come
     /// (§5.1). Nothing is kept of a NewSessionTicket but how much of it
-    /// is still to be skipped, so no message needs a buffer.
+    /// is still to be skipped, and a KeyUpdate's body is one byte, read
+    /// from the record that ends it, so no message needs a buffer.
     pub const PartialMessage = struct {
-        /// The header, then a KeyUpdate's one-byte body.
-        head: [key_update_msg_len]u8 = undefined,
+        /// The header.
+        head: [4]u8 = undefined,
         /// How much of `head` has come; 0 between messages.
         len: u8 = 0,
         /// The NewSessionTicket body bytes still to skip.
@@ -506,7 +509,7 @@ pub const Connection = struct {
                     @intFromEnum(proto.HandshakeType.key_update) => if (body_len != 1) return error.TlsDecodeError,
                     @intFromEnum(proto.HandshakeType.new_session_ticket) => {
                         if (c.side == .server) return error.TlsUnexpectedMessage;
-                        if (body_len > max_ticket_len) return error.TlsDecodeError;
+                        if (body_len < min_ticket_len or body_len > max_ticket_len) return error.TlsDecodeError;
                         m.skip = body_len;
                     },
                     else => return error.TlsUnexpectedMessage,
@@ -735,6 +738,8 @@ pub const Connection = struct {
         // Set before the request goes out, so the answer cannot be
         // read before it is.
         const awaited = c.shared.key_update_awaited.swap(true, .monotonic);
+        // This update answers a request of the peer's, if one is waiting.
+        c.shared.key_update_requested.store(false, .monotonic);
         const request: proto.KeyUpdateRequest = if (awaited) .update_not_requested else .update_requested;
         c.sendKeyUpdate(request, tls13) catch |err| return c.failWrite(err);
         try c.flushOutput();
@@ -1334,17 +1339,17 @@ test "post-handshake messages split across records and sharing them" {
             defer end.deinit();
             // A ticket in three pieces, the header itself split; then a
             // KeyUpdate that starts in the ticket's last record and ends
-            // a record of its own; then an empty ticket and a KeyUpdate
-            // whole in one record.
+            // a record of its own; then a ticket and a KeyUpdate whole in
+            // one record.
             const records = [_][]const u8{
                 &.{ nst, 0 },
-                &.{ 0, 6, 1, 2 },
-                &.{ 3, 4, 5, 6, ku, 0 },
+                &.{ 0, 14, 1, 2, 3, 4, 5 },
+                &.{ 6, 7, 8, 9, 10, 11, 12, 13, 14, ku, 0 },
                 &.{ 0, 1, 0 },
             };
             for (records) |payload| try end.conn.writeRecord(.handshake, payload);
             try end.conn.advanceWriteKeys(&end.conn.write.keys.?.version.tls13);
-            try end.conn.writeRecord(.handshake, &.{ nst, 0, 0, 0, ku, 0, 0, 1, 0 });
+            try end.conn.writeRecord(.handshake, &[_]u8{ nst, 0, 0, 14 } ++ @as([14]u8, @splat(0)) ++ [_]u8{ ku, 0, 0, 1, 0 });
             try end.conn.advanceWriteKeys(&end.conn.write.keys.?.version.tls13);
             try end.conn.writeRecord(.application_data, "hi\n");
             try end.conn.flushOutput();
@@ -1381,12 +1386,13 @@ test "malformed post-handshake records" {
         .{ .records = &.{.{ .payload = &.{ ku, 0, 0, 1, 0, nst } }}, .expected = error.TlsUnexpectedMessage },
         // A request that is neither.
         .{ .records = &.{.{ .payload = &.{ ku, 0, 0, 1, 2 } }}, .expected = error.TlsIllegalParameter },
-        // A ticket longer than any can be.
+        // A ticket longer or shorter than any can be.
         .{ .records = &.{.{ .payload = &.{ nst, 0xff, 0xff, 0xff } }}, .expected = error.TlsDecodeError },
+        .{ .records = &.{.{ .payload = &.{ nst, 0, 0, 13 } }}, .expected = error.TlsDecodeError },
         // A message only a handshake has.
         .{ .records = &.{.{ .payload = &.{ @intFromEnum(proto.HandshakeType.finished), 0, 0, 0 } }}, .expected = error.TlsUnexpectedMessage },
         // Application data, or an alert, between a message's pieces.
-        .{ .records = &.{ .{ .payload = &.{ nst, 0, 0, 2, 0 } }, .{ .content_type = .application_data, .payload = "x" } }, .expected = error.TlsUnexpectedMessage },
+        .{ .records = &.{ .{ .payload = &.{ nst, 0, 0, 14, 0 } }, .{ .content_type = .application_data, .payload = "x" } }, .expected = error.TlsUnexpectedMessage },
         .{ .records = &.{ .{ .payload = &.{ ku, 0 } }, .{ .content_type = .alert, .payload = &.{ 1, 0 } } }, .expected = error.TlsUnexpectedMessage },
         // A ticket sent to a server.
         .{ .side = .server, .records = &.{.{ .payload = &.{ nst, 0, 0, 0 } }}, .expected = error.TlsUnexpectedMessage },
