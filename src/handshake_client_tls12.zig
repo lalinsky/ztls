@@ -64,7 +64,7 @@ pub fn run(h: *Handshake, opt: config.Client, client_random: *const [32]u8, hell
     msg = try h.nextMessage();
     var request: ?CertificateRequest = null;
     if (msg.handshake_type == .certificate_request) {
-        request = try parseCertificateRequest(msg.body, opt.auth);
+        request = try parseCertificateRequest(msg.body, opt.auth, opt.signing_schemes);
         try h.hashMessage(msg);
         msg = try h.nextMessage();
     }
@@ -208,7 +208,7 @@ fn parseServerKeyExchange(body: []const u8, opt: config.Client, public_key: *con
         .x25519, .secp256r1, .secp384r1 => {},
         else => return error.TlsIllegalParameter,
     }
-    if (std.mem.indexOfScalar(proto.SignatureScheme, &handshake.signature_algorithms, scheme) == null) return error.TlsIllegalParameter;
+    if (std.mem.indexOfScalar(proto.SignatureScheme, opt.verify_schemes, scheme) == null) return error.TlsIllegalParameter;
     if (!handshake.schemeSuits(scheme, public_key.key_type, .tls12)) return error.TlsIllegalParameter;
     const algorithm = handshake.schemeAlgorithm(scheme, .tls12).?;
 
@@ -239,7 +239,7 @@ const ecdsa_sign = 64;
 /// A TLS 1.2 CertificateRequest (RFC 5246 §7.4.4): the kinds of key and
 /// the schemes the server takes, and the authorities it trusts, which
 /// only narrow what it would like; we offer what we have.
-fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair) Error!CertificateRequest {
+fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair, signing: []const proto.SignatureScheme) Error!CertificateRequest {
     var d = codec.Decoder.init(body);
     const types = try d.vectorBytes(u8);
     if (types.len == 0) return error.TlsDecodeError;
@@ -270,8 +270,8 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair) E
     if (std.mem.indexOfScalar(u8, types, wanted_type) == null) return .{ .scheme = null };
     // A scheme naming our key's curve first, as TLS 1.3 would have it,
     // then any the key can sign under in TLS 1.2.
-    const scheme = handshake.selectScheme(key_type, offered[0..n], .tls13) orelse
-        handshake.selectScheme(key_type, offered[0..n], .tls12);
+    const scheme = handshake.selectScheme(signing, key_type, offered[0..n], .tls13) orelse
+        handshake.selectScheme(signing, key_type, offered[0..n], .tls12);
     return .{ .scheme = scheme };
 }
 
@@ -440,23 +440,23 @@ test "a CertificateRequest picks our key's scheme, curve first, if its types all
     var buf: [128]u8 = undefined;
 
     // The P-256 key: its own curve's scheme when offered, else another.
-    var r = try parseCertificateRequest(try request(&buf, &.{ rsa_sign, ecdsa_sign }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp384r1_sha384, .ecdsa_secp256r1_sha256 }), &ec);
+    var r = try parseCertificateRequest(try request(&buf, &.{ rsa_sign, ecdsa_sign }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp384r1_sha384, .ecdsa_secp256r1_sha256 }), &ec, &config.default_signature_schemes);
     try testing.expectEqual(Scheme.ecdsa_secp256r1_sha256, r.scheme.?);
-    r = try parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{.ecdsa_secp384r1_sha384}), &ec);
+    r = try parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{.ecdsa_secp384r1_sha384}), &ec, &config.default_signature_schemes);
     try testing.expectEqual(Scheme.ecdsa_secp384r1_sha384, r.scheme.?);
     // Not when the types leave EC keys out, nor with no scheme for it.
-    r = try parseCertificateRequest(try request(&buf, &.{rsa_sign}, &.{.ecdsa_secp256r1_sha256}), &ec);
+    r = try parseCertificateRequest(try request(&buf, &.{rsa_sign}, &.{.ecdsa_secp256r1_sha256}), &ec, &config.default_signature_schemes);
     try testing.expectEqual(null, r.scheme);
-    r = try parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{.rsa_pkcs1_sha256}), &ec);
+    r = try parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{.rsa_pkcs1_sha256}), &ec, &config.default_signature_schemes);
     try testing.expectEqual(null, r.scheme);
     // RSA: PSS first, PKCS#1 v1.5 when that is all there is.
-    r = try parseCertificateRequest(try request(&buf, &.{rsa_sign}, &.{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha256 }), &rsa);
+    r = try parseCertificateRequest(try request(&buf, &.{rsa_sign}, &.{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha256 }), &rsa, &config.default_signature_schemes);
     try testing.expectEqual(Scheme.rsa_pss_rsae_sha256, r.scheme.?);
-    r = try parseCertificateRequest(try request(&buf, &.{rsa_sign}, &.{.rsa_pkcs1_sha384}), &rsa);
+    r = try parseCertificateRequest(try request(&buf, &.{rsa_sign}, &.{.rsa_pkcs1_sha384}), &rsa, &config.default_signature_schemes);
     try testing.expectEqual(Scheme.rsa_pkcs1_sha384, r.scheme.?);
     // No certificate configured; and malformed lists.
-    r = try parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{.ecdsa_secp256r1_sha256}), null);
+    r = try parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{.ecdsa_secp256r1_sha256}), null, &config.default_signature_schemes);
     try testing.expectEqual(null, r.scheme);
-    try testing.expectError(error.TlsDecodeError, parseCertificateRequest(try request(&buf, &.{}, &.{.ecdsa_secp256r1_sha256}), &ec));
-    try testing.expectError(error.TlsDecodeError, parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{}), &ec));
+    try testing.expectError(error.TlsDecodeError, parseCertificateRequest(try request(&buf, &.{}, &.{.ecdsa_secp256r1_sha256}), &ec, &config.default_signature_schemes));
+    try testing.expectError(error.TlsDecodeError, parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{}), &ec, &config.default_signature_schemes));
 }

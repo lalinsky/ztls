@@ -14,12 +14,18 @@ const Error = handshake.Error;
 const Connection = @import("connection.zig").Connection;
 
 pub fn run(conn: *Connection, options: config.Server) Error!void {
+    try checkOptions(options);
     var h = Handshake.init(conn, options.allocator, options.max_handshake_message_len);
     defer h.deinit();
     handshakeInner(&h, options) catch |err| {
         h.sendAlert(err);
         return err;
     };
+}
+
+fn checkOptions(opt: config.Server) error{TlsInternalError}!void {
+    if (opt.verify_schemes.len == 0 or opt.signing_schemes.len == 0) return error.TlsInternalError;
+    if (!handshake.schemesSupported(opt.verify_schemes) or !handshake.schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
 }
 
 /// What a ClientHello offers. Slices point into the message.
@@ -152,7 +158,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     if (!retried) h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
 
     try writeEncryptedExtensions(h, choices.alpn);
-    if (opt.client_auth != null) try writeCertificateRequest(h);
+    if (opt.client_auth != null) try writeCertificateRequest(h, opt.verify_schemes);
     try h.writeCertificate("", auth);
     try h.writeCertificateVerify(auth, choices.scheme, .server);
     try h.writeFinished(&hs.server);
@@ -174,7 +180,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
             try h.hashMessage(msg);
             msg = try h.nextMessage();
             try h.expect(msg, .certificate_verify);
-            try h.verifyCertificateVerify(msg.body, &peer.public_key, .client);
+            try h.verifyCertificateVerify(msg.body, &peer.public_key, .client, opt.verify_schemes);
             try h.hashMessage(msg);
         } else {
             if (client_auth.auth_type == .require) return error.TlsCertificateRequired;
@@ -198,11 +204,16 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
 fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const config.CertKeyPair {
     const schemes = hello.schemes[0 .. hello.schemes_len orelse 0];
     if (opt.select_certificate) |select| {
-        const info: config.SelectCertificate.Hello = .{ .server_name = hello.server_name, .accepts = acceptsKey, .schemes = schemes };
+        const info: config.SelectCertificate.Hello = .{
+            .server_name = hello.server_name,
+            .accepts = acceptsKey,
+            .schemes = schemes,
+            .signing_schemes = opt.signing_schemes,
+        };
         if (select.callback(select.context, info)) |pair| return pair;
     }
     for (opt.certificates) |pair| {
-        if (handshake.selectScheme(pair.key.key_type, schemes, .tls13) == null) continue;
+        if (handshake.selectScheme(opt.signing_schemes, pair.key.key_type, schemes, .tls13) == null) continue;
         if (hello.server_name) |name| {
             if (!pair.leaf.matchesHost(name)) continue;
         }
@@ -211,8 +222,8 @@ fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const
     return opt.auth orelse error.TlsUnrecognizedName;
 }
 
-fn acceptsKey(info: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
-    return handshake.selectScheme(key_type, info.schemes, .tls13) != null;
+fn acceptsKey(hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
+    return handshake.selectScheme(hello.signing_schemes, key_type, hello.schemes, .tls13) != null;
 }
 
 /// Picks the suite, group, signature scheme and ALPN protocol, or says
@@ -233,7 +244,7 @@ fn choose(hello: *const ClientHello, opt: config.Server, auth: *const config.Cer
     } else return error.TlsHandshakeFailure;
 
     const schemes = hello.schemes[0 .. hello.schemes_len orelse return error.TlsMissingExtension];
-    const scheme = handshake.selectScheme(auth.key.key_type, schemes, .tls13) orelse return error.TlsHandshakeFailure;
+    const scheme = handshake.selectScheme(opt.signing_schemes, auth.key.key_type, schemes, .tls13) orelse return error.TlsHandshakeFailure;
 
     return .{ .suite = suite, .group = group, .scheme = scheme, .alpn = try selectAlpn(opt.alpn_protocols, hello.alpn) };
 }
@@ -459,21 +470,21 @@ fn buildEncryptedExtensions(w: *codec.Writer, alpn: ?[]const u8) codec.Writer.Er
     try message.end(w);
 }
 
-fn writeCertificateRequest(h: *Handshake) Error!void {
+fn writeCertificateRequest(h: *Handshake, verify_schemes: []const proto.SignatureScheme) Error!void {
     var buf: [128]u8 = undefined;
     var w = codec.Writer.init(&buf);
-    buildCertificateRequest(&w) catch return error.TlsInternalError;
+    buildCertificateRequest(&w, verify_schemes) catch return error.TlsInternalError;
     try h.writeMessage(w.written());
 }
 
-fn buildCertificateRequest(w: *codec.Writer) codec.Writer.Error!void {
+fn buildCertificateRequest(w: *codec.Writer, verify_schemes: []const proto.SignatureScheme) codec.Writer.Error!void {
     try w.enumValue(proto.HandshakeType.certificate_request);
     const message = try w.beginLength(u24);
     try w.vector(u8, &.{}); // certificate_request_context: none outside post-handshake auth
     const extensions = try w.beginLength(u16);
     try w.enumValue(proto.Extension.signature_algorithms);
     const ext = try w.beginLength(u16);
-    try w.enumList(&handshake.signature_algorithms);
+    try w.enumList(verify_schemes);
     try ext.end(w);
     try extensions.end(w);
     try message.end(w);

@@ -164,9 +164,14 @@ pub const SelectCertificate = struct {
     pub const Hello = struct {
         /// The server_name extension's host name, if any.
         server_name: ?[]const u8,
-        /// Whether the client can verify signatures by a key of this type.
+        /// Whether the client can verify signatures by a key of this type,
+        /// under a scheme in the server's `signing_schemes`.
         accepts: *const fn (hello: *const Hello, key_type: crypto.sig.KeyType) bool,
+        /// The client's signature_algorithms.
         schemes: []const proto.SignatureScheme,
+        /// The server's `signing_schemes`, for `accepts`; a callback that
+        /// uses `acceptsKey` need not look at it.
+        signing_schemes: []const proto.SignatureScheme,
 
         pub fn acceptsKey(hello: *const Hello, key_type: crypto.sig.KeyType) bool {
             return hello.accepts(hello, key_type);
@@ -213,6 +218,23 @@ pub const default_server_named_groups = default_named_groups;
 /// The groups a client sends key shares for in its first ClientHello:
 /// the ones a server is likely to pick, so a HelloRetryRequest is rare.
 pub const default_key_shares = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519 };
+/// Every signature scheme ztls implements, in preference order, and the
+/// default for both `verify_schemes` and `signing_schemes`. In TLS 1.3
+/// the rsa_pkcs1 ones only tell the peer which certificate signatures we
+/// accept; they never sign a CertificateVerify. In TLS 1.2 they sign
+/// handshakes too.
+pub const default_signature_schemes = [_]proto.SignatureScheme{
+    .ecdsa_secp256r1_sha256,
+    .ecdsa_secp384r1_sha384,
+    .ecdsa_secp521r1_sha512,
+    .ed25519,
+    .rsa_pss_rsae_sha256,
+    .rsa_pss_rsae_sha384,
+    .rsa_pss_rsae_sha512,
+    .rsa_pkcs1_sha256,
+    .rsa_pkcs1_sha384,
+    .rsa_pkcs1_sha512,
+};
 
 pub const Client = struct {
     /// For the handshake's working memory: the peer's messages are
@@ -241,6 +263,18 @@ pub const Client = struct {
     named_groups: []const proto.NamedGroup = &default_named_groups,
     /// Groups to send key shares for; each must be in `named_groups`.
     key_shares: []const proto.NamedGroup = &default_key_shares,
+    /// Sent as signature_algorithms, and the only schemes the server may
+    /// sign the handshake with: its CertificateVerify, or in TLS 1.2 its
+    /// ServerKeyExchange. Signatures inside the certificate chain are
+    /// checked by X.509 verification, not against this list, but in TLS
+    /// 1.3 the list also tells the server which chain signatures we take:
+    /// leaving out rsa_pkcs1_* may make it pick another certificate or
+    /// fail. Not empty, and each one of `default_signature_schemes`.
+    verify_schemes: []const proto.SignatureScheme = &default_signature_schemes,
+    /// What a client certificate's key signs with, in preference order:
+    /// the first the server accepts that suits the key. Each must be one
+    /// of `default_signature_schemes`. Empty never presents `auth`.
+    signing_schemes: []const proto.SignatureScheme = &default_signature_schemes,
     /// Offered through ALPN, in preference order. Empty sends no ALPN.
     alpn_protocols: []const []const u8 = &.{},
     /// For certificate validity.
@@ -276,6 +310,17 @@ pub const Server = struct {
     /// default; any other is followed as given.
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
+    /// Sent in a CertificateRequest, and the only schemes a client
+    /// certificate's key may sign with. Signatures inside the chain are
+    /// checked by X.509 verification, not against this list, but in TLS
+    /// 1.3 the list also tells the client which chain signatures we take.
+    /// Not empty, and each one of `default_signature_schemes`.
+    verify_schemes: []const proto.SignatureScheme = &default_signature_schemes,
+    /// What the server signs with, in preference order: the first the
+    /// client accepts that suits the certificate's key. A certificate
+    /// with no such scheme is passed over. Not empty, and each one of
+    /// `default_signature_schemes`.
+    signing_schemes: []const proto.SignatureScheme = &default_signature_schemes,
     /// Supported, in preference order. A client whose offer shares none
     /// is refused with no_application_protocol; one that offers none
     /// gets none. Empty disables ALPN.
