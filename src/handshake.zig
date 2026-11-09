@@ -279,6 +279,8 @@ pub const Handshake = struct {
     tolerate_warnings: bool = false,
     /// Warning alerts in a row, capped as on an open connection.
     warning_alerts: u32 = 0,
+    /// The handshake messages so far, while `keepRawTranscript` is on.
+    raw_transcript: ?std.ArrayList(u8) = null,
     /// legacy_record_version of the plaintext records we write. A client's
     /// first ClientHello says TLS 1.0, as every major stack's does and
     /// RFC 9846 §5.1 allows, for servers that choke on anything newer.
@@ -295,6 +297,7 @@ pub const Handshake = struct {
 
     pub fn deinit(h: *Handshake) void {
         h.inbox.deinit(h.allocator);
+        h.dropRawTranscript();
         if (h.schedule) |*s| s.deinit();
         h.* = undefined;
     }
@@ -388,8 +391,28 @@ pub const Handshake = struct {
         if (message.handshake_type != handshake_type) return error.TlsUnexpectedMessage;
     }
 
-    pub fn hashMessage(h: *Handshake, message: Message) void {
-        h.transcript.update(message.raw);
+    pub fn hashMessage(h: *Handshake, message: Message) Error!void {
+        try h.addTranscript(message.raw);
+    }
+
+    /// Hashes `bytes` into the transcript, and keeps them too while
+    /// `raw_transcript` is on.
+    fn addTranscript(h: *Handshake, bytes: []const u8) Error!void {
+        h.transcript.update(bytes);
+        if (h.raw_transcript) |*raw| try raw.appendSlice(h.allocator, bytes);
+    }
+
+    /// Starts keeping the handshake messages themselves, for a TLS 1.2
+    /// CertificateVerify, which signs them rather than their hash
+    /// (RFC 5246 §7.4.8) with whatever hash the server lets us use.
+    pub fn keepRawTranscript(h: *Handshake) void {
+        assert(h.raw_transcript == null);
+        h.raw_transcript = .empty;
+    }
+
+    pub fn dropRawTranscript(h: *Handshake) void {
+        if (h.raw_transcript) |*raw| raw.deinit(h.allocator);
+        h.raw_transcript = null;
     }
 
     // Sending
@@ -404,7 +427,7 @@ pub const Handshake = struct {
         len: usize = 0,
 
         pub fn write(w: *MessageWriter, bytes: []const u8) Error!void {
-            w.h.transcript.update(bytes);
+            try w.h.addTranscript(bytes);
             var rest = bytes;
             while (rest.len > 0) {
                 if (w.len == w.window.len) try w.flushRecord();
@@ -607,9 +630,19 @@ pub const Handshake = struct {
     pub fn writeCertificateVerify(h: *Handshake, pair: *const config.CertKeyPair, scheme: proto.SignatureScheme, side: proto.Side) Error!void {
         var content_buf: [64 + 33 + 1 + crypto.hash.max_digest_length]u8 = undefined;
         const content = h.certificateVerifyContent(side, &content_buf);
+        try h.writeSignedCertificateVerify(pair, scheme, schemeAlgorithm(scheme, .tls13).?, content);
+    }
+
+    /// TLS 1.2's CertificateVerify (RFC 5246 §7.4.8): the handshake
+    /// messages so far, signed whole, which `keepRawTranscript` kept.
+    pub fn writeCertificateVerifyTls12(h: *Handshake, pair: *const config.CertKeyPair, scheme: proto.SignatureScheme) Error!void {
+        const content = h.raw_transcript.?.items;
+        try h.writeSignedCertificateVerify(pair, scheme, schemeAlgorithm(scheme, .tls12).?, content);
+    }
+
+    fn writeSignedCertificateVerify(h: *Handshake, pair: *const config.CertKeyPair, scheme: proto.SignatureScheme, algorithm: sig.Algorithm, content: []const u8) Error!void {
         var signature_buf: [1024]u8 = undefined;
         if (pair.key.maxSignatureLength() > signature_buf.len) return error.TlsInternalError;
-        const algorithm = schemeAlgorithm(scheme, .tls13).?;
         const signature = if (pair.signer) |s| blk: {
             const signed = s.sign(s.context, &pair.key, algorithm, content, &signature_buf) catch return error.TlsInternalError;
             // The hook's result has to be a slice of the buffer it was
@@ -914,19 +947,19 @@ test "certificate, certificate verify and finished round-trip through records" {
     try receiver.verifyChain(&peer, &store, .server, "127.0.0.1", 1_800_000_000);
     try testing.expectError(error.CertificateHostMismatch, receiver.verifyChain(&peer, &store, .server, "example.org", 1_800_000_000));
     try testing.expectError(error.CertificateNotYetValid, receiver.verifyChain(&peer, &store, .server, "localhost", 1_000_000_000));
-    receiver.hashMessage(msg);
+    try receiver.hashMessage(msg);
 
     msg = try receiver.nextMessage();
     try receiver.expect(msg, .certificate_verify);
     try receiver.verifyCertificateVerify(msg.body, &peer.public_key, .server);
     try testing.expectError(error.TlsDecryptError, receiver.verifyCertificateVerify(msg.body, &peer.public_key, .client));
-    receiver.hashMessage(msg);
+    try receiver.hashMessage(msg);
 
     msg = try receiver.nextMessage();
     try receiver.expect(msg, .finished);
     try receiver.verifyFinished(msg.body, &peer_secrets.server);
     try testing.expectError(error.TlsDecryptError, receiver.verifyFinished(msg.body, &peer_secrets.client));
-    receiver.hashMessage(msg);
+    try receiver.hashMessage(msg);
 
     // Both transcripts agree, and the sender's hashed exactly what it sent.
     var received_hash: [crypto.hash.max_digest_length]u8 = undefined;

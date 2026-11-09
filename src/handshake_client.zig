@@ -93,6 +93,8 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 
     var shares: KeyShares = if (offers(opt, .tls_1_3)) try KeyShares.generate(opt.key_shares) else .{};
     defer shares.deinit();
+    // A TLS 1.2 client certificate signs the messages themselves.
+    if (offers(opt, .tls_1_2) and opt.auth != null) h.keepRawTranscript();
     h.record_version = @enumFromInt(0x0301);
     try writeClientHello(h, opt, &random, session_id, &shares, opt.key_shares, null);
     h.record_version = .tls_1_2;
@@ -108,7 +110,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
         .tls13 => |hello| hello,
         .tls12 => |hello| {
             h.setSuite(hello.suite);
-            h.hashMessage(msg);
+            try h.hashMessage(msg);
             try tls12.run(h, opt, &random, hello);
             h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
             return;
@@ -116,13 +118,14 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     };
     h.ccs_allowed = true;
     h.tolerate_warnings = false;
+    h.dropRawTranscript();
     var sent_ccs = false;
     if (hello.is_retry) {
         try h.expectFlightEnd();
         h.conn.retried = true;
         h.setSuite(hello.suite);
         h.transcript.replaceWithMessageHash();
-        h.hashMessage(msg);
+        try h.hashMessage(msg);
         // A retry must change something (§4.2.4): a group we support and
         // did not already offer a share for, or a cookie to echo.
         var retry_groups: [1]proto.NamedGroup = undefined;
@@ -160,7 +163,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     } else {
         h.setSuite(hello.suite);
     }
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     const key_share = hello.key_share orelse return error.TlsMissingExtension;
     if (!shares.has(key_share.group)) return error.TlsIllegalParameter;
@@ -179,13 +182,13 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     msg = try h.nextMessage();
     try h.expect(msg, .encrypted_extensions);
     const alpn = try parseEncryptedExtensions(msg.body, opt);
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     msg = try h.nextMessage();
     var request: ?CertificateRequest = null;
     if (msg.handshake_type == .certificate_request) {
         request = try parseCertificateRequest(msg.body, opt.auth);
-        h.hashMessage(msg);
+        try h.hashMessage(msg);
         msg = try h.nextMessage();
     }
 
@@ -197,18 +200,18 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     if (!opt.insecure_skip_verify) {
         try h.verifyChain(&peer, opt.root_ca.?, .server, opt.host, opt.now.toSeconds());
     }
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     msg = try h.nextMessage();
     try h.expect(msg, .certificate_verify);
     try h.verifyCertificateVerify(msg.body, &peer.public_key, .server);
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     msg = try h.nextMessage();
     try h.expect(msg, .finished);
     try h.expectFlightEnd();
     try h.verifyFinished(msg.body, &hs.server);
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     var ap = h.deriveApplicationSecrets();
     defer ap.wipe();

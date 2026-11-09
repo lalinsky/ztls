@@ -53,27 +53,28 @@ pub fn run(h: *Handshake, opt: config.Client, client_random: *const [32]u8, hell
     if (!opt.insecure_skip_verify) {
         try h.verifyChain(&peer, opt.root_ca.?, .server, opt.host, opt.now.toSeconds());
     }
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     msg = try h.nextMessage();
     try h.expect(msg, .server_key_exchange);
     const exchange = try parseServerKeyExchange(msg.body, opt, &peer.public_key, randoms);
     h.conn.peer_signature_scheme = exchange.scheme;
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     msg = try h.nextMessage();
-    var certificate_requested = false;
+    var request: ?CertificateRequest = null;
     if (msg.handshake_type == .certificate_request) {
-        try parseCertificateRequest(msg.body);
-        certificate_requested = true;
-        h.hashMessage(msg);
+        request = try parseCertificateRequest(msg.body, opt.auth);
+        try h.hashMessage(msg);
         msg = try h.nextMessage();
     }
+    // Only a CertificateVerify needs the messages themselves.
+    if (request == null or request.?.scheme == null) h.dropRawTranscript();
 
     try h.expect(msg, .server_hello_done);
     if (msg.body.len != 0) return error.TlsDecodeError;
     try h.expectFlightEnd();
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     // Our share, and the premaster secret, in one step.
     var share_buf: [KeyShares.max_share_len]u8 = undefined;
@@ -82,9 +83,9 @@ pub fn run(h: *Handshake, opt: config.Client, client_random: *const [32]u8, hell
     const response = try KeyShares.respond(exchange.group, exchange.point(), &share_buf, &premaster_buf);
     h.conn.group = exchange.group;
 
-    // Our flight. With no client certificate yet, a request gets an empty
-    // Certificate, which the server may accept or refuse (§7.4.6).
-    if (certificate_requested) try h.writeMessage(&.{ @intFromEnum(proto.HandshakeType.certificate), 0, 0, 3, 0, 0, 0 });
+    // Our flight: our certificate if asked, or an empty one when we have
+    // none that fits, which the server may accept or refuse (§7.4.6).
+    if (request) |req| try writeCertificate(h, if (req.scheme != null) opt.auth.? else null);
     try writeClientKeyExchange(h, response.share);
 
     var master: [master_secret_len]u8 = undefined;
@@ -97,6 +98,11 @@ pub fn run(h: *Handshake, opt: config.Client, client_random: *const [32]u8, hell
     } else {
         crypto.prf.tls12(hash_algorithm, response.secret, "master secret", randoms.client, randoms.server, &master);
     }
+    // After ClientKeyExchange, and outside the session hash.
+    if (request) |req| if (req.scheme) |scheme| {
+        try h.writeCertificateVerifyTls12(opt.auth.?, scheme);
+        h.dropRawTranscript();
+    };
 
     var keys = try KeyBlock.derive(suite, &master, randoms);
     defer keys.wipe();
@@ -118,7 +124,7 @@ pub fn run(h: *Handshake, opt: config.Client, client_random: *const [32]u8, hell
     try h.expect(msg, .finished);
     try h.expectFlightEnd();
     try verifyFinished(h, hash_algorithm, &master, msg.body);
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     h.conn.read.ccs = .refuse;
     h.conn.alpn_protocol = hello.alpn;
@@ -221,18 +227,70 @@ fn parseServerKeyExchange(body: []const u8, opt: config.Client, public_key: *con
     return exchange;
 }
 
-/// A TLS 1.2 CertificateRequest (RFC 5246 §7.4.4), checked for form.
-fn parseCertificateRequest(body: []const u8) Error!void {
+const CertificateRequest = struct {
+    /// The scheme our certificate answers with, or null to send none.
+    scheme: ?proto.SignatureScheme,
+};
+
+/// ClientCertificateType values (RFC 5246 §7.4.4, RFC 8422 §5.5).
+const rsa_sign = 1;
+const ecdsa_sign = 64;
+
+/// A TLS 1.2 CertificateRequest (RFC 5246 §7.4.4): the kinds of key and
+/// the schemes the server takes, and the authorities it trusts, which
+/// only narrow what it would like; we offer what we have.
+fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair) Error!CertificateRequest {
     var d = codec.Decoder.init(body);
     const types = try d.vectorBytes(u8);
     if (types.len == 0) return error.TlsDecodeError;
     var schemes = try d.vector(u16);
-    if (schemes.eof() or schemes.remaining() % 2 != 0) return error.TlsDecodeError;
+    if (schemes.eof()) return error.TlsDecodeError;
     var authorities = try d.vector(u16);
     try d.expectEof();
     while (!authorities.eof()) {
         if ((try authorities.vectorBytes(u16)).len == 0) return error.TlsDecodeError;
     }
+    var offered: [64]proto.SignatureScheme = undefined;
+    var n: usize = 0;
+    while (!schemes.eof()) {
+        const scheme = try schemes.decode(proto.SignatureScheme);
+        if (n < offered.len) {
+            offered[n] = scheme;
+            n += 1;
+        }
+    }
+
+    const pair = auth orelse return .{ .scheme = null };
+    const key_type = pair.key.key_type;
+    // Ed25519 goes under ecdsa_sign (RFC 8422 §5.5).
+    const wanted_type: u8 = switch (key_type) {
+        .rsa => rsa_sign,
+        .ecdsa, .ed25519 => ecdsa_sign,
+    };
+    if (std.mem.indexOfScalar(u8, types, wanted_type) == null) return .{ .scheme = null };
+    // A scheme naming our key's curve first, as TLS 1.3 would have it,
+    // then any the key can sign under in TLS 1.2.
+    const scheme = handshake.selectScheme(key_type, offered[0..n], .tls13) orelse
+        handshake.selectScheme(key_type, offered[0..n], .tls12);
+    return .{ .scheme = scheme };
+}
+
+/// A TLS 1.2 Certificate (RFC 5246 §7.4.2): `pair`'s chain, or none.
+fn writeCertificate(h: *Handshake, pair: ?*const config.CertKeyPair) Error!void {
+    const chain: []const []const u8 = if (pair) |p| p.chain else &.{};
+    var list_len: usize = 0;
+    for (chain) |der| list_len += 3 + der.len;
+    if (list_len > std.math.maxInt(u24) - 3) return error.TlsInternalError;
+
+    var w = try h.messageWriter();
+    try w.write(&.{@intFromEnum(proto.HandshakeType.certificate)});
+    try w.int(u24, 3 + list_len);
+    try w.int(u24, list_len);
+    for (chain) |der| {
+        try w.int(u24, der.len);
+        try w.write(der);
+    }
+    try w.finish();
 }
 
 fn writeClientKeyExchange(h: *Handshake, share: []const u8) Error!void {
@@ -359,4 +417,44 @@ test "a ServerKeyExchange is signed over both randoms, with a group and scheme w
     try testing.expectError(error.TlsIllegalParameter, parseServerKeyExchange(try testServerKeyExchange(&buf, &pair, hello, 1, .x25519, .ecdsa_secp256r1_sha256), opt, &public, hello));
     try testing.expectError(error.TlsIllegalParameter, parseServerKeyExchange(try testServerKeyExchange(&buf, &pair, hello, 3, .x25519_ml_kem768, .ecdsa_secp256r1_sha256), opt, &public, hello));
     try testing.expectError(error.TlsIllegalParameter, parseServerKeyExchange(try testServerKeyExchange(&buf, &pair, hello, 3, .secp521r1, .ecdsa_secp256r1_sha256), opt, &public, hello));
+}
+
+test "a CertificateRequest picks our key's scheme, curve first, if its types allow the key" {
+    var ec = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/client.pem"), @embedFile("testdata/pki/client.key"));
+    defer ec.deinit(testing.allocator);
+    var rsa = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
+    defer rsa.deinit(testing.allocator);
+    const Scheme = proto.SignatureScheme;
+
+    const request = struct {
+        fn build(buf: []u8, types: []const u8, schemes: []const Scheme) ![]const u8 {
+            var w = codec.Writer.init(buf);
+            try w.vector(u8, types);
+            try w.enumList(schemes);
+            try w.vector(u16, &.{});
+            return w.written();
+        }
+    }.build;
+    var buf: [128]u8 = undefined;
+
+    // The P-256 key: its own curve's scheme when offered, else another.
+    var r = try parseCertificateRequest(try request(&buf, &.{ rsa_sign, ecdsa_sign }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp384r1_sha384, .ecdsa_secp256r1_sha256 }), &ec);
+    try testing.expectEqual(Scheme.ecdsa_secp256r1_sha256, r.scheme.?);
+    r = try parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{.ecdsa_secp384r1_sha384}), &ec);
+    try testing.expectEqual(Scheme.ecdsa_secp384r1_sha384, r.scheme.?);
+    // Not when the types leave EC keys out, nor with no scheme for it.
+    r = try parseCertificateRequest(try request(&buf, &.{rsa_sign}, &.{.ecdsa_secp256r1_sha256}), &ec);
+    try testing.expectEqual(null, r.scheme);
+    r = try parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{.rsa_pkcs1_sha256}), &ec);
+    try testing.expectEqual(null, r.scheme);
+    // RSA: PSS first, PKCS#1 v1.5 when that is all there is.
+    r = try parseCertificateRequest(try request(&buf, &.{rsa_sign}, &.{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha256 }), &rsa);
+    try testing.expectEqual(Scheme.rsa_pss_rsae_sha256, r.scheme.?);
+    r = try parseCertificateRequest(try request(&buf, &.{rsa_sign}, &.{.rsa_pkcs1_sha384}), &rsa);
+    try testing.expectEqual(Scheme.rsa_pkcs1_sha384, r.scheme.?);
+    // No certificate configured; and malformed lists.
+    r = try parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{.ecdsa_secp256r1_sha256}), null);
+    try testing.expectEqual(null, r.scheme);
+    try testing.expectError(error.TlsDecodeError, parseCertificateRequest(try request(&buf, &.{}, &.{.ecdsa_secp256r1_sha256}), &ec));
+    try testing.expectError(error.TlsDecodeError, parseCertificateRequest(try request(&buf, &.{ecdsa_sign}, &.{}), &ec));
 }

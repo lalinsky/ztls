@@ -90,7 +90,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     h.setSuite(choices.suite);
     h.conn.group = choices.group;
     h.conn.setServerName(hello.server_name);
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     var session_id_buf: [32]u8 = undefined;
     @memcpy(session_id_buf[0..hello.session_id.len], hello.session_id);
@@ -124,7 +124,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
         if (!std.mem.eql(u8, hello.server_name orelse "", server_name_buf[0..server_name_len])) return error.TlsIllegalParameter;
         if (hello.key_shares_len != 1 or hello.shareFor(choices.group) == null) return error.TlsIllegalParameter;
         choices = second;
-        h.hashMessage(msg);
+        try h.hashMessage(msg);
     }
 
     var share_buf: [KeyShares.max_share_len]u8 = undefined;
@@ -159,20 +159,20 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
             defer peer.deinit();
             h.conn.peer_key_type = peer.public_key.key_type;
             try h.verifyChain(peer, client_auth.root_ca, .client, null, opt.now.toSeconds());
-            h.hashMessage(msg);
+            try h.hashMessage(msg);
             msg = try h.nextMessage();
             try h.expect(msg, .certificate_verify);
             try h.verifyCertificateVerify(msg.body, &peer.public_key, .client);
-            h.hashMessage(msg);
+            try h.hashMessage(msg);
         } else {
             if (client_auth.auth_type == .require) return error.TlsCertificateRequired;
-            h.hashMessage(msg);
+            try h.hashMessage(msg);
         }
         msg = try h.nextMessage();
     }
     try h.expect(msg, .finished);
     try h.verifyFinished(msg.body, &hs.client);
-    h.hashMessage(msg);
+    try h.hashMessage(msg);
 
     try h.installReadKeys(ap.client);
     h.conn.read.ccs = .refuse;

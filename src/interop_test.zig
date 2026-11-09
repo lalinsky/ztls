@@ -243,6 +243,9 @@ test "our client against openssl s_server" {
         .{ .tls12 = true, .suites = &both, .cipher = "ECDHE-ECDSA-CHACHA20-POLY1305", .groups = "P-256" },
         .{ .tls12 = true, .suites = &both, .cipher = "ECDHE-ECDSA-AES256-GCM-SHA384", .groups = "P-384" },
         .{ .tls12 = true, .suites = &proto.CipherSuite.tls12, .request_cert = true },
+        // A client certificate, required, under both suite kinds.
+        .{ .tls12 = true, .suites = &both, .client_cert = true },
+        .{ .tls12 = true, .suites = &both, .client_cert = true, .cert = "server-rsa", .sigalgs = "RSA+SHA256:ECDSA+SHA384" },
         .{ .tls12 = true, .suites = &both, .transfer = 1 << 20 },
     };
     var trust = try ztls.TrustStore.init();
@@ -502,6 +505,7 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
     const cases = [_]Case{
         // TLS 1.2 needs the leaf's curve, P-256, among the groups offered.
         .{ .groups = &.{ .x25519_ml_kem768, .x25519, .secp256r1 }, .tls12 = true },
+        .{ .groups = &.{ .x25519, .secp256r1 }, .tls12 = true, .client_cert = true },
         .{ .groups = &.{.x25519_ml_kem768} },
         .{ .groups = &.{.x25519}, .client_cert = true },
         .{ .groups = &.{.secp256r1}, .transfer = 1 << 20 },

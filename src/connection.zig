@@ -43,7 +43,7 @@ const max_idle_records = 32;
 const max_key_updates: u64 = (1 << 48) - 1;
 
 /// Warning alerts a peer may send in a row, with no other record between
-/// them, as AWS-LC counts them; TLS 1.3 has only user_canceled. TLS 1.2
+/// them, as BoringSSL counts them; TLS 1.3 has only user_canceled. TLS 1.2
 /// peers send others (unrecognized_name, say), each ignored.
 pub const max_warning_alerts = 4;
 
@@ -329,7 +329,7 @@ pub const Connection = struct {
                     return e;
                 },
             };
-            // Empty records leave the count be, as in AWS-LC: they are
+            // Empty records leave the count be, as in BoringSSL: they are
             // capped on their own.
             if (record.content_type != .alert and record.payload.len > 0) c.read.warning_alerts = 0;
             switch (record.content_type) {
@@ -363,7 +363,7 @@ pub const Connection = struct {
                             return error.TlsUnexpectedMessage;
                         }
                         // Not idle records: warnings and empty records
-                        // have caps of their own, as in AWS-LC.
+                        // have caps of their own, as in BoringSSL.
                         continue;
                     }
                     if (alert.toError()) |err| {

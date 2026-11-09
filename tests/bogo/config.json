@@ -103,15 +103,7 @@
     "RSAKeyUsage-Client-WantEncipherment-*": "no RSA key exchange",
     "CertificateCipherMismatch-PSS": "no RSA key exchange",
     "ExtraCompressionMethods-TLS12": "no TLS 1.2 server",
-    "OmitExtensions-ClientHello-TLS12": "no TLS 1.2 server",
-    "Agree-Digest-Default": "TLS 1.2 client certificates: next commit",
-    "ClientAuth-ECDSA-Client-TLS-*": "TLS 1.2 client certificates: next commit",
-    "ClientAuth-OldCallback-TLS-*": "TLS 1.2 client certificates: next commit",
-    "ClientAuth-RSA-Client-TLS-*": "TLS 1.2 client certificates: next commit",
-    "ClientAuth-SignatureType": "TLS 1.2 client certificates: next commit",
-    "Client-SignDefault-*-TLS12": "TLS 1.2 client certificates: next commit",
-    "SendReceiveIntermediate-Client-TLS12": "TLS 1.2 client certificates: next commit",
-    "TLS12-Client-ClientAuth-*": "TLS 1.2 client certificates: next commit"
+    "OmitExtensions-ClientHello-TLS12": "no TLS 1.2 server"
   },
   "ErrorMap": {
     ":DECODE_ERROR:": [

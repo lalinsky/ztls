@@ -14,7 +14,8 @@ pub const Certificate = crypto.x509.Certificate;
 /// task can hand the work to a thread pool.
 pub const Signer = struct {
     context: ?*anyopaque = null,
-    /// Signs `message`, the framed CertificateVerify content, with `key`
+    /// Signs `message`, the framed CertificateVerify content (in TLS 1.2,
+    /// the handshake messages so far, which can run long), with `key`
     /// under `algorithm` into `out`, and returns the signature as a slice
     /// of `out`. Runs on the handshake's task and may block or suspend;
     /// it must not touch the connection. Any error fails the handshake
