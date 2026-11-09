@@ -17,12 +17,22 @@ const tls12 = @import("handshake_client_tls12.zig");
 
 pub fn run(conn: *Connection, options: config.Client) Error!void {
     try checkOptions(options);
+    var opt = options;
+    opt.cipher_suites = offeredSuites(opt.cipher_suites, crypto.aead.hasAesHardware());
     var h = Handshake.init(conn, options.allocator, options.max_handshake_message_len);
     defer h.deinit();
-    handshakeInner(&h, options) catch |err| {
+    handshakeInner(&h, opt) catch |err| {
         h.sendAlert(err);
         return err;
     };
+}
+
+/// The suites to offer: the default list puts ChaCha20-Poly1305 first
+/// without AES instructions, where software AES is several times slower,
+/// so that servers that follow the client's order pick it.
+fn offeredSuites(suites: []const proto.CipherSuite, aes_hardware: bool) []const proto.CipherSuite {
+    if (aes_hardware or !std.mem.eql(proto.CipherSuite, suites, &config.default_cipher_suites)) return suites;
+    return &config.default_cipher_suites_chacha_first;
 }
 
 /// A ServerHello of either version.
@@ -714,4 +724,20 @@ test "TLS 1.2 suites are refused in a build without TLS 1.2" {
         try testing.expectError(error.TlsInternalError, checkOptions(opt));
         try checkOptions(.{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined });
     }
+}
+
+test "the default suites put ChaCha20-Poly1305 first without AES hardware" {
+    const default: []const proto.CipherSuite = &config.default_cipher_suites;
+    try testing.expectEqual(default, offeredSuites(default, true));
+    const chacha = offeredSuites(default, false);
+    try testing.expectEqual(proto.CipherSuite.chacha20_poly1305_sha256, chacha[0]);
+    // The same suites, in an order of the same versions.
+    try testing.expectEqual(default.len, chacha.len);
+    for (default, chacha) |a, b| {
+        try testing.expect(std.mem.indexOfScalar(proto.CipherSuite, chacha, a) != null);
+        try testing.expectEqual(a.version(), b.version());
+    }
+    // A list of one's own is offered as given.
+    const own = [_]proto.CipherSuite{ .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
+    try testing.expectEqual(@as([]const proto.CipherSuite, &own), offeredSuites(&own, false));
 }

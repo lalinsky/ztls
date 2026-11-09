@@ -12,6 +12,13 @@ const assert = std.debug.assert;
 const c = @import("c");
 const err = @import("err.zig");
 
+/// Whether the CPU has AES instructions AWS-LC uses. Without them its
+/// AES-GCM stays constant-time but is several times slower than
+/// ChaCha20-Poly1305.
+pub fn hasAesHardware() bool {
+    return c.EVP_has_aes_hardware() != 0;
+}
+
 /// Only AEADs whose AWS-LC state is plain inline data (an AES key schedule
 /// and GHASH key, or a ChaCha key) belong here: `Context` relies on that to
 /// be movable and to wipe its key itself. AES-GCM-SIV, for one, is not.
