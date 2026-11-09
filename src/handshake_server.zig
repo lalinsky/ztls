@@ -202,7 +202,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
 /// of `certificates` for the client's server name that it can verify,
 /// else `auth`.
 fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const config.CertKeyPair {
-    const schemes = hello.schemes[0 .. hello.schemes_len orelse 0];
+    const schemes = hello.schemes[0..hello.schemes_len.?];
     if (opt.select_certificate) |select| {
         const info: config.SelectCertificate.Hello = .{
             .server_name = hello.server_name,
@@ -243,7 +243,7 @@ fn choose(hello: *const ClientHello, opt: config.Server, auth: *const config.Cer
         if (handshake.groupSupported(group) and hello.supportsGroup(group)) break group;
     } else return error.TlsHandshakeFailure;
 
-    const schemes = hello.schemes[0 .. hello.schemes_len orelse return error.TlsMissingExtension];
+    const schemes = hello.schemes[0..hello.schemes_len.?];
     const scheme = handshake.selectScheme(opt.signing_schemes, auth.key.key_type, schemes, .tls13) orelse return error.TlsHandshakeFailure;
 
     return .{ .suite = suite, .group = group, .scheme = scheme, .alpn = try selectAlpn(opt.alpn_protocols, hello.alpn) };
@@ -398,8 +398,10 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
         try data.expectEof();
     }
     if (!supports_1_3) return error.TlsProtocolVersion;
-    // (EC)DHE is the only key exchange here, so both are required (§9.2).
-    if (!has_key_share or !has_groups) return error.TlsMissingExtension;
+    // (EC)DHE is the only key exchange here, so both are required, and
+    // with no PSK so are signature algorithms (§9.2). Checked here, so a
+    // second ClientHello meets them too.
+    if (!has_key_share or !has_groups or hello.schemes_len == null) return error.TlsMissingExtension;
     // A share may only be offered for a group in supported_groups (§4.3.8).
     for (hello.key_shares[0..hello.key_shares_len]) |ks| {
         if (!hello.supportsGroup(ks.group)) return error.TlsIllegalParameter;
@@ -511,7 +513,7 @@ test "parsing the example ClientHello" {
 
 /// A minimal ClientHello body for the parser: one suite, x25519 and no
 /// share, so a retry would be needed.
-fn testClientHello(buf: []u8, o: struct { version: proto.Version = .tls_1_2, name: ?[]const u8 = null, early_data: bool = false }) ![]const u8 {
+fn testClientHello(buf: []u8, o: struct { version: proto.Version = .tls_1_2, name: ?[]const u8 = null, early_data: bool = false, schemes: bool = true }) ![]const u8 {
     var w = codec.Writer.init(buf);
     try w.enumValue(o.version);
     const zeros: [32]u8 = @splat(0);
@@ -526,6 +528,10 @@ fn testClientHello(buf: []u8, o: struct { version: proto.Version = .tls_1_2, nam
     try w.vector(u16, &.{ 0, 2, 0, 0x1d });
     try w.enumValue(proto.Extension.key_share);
     try w.vector(u16, &.{ 0, 0 });
+    if (o.schemes) {
+        try w.enumValue(proto.Extension.signature_algorithms);
+        try w.vector(u16, &.{ 0, 2, 0x04, 0x03 });
+    }
     if (o.name) |name| {
         try w.enumValue(proto.Extension.server_name);
         const sni = try w.beginLength(u16);
@@ -553,8 +559,9 @@ test "server names: a trailing dot is dropped, IP literals and NULs are refused"
     try testing.expectError(error.TlsIllegalParameter, parseClientHello(try testClientHello(&buf, .{ .name = "." })));
 }
 
-test "legacy_version is ignored, early_data is refused" {
+test "legacy_version is ignored, early_data is refused, signature_algorithms is required" {
     var buf: [512]u8 = undefined;
+    try testing.expectError(error.TlsMissingExtension, parseClientHello(try testClientHello(&buf, .{ .schemes = false })));
     _ = try parseClientHello(try testClientHello(&buf, .{ .version = @enumFromInt(0x0301) }));
     _ = try parseClientHello(try testClientHello(&buf, .{ .version = .tls_1_3 }));
     try testing.expectError(error.TlsUnsupportedExtension, parseClientHello(try testClientHello(&buf, .{ .early_data = true })));
