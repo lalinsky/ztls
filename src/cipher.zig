@@ -159,13 +159,14 @@ pub const Keys = struct {
     /// caller passes `&keys.version.tls13`, having switched on the version.
     /// On failure the keys are left as they were.
     pub fn update(keys: *Keys, tls13: *const Tls13) crypto.err.Error!void {
+        assert(tls13 == &keys.version.tls13);
         var next_secret = key_schedule.nextTrafficSecret(tls13.hash_algorithm, &tls13.secret);
-        const next = fromSecret(keys.algorithm, .{ .hash_algorithm = tls13.hash_algorithm, .secret = next_secret }) catch |err| {
-            next_secret.wipe();
-            return err;
-        };
+        defer next_secret.wipe();
+        var next = try fromSecret(keys.algorithm, .{ .hash_algorithm = tls13.hash_algorithm, .secret = next_secret });
         keys.deinit();
         keys.* = next;
+        // The copy now lives in `keys`; leave no secret behind on the stack.
+        std.crypto.secureZero(u8, std.mem.asBytes(&next));
     }
 
     /// How many records one generation of keys may seal before the sender
