@@ -13,7 +13,7 @@ cd "$(dirname "$0")/../.."
 : "${BORINGSSL_REV:=0131ae9d78e42fcc2c1811315e62410ad96d8230}"
 # Passes with the pinned runner; fewer means tests slipped from passing to
 # unimplemented or failed, which -allow-unimplemented alone would hide.
-: "${MIN_PASS:=341}"
+: "${MIN_PASS:=516}"
 
 # Only the pinned commit is fetched; the full history is 400 MB.
 if [ ! -d "$BORINGSSL" ]; then

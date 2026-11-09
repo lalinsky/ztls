@@ -93,7 +93,9 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 
     var shares: KeyShares = if (offers(opt, .tls_1_3)) try KeyShares.generate(opt.key_shares) else .{};
     defer shares.deinit();
+    h.record_version = @enumFromInt(0x0301);
     try writeClientHello(h, opt, &random, session_id, &shares, opt.key_shares, null);
+    h.record_version = .tls_1_2;
     try h.flush();
     // A server that may answer TLS 1.2 sends no compatibility CCS, and may
     // send warning alerts before it says which version it speaks.
@@ -143,6 +145,10 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 
         msg = try h.nextMessage();
         try h.expect(msg, .server_hello);
+        // The version is settled, so a ServerHello that does not say
+        // 0x0303 is malformed now rather than another version, as AWS-LC
+        // has it.
+        if (msg.body.len >= 2 and std.mem.readInt(u16, msg.body[0..2], .big) != @intFromEnum(proto.Version.tls_1_2)) return error.TlsDecodeError;
         const second = switch (try parseServerHello(msg.body, opt, session_id)) {
             .tls13 => |second| second,
             // A retry settled TLS 1.3 (§4.2.4).
@@ -291,7 +297,13 @@ fn build(
     {
         try w.enumValue(proto.Extension.supported_groups);
         const ext = try w.beginLength(u16);
-        try w.enumList(opt.named_groups);
+        // The hybrid is TLS 1.3's alone.
+        const list = try w.beginLength(u16);
+        for (opt.named_groups) |group| {
+            if (group == .x25519_ml_kem768 and !offers(opt, .tls_1_3)) continue;
+            try w.enumValue(group);
+        }
+        try list.end(w);
         try ext.end(w);
     }
     {
@@ -384,7 +396,7 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
     if (std.mem.indexOfScalar(proto.CipherSuite, opt.cipher_suites, suite) == null) return error.TlsIllegalParameter;
     if (suite.version() != version) return error.TlsIllegalParameter;
 
-    if (version == .tls_1_2) return .{ .tls12 = try parseServerHelloTls12(opt, random, suite, extensions) };
+    if (version == .tls_1_2) return .{ .tls12 = try parseServerHelloTls12(opt, random, session_id, echoed_session_id, suite, extensions) };
 
     const is_retry = std.mem.eql(u8, &random, &handshake.hello_retry_request_random);
     if (!std.mem.eql(u8, echoed_session_id, session_id)) return error.TlsIllegalParameter;
@@ -413,17 +425,17 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
     return .{ .tls13 = hello };
 }
 
-/// The rest of a TLS 1.2 ServerHello: the downgrade sentinel and the
-/// extensions TLS 1.2 puts here. Its session ID is not looked at: we
-/// offer none to resume, and a server that echoes our TLS 1.3 one gets a
-/// full handshake, as with AWS-LC (one that tries to resume fails at the
-/// Certificate it does not send).
-fn parseServerHelloTls12(opt: config.Client, random: [32]u8, suite: proto.CipherSuite, extensions: codec.Decoder) Error!tls12.ServerHello {
+/// The rest of a TLS 1.2 ServerHello: the downgrade sentinel, no
+/// resumption, and the extensions TLS 1.2 puts here.
+fn parseServerHelloTls12(opt: config.Client, random: [32]u8, session_id: []const u8, echoed_session_id: []const u8, suite: proto.CipherSuite, extensions: codec.Decoder) Error!tls12.ServerHello {
     // A server that could speak TLS 1.3 and chose an older version has
     // been tampered with, when we offered 1.3 (§4.2.3).
     if (offers(opt, .tls_1_3)) {
         if (std.mem.eql(u8, random[24..], downgrade_tls12) or std.mem.eql(u8, random[24..], downgrade_tls11)) return error.TlsIllegalParameter;
     }
+    // Our TLS 1.3 session ID back would be resuming a session we never
+    // offered; BoringSSL refuses it, and its runner checks that.
+    if (session_id.len > 0 and std.mem.eql(u8, echoed_session_id, session_id)) return error.TlsIllegalParameter;
 
     var hello: tls12.ServerHello = .{ .suite = suite, .random = random };
     try checkNoDuplicates(extensions, error.TlsDecodeError);
@@ -449,6 +461,9 @@ fn parseServerHelloTls12(opt: config.Client, random: [32]u8, suite: proto.Cipher
             },
             .application_layer_protocol_negotiation => hello.alpn = try parseAlpn(&data, opt),
             .server_name => if (!sendsSni(opt.host)) return error.TlsUnsupportedExtension,
+            // Not allowed here, but sent by some servers, so tolerated as
+            // AWS-LC does.
+            .supported_groups => continue,
             // Nothing else was offered for TLS 1.2: no session tickets, no
             // status_request.
             else => return error.TlsUnsupportedExtension,
@@ -654,8 +669,8 @@ test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
         _ = try parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, null), tls12_only, "");
     }
     random = @splat(0x5a);
-    // Our session ID back gets a full handshake, as with AWS-LC.
-    _ = (try parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &ours, suite, null), opt, &ours)).tls12;
+    // Our session ID back: resumption we never asked for.
+    try testing.expectError(error.TlsIllegalParameter, parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &ours, suite, null), opt, &ours));
 
     // renegotiation_info must be empty; point formats must allow
     // uncompressed; nothing we did not offer.

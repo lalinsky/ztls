@@ -143,11 +143,10 @@ fn suiteAuthentication(suite: proto.CipherSuite) Authentication {
 }
 
 /// The leaf's key must be of the kind the suite names (ECDHE_ECDSA also
-/// covers Ed25519, RFC 8422 §2.3), as AWS-LC checks. A non-RSA key must
-/// be allowed to sign, and an ECDSA key must be on a curve we offered in
-/// supported_groups (RFC 8422 §5.1). RSA leaves are left to the X.509
-/// purpose check: older ones allow only keyEncipherment, which ECDHE_RSA
-/// servers use them with anyway, and AWS-LC lets them through.
+/// covers Ed25519, RFC 8422 §2.3), as AWS-LC checks, and must be allowed
+/// to sign: BoringSSL (and so Chrome) holds RSA leaves to that too, so a
+/// keyEncipherment-only one is refused. An ECDSA key must be on a curve
+/// we offered in supported_groups (RFC 8422 §5.1).
 fn checkLeaf(peer: *const handshake.PeerCertificate, suite: proto.CipherSuite, named_groups: []const proto.NamedGroup) Error!void {
     const key_type = peer.public_key.key_type;
     switch (suiteAuthentication(suite)) {
@@ -165,9 +164,9 @@ fn checkLeaf(peer: *const handshake.PeerCertificate, suite: proto.CipherSuite, n
                 .ed25519 => {},
                 .rsa => return error.TlsIllegalParameter,
             }
-            if (!peer.chain[0].allowsDigitalSignature()) return error.TlsBadCertificate;
         },
     }
+    if (!peer.chain[0].allowsDigitalSignature()) return error.TlsBadCertificate;
 }
 
 /// The server's ECDHE parameters, copied out of the message, which does
@@ -299,7 +298,9 @@ fn writeFinished(h: *Handshake, hash_algorithm: crypto.hash.Algorithm, master: *
 }
 
 fn verifyFinished(h: *const Handshake, hash_algorithm: crypto.hash.Algorithm, master: *const [master_secret_len]u8, body: []const u8) Error!void {
-    if (body.len != verify_data_len) return error.TlsDecodeError;
+    // A Finished of the wrong length fails as a wrong one does, as AWS-LC
+    // has it.
+    if (body.len != verify_data_len) return error.TlsDecryptError;
     const expected = verifyData(h, hash_algorithm, master, "server finished");
     if (!std.crypto.timing_safe.eql([verify_data_len]u8, expected, body[0..verify_data_len].*)) return error.TlsDecryptError;
 }

@@ -279,6 +279,10 @@ pub const Handshake = struct {
     tolerate_warnings: bool = false,
     /// Warning alerts in a row, capped as on an open connection.
     warning_alerts: u32 = 0,
+    /// legacy_record_version of the plaintext records we write. A client's
+    /// first ClientHello says TLS 1.0, as every major stack's does and
+    /// RFC 9846 §5.1 allows, for servers that choke on anything newer.
+    record_version: proto.Version = .tls_1_2,
 
     pub fn init(conn: *Connection, allocator: Allocator, max_message_len: usize) Handshake {
         return .{
@@ -431,7 +435,7 @@ pub const Handshake = struct {
                 break :blk keys.sealedLen(w.len);
             } else blk: {
                 unused[0] = @intFromEnum(proto.ContentType.handshake);
-                std.mem.writeInt(u16, unused[1..3], @intFromEnum(proto.Version.tls_1_2), .big);
+                std.mem.writeInt(u16, unused[1..3], @intFromEnum(w.h.record_version), .big);
                 std.mem.writeInt(u16, unused[3..5], @intCast(w.len), .big);
                 break :blk cipher.header_len + w.len;
             };

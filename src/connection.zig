@@ -329,7 +329,9 @@ pub const Connection = struct {
                     return e;
                 },
             };
-            if (record.content_type != .alert) c.read.warning_alerts = 0;
+            // Empty records leave the count be, as in AWS-LC: they are
+            // capped on their own.
+            if (record.content_type != .alert and record.payload.len > 0) c.read.warning_alerts = 0;
             switch (record.content_type) {
                 .application_data => {
                     if (record.payload.len == 0) {
@@ -360,7 +362,8 @@ pub const Connection = struct {
                             c.failRead(error.TlsUnexpectedMessage);
                             return error.TlsUnexpectedMessage;
                         }
-                        try c.countIdleRecord();
+                        // Not idle records: warnings and empty records
+                        // have caps of their own, as in AWS-LC.
                         continue;
                     }
                     if (alert.toError()) |err| {
@@ -443,18 +446,21 @@ pub const Connection = struct {
     /// once rather than at its timeout.
     fn handlePostHandshake(c: *Connection, payload: []const u8) Failure!void {
         const keys = &c.read.keys.?;
+        const tls13 = switch (keys.version) {
+            .tls13 => |*tls13| tls13,
+            // HelloRequest is refused on its first fragment: a peer may
+            // split its four bytes across records, and the rest changes
+            // nothing.
+            .tls12 => {
+                if (payload[0] != @intFromEnum(proto.HandshakeType.hello_request)) return error.TlsUnexpectedMessage;
+                for (payload[0..@min(payload.len, 4)]) |b| if (b != 0) return error.TlsDecodeError;
+                return error.TlsNoRenegotiation;
+            },
+        };
         var d = codec.Decoder.init(payload);
         while (!d.eof()) {
             const handshake_type = d.decode(proto.HandshakeType) catch return error.TlsDecodeError;
             var body = d.vector(u24) catch return error.TlsDecodeError;
-            const tls13 = switch (keys.version) {
-                .tls13 => |*tls13| tls13,
-                .tls12 => {
-                    if (handshake_type != .hello_request) return error.TlsUnexpectedMessage;
-                    if (!body.eof()) return error.TlsDecodeError;
-                    return error.TlsNoRenegotiation;
-                },
-            };
             switch (handshake_type) {
                 .key_update => {
                     const request = body.decode(proto.KeyUpdateRequest) catch return error.TlsDecodeError;
