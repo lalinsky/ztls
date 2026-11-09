@@ -1,4 +1,5 @@
-//! ztls: TLS 1.3 on AWS-LC's libcrypto. See DESIGN.md.
+//! ztls: TLS 1.3, and a TLS 1.2 client, on AWS-LC's libcrypto. See
+//! DESIGN.md.
 //!
 //! `client` and `server` run a handshake over a transport's reader and
 //! writer and return a `Connection`, whose `reader`, `writer` and

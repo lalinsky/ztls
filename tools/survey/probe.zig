@@ -1,13 +1,13 @@
-//! One connection to a public server with ztls, for the TLS 1.3 survey in
+//! One connection to a public server with ztls, for the survey in
 //! this directory. Usage: survey-probe HOST [PORT] [--groups a,b,...]
-//! [--tls12].
+//! [--tls13-only].
 //! Prints tab-separated fields: HOST ok SUITE GROUP RETRIED KEY SCHEME
 //! ALPN STATUS, first with STATUS "-" as soon as the handshake is done and
 //! again with the HTTP status line, or with "error: NAME" when the request
 //! failed; or HOST fail ERROR when the handshake did.
 //! --groups replaces the client's default groups, the first one getting
-//! the key share. --tls12 offers TLS 1.2 after TLS 1.3; the suite shows
-//! which was agreed.
+//! the key share. TLS 1.2 is offered after TLS 1.3, as by default, unless
+//! --tls13-only; the suite shows which was agreed.
 
 const std = @import("std");
 const ztls = @import("ztls");
@@ -22,11 +22,11 @@ pub fn main(init: std.process.Init) !void {
     var host: ?[]const u8 = null;
     var port: u16 = 443;
     var groups: std.ArrayList(ztls.protocol.NamedGroup) = .empty;
-    var tls12 = false;
+    var tls12 = true;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--tls12")) {
-            tls12 = true;
+        if (std.mem.eql(u8, args[i], "--tls13-only")) {
+            tls12 = false;
         } else if (std.mem.eql(u8, args[i], "--groups") and i + 1 < args.len) {
             i += 1;
             var names = std.mem.splitScalar(u8, args[i], ',');
@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage(out: *std.Io.Writer) !void {
-    try out.writeAll("usage: survey-probe HOST [PORT] [--groups a,b,...] [--tls12]\n");
+    try out.writeAll("usage: survey-probe HOST [PORT] [--groups a,b,...] [--tls13-only]\n");
     std.process.exit(2);
 }
 
@@ -72,8 +72,7 @@ fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, groups
         .alpn_protocols = &.{"http/1.1"},
         .now = std.Io.Clock.real.now(io),
     };
-    const both = ztls.protocol.CipherSuite.all ++ ztls.protocol.CipherSuite.tls12;
-    if (tls12) options.cipher_suites = &both;
+    if (!tls12) options.cipher_suites = &ztls.protocol.CipherSuite.all;
     if (groups.len > 0) {
         options.named_groups = groups;
         options.key_shares = groups[0..1];

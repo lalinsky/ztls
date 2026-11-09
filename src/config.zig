@@ -189,6 +189,8 @@ pub const ClientAuth = struct {
 };
 
 /// The groups a client supports, in preference order.
+/// TLS 1.3's suites, then TLS 1.2's, for servers that have nothing newer.
+pub const default_cipher_suites = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
 pub const default_named_groups = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1 };
 pub const default_server_named_groups = default_named_groups;
 /// The groups a client sends key shares for in its first ClientHello:
@@ -213,7 +215,8 @@ pub const Client = struct {
     auth: ?*const CertKeyPair = null,
     /// Offered in this order. Any of `CipherSuite.tls12` among them offers
     /// TLS 1.2 too, after TLS 1.3; with only those, TLS 1.2 alone.
-    cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
+    /// `CipherSuite.all` offers TLS 1.3 alone.
+    cipher_suites: []const proto.CipherSuite = &default_cipher_suites,
     named_groups: []const proto.NamedGroup = &default_named_groups,
     /// Groups to send key shares for; each must be in `named_groups`.
     key_shares: []const proto.NamedGroup = &default_key_shares,

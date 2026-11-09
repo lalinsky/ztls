@@ -582,7 +582,7 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair) E
 const testing = std.testing;
 
 test "a ServerHello must echo the session id and name TLS 1.3" {
-    const opt: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined };
+    const opt: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
     var session_id: [32]u8 = @splat(7);
     var buf: [256]u8 = undefined;
     var w = codec.Writer.init(&buf);
@@ -633,7 +633,7 @@ fn testServerHello(buf: []u8, version: proto.Version, random: *const [32]u8, ses
 test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
     const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
     const opt: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
-    const only13: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined };
+    const only13: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
     const ours: [32]u8 = @splat(7);
     const theirs: [32]u8 = @splat(9);
     var random: [32]u8 = @splat(0x5a);
