@@ -15,6 +15,7 @@ pub const c = @import("c");
 pub const err = @import("crypto/err.zig");
 pub const hash = @import("crypto/hash.zig");
 pub const hkdf = @import("crypto/hkdf.zig");
+pub const prf = @import("crypto/prf.zig");
 pub const aead = @import("crypto/aead.zig");
 pub const rand = @import("crypto/rand.zig");
 pub const kx = @import("crypto/kx.zig");

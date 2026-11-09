@@ -699,9 +699,9 @@ test "public key and private key matching" {
     defer public.deinit();
     try testing.expectEqual(sig.KeyType{ .ecdsa = .p256 }, public.key_type);
     var sig_buf: [128]u8 = undefined;
-    const signature = try key.sign(.ecdsa_p256_sha256, "transcript", &sig_buf);
-    try public.verify(.ecdsa_p256_sha256, "transcript", signature);
-    try testing.expectError(error.SignatureInvalid, public.verify(.ecdsa_p256_sha256, "other", signature));
+    const signature = try key.sign(.ecdsa_sha256, "transcript", &sig_buf);
+    try public.verify(.ecdsa_sha256, "transcript", signature);
+    try testing.expectError(error.SignatureInvalid, public.verify(.ecdsa_sha256, "other", signature));
 }
 
 test "matching a certificate's names" {

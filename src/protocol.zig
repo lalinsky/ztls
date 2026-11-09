@@ -19,27 +19,72 @@ pub const ContentType = enum(u8) {
 };
 
 pub const HandshakeType = enum(u8) {
+    hello_request = 0, // TLS 1.2
     client_hello = 1,
     server_hello = 2,
     new_session_ticket = 4,
     end_of_early_data = 5,
     encrypted_extensions = 8,
     certificate = 11,
+    server_key_exchange = 12, // TLS 1.2
     certificate_request = 13,
+    server_hello_done = 14, // TLS 1.2
     certificate_verify = 15,
+    client_key_exchange = 16, // TLS 1.2
     finished = 20,
     key_update = 24,
     message_hash = 254,
     _,
 };
 
+/// Whether the TLS 1.2 client is built in: the `tls12` build option,
+/// true unless `-Dtls12=false`. Without it the code is left out.
+pub const tls12_enabled = @import("build_options").tls12;
+
 pub const CipherSuite = enum(u16) {
     aes_128_gcm_sha256 = 0x1301,
     aes_256_gcm_sha384 = 0x1302,
     chacha20_poly1305_sha256 = 0x1303,
+    // TLS 1.2: ECDHE with an AEAD (RFC 5289, RFC 7905).
+    ecdhe_ecdsa_with_aes_128_gcm_sha256 = 0xc02b,
+    ecdhe_ecdsa_with_aes_256_gcm_sha384 = 0xc02c,
+    ecdhe_rsa_with_aes_128_gcm_sha256 = 0xc02f,
+    ecdhe_rsa_with_aes_256_gcm_sha384 = 0xc030,
+    ecdhe_rsa_with_chacha20_poly1305_sha256 = 0xcca8,
+    ecdhe_ecdsa_with_chacha20_poly1305_sha256 = 0xcca9,
+    /// Not a suite: a client's signal of secure renegotiation (RFC 5746).
+    empty_renegotiation_info_scsv = 0x00ff,
     _,
 
+    /// The TLS 1.3 suites.
     pub const all = [_]CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
+    /// The TLS 1.2 suites a client may offer, in preference order. Listing
+    /// any of them in a client's `cipher_suites` offers TLS 1.2, in a
+    /// build with `tls12_enabled`.
+    pub const tls12 = [_]CipherSuite{
+        .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .ecdhe_rsa_with_aes_128_gcm_sha256,
+        .ecdhe_ecdsa_with_chacha20_poly1305_sha256,
+        .ecdhe_rsa_with_chacha20_poly1305_sha256,
+        .ecdhe_ecdsa_with_aes_256_gcm_sha384,
+        .ecdhe_rsa_with_aes_256_gcm_sha384,
+    };
+
+    /// The protocol version a suite belongs to, null for one ztls does
+    /// not implement.
+    pub fn version(suite: CipherSuite) ?Version {
+        return switch (suite) {
+            .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 => .tls_1_3,
+            .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+            .ecdhe_ecdsa_with_aes_256_gcm_sha384,
+            .ecdhe_rsa_with_aes_128_gcm_sha256,
+            .ecdhe_rsa_with_aes_256_gcm_sha384,
+            .ecdhe_rsa_with_chacha20_poly1305_sha256,
+            .ecdhe_ecdsa_with_chacha20_poly1305_sha256,
+            => .tls_1_2,
+            else => null,
+        };
+    }
 };
 
 pub const Extension = enum(u16) {
@@ -47,10 +92,13 @@ pub const Extension = enum(u16) {
     max_fragment_length = 1,
     status_request = 5,
     supported_groups = 10,
+    ec_point_formats = 11, // TLS 1.2
     signature_algorithms = 13,
     application_layer_protocol_negotiation = 16,
     signed_certificate_timestamp = 18,
     padding = 21,
+    extended_master_secret = 23, // TLS 1.2
+    session_ticket = 35, // TLS 1.2
     pre_shared_key = 41,
     early_data = 42,
     supported_versions = 43,
@@ -61,6 +109,7 @@ pub const Extension = enum(u16) {
     post_handshake_auth = 49,
     signature_algorithms_cert = 50,
     key_share = 51,
+    renegotiation_info = 0xff01, // TLS 1.2
     _,
 };
 
@@ -134,6 +183,7 @@ pub const Alert = enum(u8) {
     internal_error = 80,
     inappropriate_fallback = 86,
     user_canceled = 90,
+    no_renegotiation = 100, // TLS 1.2
     missing_extension = 109,
     unsupported_extension = 110,
     unrecognized_name = 112,
@@ -171,6 +221,7 @@ pub const Alert = enum(u8) {
         TlsAlertInsufficientSecurity,
         TlsAlertInternalError,
         TlsAlertInappropriateFallback,
+        TlsAlertNoRenegotiation,
         TlsAlertMissingExtension,
         TlsAlertUnsupportedExtension,
         TlsAlertUnrecognizedName,
@@ -204,6 +255,7 @@ pub const Alert = enum(u8) {
             .insufficient_security => error.TlsAlertInsufficientSecurity,
             .internal_error => error.TlsAlertInternalError,
             .inappropriate_fallback => error.TlsAlertInappropriateFallback,
+            .no_renegotiation => error.TlsAlertNoRenegotiation,
             .missing_extension => error.TlsAlertMissingExtension,
             .unsupported_extension => error.TlsAlertUnsupportedExtension,
             .unrecognized_name => error.TlsAlertUnrecognizedName,
@@ -254,6 +306,7 @@ pub const Alert = enum(u8) {
             error.TlsInsufficientSecurity => .insufficient_security,
             error.TlsInternalError => .internal_error,
             error.TlsInappropriateFallback => .inappropriate_fallback,
+            error.TlsNoRenegotiation => .no_renegotiation,
             error.TlsMissingExtension => .missing_extension,
             error.TlsUnsupportedExtension => .unsupported_extension,
             error.TlsUnrecognizedName => .unrecognized_name,
@@ -310,6 +363,8 @@ pub const LocalError = error{
     TlsInsufficientSecurity,
     TlsInternalError,
     TlsInappropriateFallback,
+    /// A TLS 1.2 server asked to renegotiate, which we never do.
+    TlsNoRenegotiation,
     TlsMissingExtension,
     TlsUnsupportedExtension,
     TlsUnrecognizedName,

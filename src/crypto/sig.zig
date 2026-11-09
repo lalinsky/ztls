@@ -1,6 +1,7 @@
-//! Private and public keys for CertificateVerify: ECDSA, RSA-PSS and
-//! Ed25519 through AWS-LC's EVP interface, with each TLS 1.3 signature
-//! algorithm tied to the key it is defined for.
+//! Private and public keys for CertificateVerify and the TLS 1.2
+//! ServerKeyExchange: ECDSA, RSA-PSS, RSA PKCS#1 v1.5 and Ed25519 through
+//! AWS-LC's EVP interface, with each signature algorithm tied to the kind
+//! of key it is defined for.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -8,23 +9,27 @@ const c = @import("c");
 const err = @import("err.zig");
 const pem = @import("pem.zig");
 
-/// The signature algorithms of RFC 9846 §4.3.3 that may sign a
-/// CertificateVerify. The rsa_pkcs1 ones may only appear in certificates,
-/// where X.509 verification handles them.
+/// What a handshake signature computes: the hash and the padding or curve
+/// family, not the TLS protocol rules around it. Which TLS signature
+/// scheme maps to which algorithm, and what curve a TLS 1.3 ECDSA scheme
+/// binds the key to, is the handshake's business.
 pub const Algorithm = enum {
-    ecdsa_p256_sha256,
-    ecdsa_p384_sha384,
-    ecdsa_p521_sha512,
+    ecdsa_sha256,
+    ecdsa_sha384,
+    ecdsa_sha512,
     rsa_pss_sha256,
     rsa_pss_sha384,
     rsa_pss_sha512,
+    rsa_pkcs1_sha256,
+    rsa_pkcs1_sha384,
+    rsa_pkcs1_sha512,
     ed25519,
 
     fn md(a: Algorithm) ?*const c.EVP_MD {
         return switch (a) {
-            .ecdsa_p256_sha256, .rsa_pss_sha256 => c.EVP_sha256(),
-            .ecdsa_p384_sha384, .rsa_pss_sha384 => c.EVP_sha384(),
-            .ecdsa_p521_sha512, .rsa_pss_sha512 => c.EVP_sha512(),
+            .ecdsa_sha256, .rsa_pss_sha256, .rsa_pkcs1_sha256 => c.EVP_sha256(),
+            .ecdsa_sha384, .rsa_pss_sha384, .rsa_pkcs1_sha384 => c.EVP_sha384(),
+            .ecdsa_sha512, .rsa_pss_sha512, .rsa_pkcs1_sha512 => c.EVP_sha512(),
             .ed25519 => null,
         };
     }
@@ -36,13 +41,13 @@ pub const Algorithm = enum {
         };
     }
 
-    /// Whether a key of this type may sign or verify with the algorithm.
+    /// Whether a key of this kind may sign or verify with the algorithm.
+    /// ECDSA takes a key on any curve here.
     pub fn suits(a: Algorithm, key_type: KeyType) bool {
         return switch (a) {
-            .ecdsa_p256_sha256 => key_type == .ecdsa and key_type.ecdsa == .p256,
-            .ecdsa_p384_sha384 => key_type == .ecdsa and key_type.ecdsa == .p384,
-            .ecdsa_p521_sha512 => key_type == .ecdsa and key_type.ecdsa == .p521,
+            .ecdsa_sha256, .ecdsa_sha384, .ecdsa_sha512 => key_type == .ecdsa,
             .rsa_pss_sha256, .rsa_pss_sha384, .rsa_pss_sha512 => key_type == .rsa,
+            .rsa_pkcs1_sha256, .rsa_pkcs1_sha384, .rsa_pkcs1_sha512 => key_type == .rsa,
             .ed25519 => key_type == .ed25519,
         };
     }
@@ -204,8 +209,7 @@ pub const PublicKey = struct {
         self.* = undefined;
     }
 
-    /// Fails with `AlgorithmMismatch` unless `algorithm.suits(self.key_type)`:
-    /// TLS 1.3 ties each ECDSA curve to one hash.
+    /// Fails with `AlgorithmMismatch` unless `algorithm.suits(self.key_type)`.
     pub fn verify(self: *const PublicKey, algorithm: Algorithm, message: []const u8, signature: []const u8) error{ SignatureInvalid, AlgorithmMismatch, CryptoFailed }!void {
         if (!algorithm.suits(self.key_type)) return error.AlgorithmMismatch;
         var md_ctx: c.EVP_MD_CTX = undefined;
@@ -222,7 +226,8 @@ pub const PublicKey = struct {
 };
 
 /// RSA-PSS as TLS 1.3 wants it: MGF1 with the same hash (AWS-LC's default)
-/// and a salt as long as the digest.
+/// and a salt as long as the digest. PKCS#1 v1.5 is AWS-LC's default
+/// padding for RSA keys and needs nothing.
 fn setPss(pctx: ?*c.EVP_PKEY_CTX, algorithm: Algorithm) err.Error!void {
     if (!algorithm.isRsaPss()) return;
     if (c.EVP_PKEY_CTX_set_rsa_padding(pctx, c.RSA_PKCS1_PSS_PADDING) != 1) return err.fail();
@@ -232,13 +237,13 @@ fn setPss(pctx: ?*c.EVP_PKEY_CTX, algorithm: Algorithm) err.Error!void {
 const testing = std.testing;
 
 const test_keys = [_]struct { pem: []const u8, key_type: KeyType, algorithm: Algorithm }{
-    .{ .pem = @embedFile("../testdata/keys/ec_prime256v1_private_key.pem"), .key_type = .{ .ecdsa = .p256 }, .algorithm = .ecdsa_p256_sha256 },
-    .{ .pem = @embedFile("../testdata/keys/ec_private_key.pem"), .key_type = .{ .ecdsa = .p384 }, .algorithm = .ecdsa_p384_sha384 },
-    .{ .pem = @embedFile("../testdata/keys/ec_secp384r1_private_key.pem"), .key_type = .{ .ecdsa = .p384 }, .algorithm = .ecdsa_p384_sha384 },
+    .{ .pem = @embedFile("../testdata/keys/ec_prime256v1_private_key.pem"), .key_type = .{ .ecdsa = .p256 }, .algorithm = .ecdsa_sha256 },
+    .{ .pem = @embedFile("../testdata/keys/ec_private_key.pem"), .key_type = .{ .ecdsa = .p384 }, .algorithm = .ecdsa_sha384 },
+    .{ .pem = @embedFile("../testdata/keys/ec_secp384r1_private_key.pem"), .key_type = .{ .ecdsa = .p384 }, .algorithm = .ecdsa_sha384 },
     .{ .pem = @embedFile("../testdata/keys/ed25519_private_key.pem"), .key_type = .ed25519, .algorithm = .ed25519 },
     .{ .pem = @embedFile("../testdata/keys/rsa_private_key.pem"), .key_type = .{ .rsa = 2048 }, .algorithm = .rsa_pss_sha256 },
     .{ .pem = @embedFile("../testdata/pki/server-rsa.key"), .key_type = .{ .rsa = 2048 }, .algorithm = .rsa_pss_sha384 },
-    .{ .pem = @embedFile("../testdata/pki/server-chain.key"), .key_type = .{ .ecdsa = .p384 }, .algorithm = .ecdsa_p384_sha384 },
+    .{ .pem = @embedFile("../testdata/pki/server-chain.key"), .key_type = .{ .ecdsa = .p384 }, .algorithm = .ecdsa_sha384 },
 };
 
 /// The public half of a private key, as a verifier would hold it.
@@ -275,20 +280,55 @@ test "parse, sign and verify with every test key" {
     }
 }
 
-test "an algorithm must suit the key" {
+test "an algorithm must suit the kind of key" {
     var p256 = try PrivateKey.parsePem(testing.allocator, test_keys[0].pem);
     defer p256.deinit();
+    var rsa = try PrivateKey.parsePem(testing.allocator, test_keys[4].pem);
+    defer rsa.deinit();
+    var ed = try PrivateKey.parsePem(testing.allocator, test_keys[3].pem);
+    defer ed.deinit();
+    var sig_buf: [512]u8 = undefined;
+    try testing.expectError(error.AlgorithmMismatch, p256.sign(.rsa_pss_sha256, "m", &sig_buf));
+    try testing.expectError(error.AlgorithmMismatch, p256.sign(.rsa_pkcs1_sha256, "m", &sig_buf));
+    try testing.expectError(error.AlgorithmMismatch, p256.sign(.ed25519, "m", &sig_buf));
+    try testing.expectError(error.AlgorithmMismatch, rsa.sign(.ecdsa_sha256, "m", &sig_buf));
+    try testing.expectError(error.AlgorithmMismatch, ed.sign(.ecdsa_sha256, "m", &sig_buf));
+
+    const signature = try p256.sign(.ecdsa_sha256, "m", &sig_buf);
+    var public = try publicOf(&rsa);
+    defer public.deinit();
+    try testing.expectError(error.AlgorithmMismatch, public.verify(.ecdsa_sha256, "m", signature));
+}
+
+test "PKCS#1 v1.5, and ECDSA with any hash on any curve" {
+    var rsa = try PrivateKey.parsePem(testing.allocator, test_keys[4].pem);
+    defer rsa.deinit();
+    var rsa_public = try publicOf(&rsa);
+    defer rsa_public.deinit();
+    var sig_buf: [512]u8 = undefined;
+    for ([_]Algorithm{ .rsa_pkcs1_sha256, .rsa_pkcs1_sha384, .rsa_pkcs1_sha512 }) |algorithm| {
+        const signature = try rsa.sign(algorithm, "ServerKeyExchange", &sig_buf);
+        try rsa_public.verify(algorithm, "ServerKeyExchange", signature);
+        try testing.expectError(error.SignatureInvalid, rsa_public.verify(algorithm, "other", signature));
+        // PKCS#1 v1.5 and PSS are not interchangeable.
+        try testing.expectError(error.SignatureInvalid, rsa_public.verify(.rsa_pss_sha256, "ServerKeyExchange", signature));
+    }
+    // PKCS#1 v1.5 is deterministic: the same message, the same signature.
+    const a = try rsa.sign(.rsa_pkcs1_sha256, "m", &sig_buf);
+    var other_buf: [512]u8 = undefined;
+    const b = try rsa.sign(.rsa_pkcs1_sha256, "m", &other_buf);
+    try testing.expectEqualSlices(u8, a, b);
+
+    // A P-384 key with each hash; binding curves to hashes is TLS 1.3's
+    // rule, applied by the handshake.
     var p384 = try PrivateKey.parsePem(testing.allocator, test_keys[1].pem);
     defer p384.deinit();
-    var sig_buf: [512]u8 = undefined;
-    try testing.expectError(error.AlgorithmMismatch, p256.sign(.ecdsa_p384_sha384, "m", &sig_buf));
-    try testing.expectError(error.AlgorithmMismatch, p256.sign(.rsa_pss_sha256, "m", &sig_buf));
-    try testing.expectError(error.AlgorithmMismatch, p384.sign(.ed25519, "m", &sig_buf));
-
-    const signature = try p256.sign(.ecdsa_p256_sha256, "m", &sig_buf);
-    var public = try publicOf(&p384);
-    defer public.deinit();
-    try testing.expectError(error.AlgorithmMismatch, public.verify(.ecdsa_p256_sha256, "m", signature));
+    var p384_public = try publicOf(&p384);
+    defer p384_public.deinit();
+    for ([_]Algorithm{ .ecdsa_sha256, .ecdsa_sha384, .ecdsa_sha512 }) |algorithm| {
+        const signature = try p384.sign(algorithm, "ServerKeyExchange", &sig_buf);
+        try p384_public.verify(algorithm, "ServerKeyExchange", signature);
+    }
 }
 
 test "ed25519 signatures verify with std.crypto" {

@@ -14,7 +14,8 @@ pub const Certificate = crypto.x509.Certificate;
 /// task can hand the work to a thread pool.
 pub const Signer = struct {
     context: ?*anyopaque = null,
-    /// Signs `message`, the framed CertificateVerify content, with `key`
+    /// Signs `message`, the framed CertificateVerify content (in TLS 1.2,
+    /// the handshake messages so far, which can run long), with `key`
     /// under `algorithm` into `out`, and returns the signature as a slice
     /// of `out`. Runs on the handshake's task and may block or suspend;
     /// it must not touch the connection. Any error fails the handshake
@@ -187,6 +188,9 @@ pub const ClientAuth = struct {
     };
 };
 
+/// TLS 1.3's suites, then TLS 1.2's, for servers that have nothing newer,
+/// when the TLS 1.2 client is built in (`proto.tls12_enabled`).
+pub const default_cipher_suites = if (proto.tls12_enabled) proto.CipherSuite.all ++ proto.CipherSuite.tls12 else proto.CipherSuite.all;
 /// The groups a client supports, in preference order.
 pub const default_named_groups = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1 };
 pub const default_server_named_groups = default_named_groups;
@@ -210,7 +214,11 @@ pub const Client = struct {
     insecure_skip_verify: bool = false,
     /// A certificate to present if the server asks for one.
     auth: ?*const CertKeyPair = null,
-    cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
+    /// Offered in this order. Any of `CipherSuite.tls12` among them offers
+    /// TLS 1.2 too, after TLS 1.3; with only those, TLS 1.2 alone.
+    /// `CipherSuite.all` offers TLS 1.3 alone. TLS 1.2 suites in a build
+    /// without TLS 1.2 fail the handshake before anything is sent.
+    cipher_suites: []const proto.CipherSuite = &default_cipher_suites,
     named_groups: []const proto.NamedGroup = &default_named_groups,
     /// Groups to send key shares for; each must be in `named_groups`.
     key_shares: []const proto.NamedGroup = &default_key_shares,
@@ -242,6 +250,7 @@ pub const Server = struct {
     /// `auth` are tried. Null leaves the choice to them.
     select_certificate: ?SelectCertificate = null,
     client_auth: ?ClientAuth = null,
+    /// The server speaks TLS 1.3 only; TLS 1.2 suites here are skipped.
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
     /// Supported, in preference order. A client whose offer shares none

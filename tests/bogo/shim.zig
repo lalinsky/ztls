@@ -6,8 +6,8 @@
 //! stderr for the runner's error matching, and 89 says the flags ask for
 //! something this shim does not implement.
 //!
-//! Only TLS 1.3 over TCP is implemented; `config.json` beside this file
-//! disables the tests that need more.
+//! TLS 1.3 over TCP, and a TLS 1.2 client, are implemented; `config.json`
+//! beside this file disables the tests that need more.
 
 const std = @import("std");
 const ztls = @import("ztls");
@@ -47,6 +47,10 @@ const Options = struct {
     tls13_ciphers: std.ArrayList(u16) = .empty,
     min_version: u16 = 0,
     max_version: u16 = 0,
+    no_tls12: bool = false,
+    no_tls13: bool = false,
+    /// OpenSSL-style TLS 1.2 suite names, colon-separated.
+    cipher: ?[]const u8 = null,
     read_size: usize = 512,
     shim_writes_first: bool = false,
     shim_initial_write: []const u8 = "hello",
@@ -157,6 +161,9 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
             .{ .name = "-tls13-ciphers", .kind = .int_list, .field = "tls13_ciphers" },
             .{ .name = "-min-version", .kind = .int, .field = "min_version" },
             .{ .name = "-max-version", .kind = .int, .field = "max_version" },
+            .{ .name = "-no-tls12", .kind = .bool_flag, .field = "no_tls12" },
+            .{ .name = "-no-tls13", .kind = .bool_flag, .field = "no_tls13" },
+            .{ .name = "-cipher", .kind = .string, .field = "cipher" },
             .{ .name = "-read-size", .kind = .int, .field = "read_size" },
             .{ .name = "-shim-writes-first", .kind = .bool_flag, .field = "shim_writes_first" },
             .{ .name = "-shim-initial-write", .kind = .string, .field = "shim_initial_write" },
@@ -167,18 +174,18 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
             .{ .name = "-key-update-before-read", .kind = .bool_flag, .field = "key_update_before_read" },
             .{ .name = "-async", .kind = .bool_flag, .field = "async" },
         };
-        // Accepted and ignored: they ask for nothing of a TLS 1.3-only
-        // blocking implementation, or are about versions it never offers.
+        // Accepted and ignored: they ask for nothing of a blocking
+        // implementation, or are about versions it never offers.
         const ignored = [_][]const u8{
-            "-no-tls1",              "-no-tls11",                     "-no-tls12",              "-enable-grease",
-            "-permute-extensions",   "-fuzzer-mode",                  "-expect-ticket-renewal",
+            "-no-tls1",            "-no-tls11",             "-enable-grease",
+            "-permute-extensions", "-fuzzer-mode",          "-expect-ticket-renewal",
             // The handshake always runs first and whole here, and
             // certificates are configured up front, so these change nothing.
-            "-implicit-handshake",
-            "-handshake-never-done", "-use-old-client-cert-callback", "-use-early-callback",
+            "-implicit-handshake", "-handshake-never-done", "-use-old-client-cert-callback",
+            "-use-early-callback",
             // No sessions are ever cached.
-               "-expect-no-session-id",
-            "-expect-session-miss",  "-expect-no-session",
+            "-expect-no-session-id", "-expect-session-miss",
+            "-expect-no-session",
         };
         const ignored_with_value = [_][]const u8{ "-handshaker-path", "-expect-ticket-age-skew" };
 
@@ -243,6 +250,22 @@ fn fromWire(comptime E: type, id: u16) ?E {
     return null;
 }
 
+/// OpenSSL's names for the TLS 1.2 suites, as `-cipher` gives them.
+fn suiteFromName(name: []const u8) ?ztls.protocol.CipherSuite {
+    const names = [_]struct { []const u8, ztls.protocol.CipherSuite }{
+        .{ "ECDHE-ECDSA-AES128-GCM-SHA256", .ecdhe_ecdsa_with_aes_128_gcm_sha256 },
+        .{ "ECDHE-ECDSA-AES256-GCM-SHA384", .ecdhe_ecdsa_with_aes_256_gcm_sha384 },
+        .{ "ECDHE-RSA-AES128-GCM-SHA256", .ecdhe_rsa_with_aes_128_gcm_sha256 },
+        .{ "ECDHE-RSA-AES256-GCM-SHA384", .ecdhe_rsa_with_aes_256_gcm_sha384 },
+        .{ "ECDHE-ECDSA-CHACHA20-POLY1305", .ecdhe_ecdsa_with_chacha20_poly1305_sha256 },
+        .{ "ECDHE-RSA-CHACHA20-POLY1305", .ecdhe_rsa_with_chacha20_poly1305_sha256 },
+    };
+    for (names) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) return entry[1];
+    }
+    return null;
+}
+
 fn groupFromId(id: u16) ?ztls.protocol.NamedGroup {
     return fromWire(ztls.protocol.NamedGroup, id);
 }
@@ -288,10 +311,13 @@ pub fn main(init: std.process.Init) !void {
     }
     var o = try parseArgs(arena, args);
 
-    // Versions: only TLS 1.3 exists here.
-    if (o.max_version != 0 and o.max_version < 0x0304) unimplemented("max version {x}", .{o.max_version});
-    if (o.min_version > 0x0304) unimplemented("min version {x}", .{o.min_version});
-    if (o.expect_version != 0 and o.expect_version != 0x0304) fail("want version {x}, we only do 0304", .{o.expect_version});
+    // Versions: TLS 1.3 on both sides, TLS 1.2 for the client. Like
+    // BoringSSL, all of them by default.
+    const max_version: u16 = if (o.max_version == 0) 0x0304 else o.max_version;
+    const min_version: u16 = if (o.min_version == 0) 0x0301 else o.min_version;
+    const offer13 = !o.no_tls13 and min_version <= 0x0304 and max_version >= 0x0304;
+    const offer12 = ztls.protocol.tls12_enabled and !o.no_tls12 and !o.server and min_version <= 0x0303 and max_version >= 0x0303;
+    if (!offer13 and !offer12) unimplemented("versions {x} to {x}", .{ min_version, max_version });
 
     var named_groups: std.ArrayList(ztls.protocol.NamedGroup) = .empty;
     for (o.curves.items) |id| {
@@ -302,8 +328,19 @@ pub fn main(init: std.process.Init) !void {
         for (shares.items) |id| try key_shares.append(arena, groupFromId(id) orelse unimplemented("group {d}", .{id}));
     }
     var suites: std.ArrayList(ztls.protocol.CipherSuite) = .empty;
-    for (o.tls13_ciphers.items) |id| {
-        try suites.append(arena, suiteFromId(id) orelse unimplemented("cipher suite {x}", .{id}));
+    if (offer13) {
+        for (o.tls13_ciphers.items) |id| {
+            try suites.append(arena, suiteFromId(id) orelse unimplemented("cipher suite {x}", .{id}));
+        }
+        if (o.tls13_ciphers.items.len == 0) try suites.appendSlice(arena, &ztls.protocol.CipherSuite.all);
+    }
+    if (offer12) {
+        if (o.cipher) |names| {
+            var it = std.mem.tokenizeScalar(u8, names, ':');
+            while (it.next()) |name| try suites.append(arena, suiteFromName(name) orelse unimplemented("cipher {s}", .{name}));
+        } else {
+            try suites.appendSlice(arena, &ztls.protocol.CipherSuite.tls12);
+        }
     }
 
     var trust = try ztls.TrustStore.init();
@@ -377,7 +414,7 @@ pub fn main(init: std.process.Init) !void {
             // ztls's own default leaves P-384 out.
             .named_groups = &.{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1 },
         };
-        if (suites.items.len > 0) options.cipher_suites = suites.items;
+        options.cipher_suites = suites.items;
         if (named_groups.items.len > 0) {
             options.named_groups = named_groups.items;
             if (o.key_shares == null) {
@@ -400,9 +437,12 @@ pub fn main(init: std.process.Init) !void {
     }) catch |err| switch (err) {
         error.ReadFailed => fail("handshake: transport read failed: {s}", .{@errorName(tcp_reader.err orelse error.Unknown)}),
         error.WriteFailed => fail("handshake: transport write failed: {s}", .{@errorName(tcp_writer.err orelse error.Unknown)}),
-        // The runner wanted a version this shim does not speak: a test
-        // with no TLS 1.3 in it, which only its configuration knows.
-        error.TlsAlertProtocolVersion, error.TlsProtocolVersion => unimplemented("TLS 1.3 was not negotiated: {s}", .{@errorName(err)}),
+        // A server asked for a version it does not speak: a test with no
+        // TLS 1.3 in it, which only its configuration knows.
+        error.TlsAlertProtocolVersion, error.TlsProtocolVersion => if (o.server)
+            unimplemented("TLS 1.3 was not negotiated: {s}", .{@errorName(err)})
+        else
+            fail("handshake failed: {s}", .{@errorName(err)}),
         else => fail("handshake failed: {s}", .{@errorName(err)}),
     };
     defer conn.deinit();
@@ -459,6 +499,9 @@ fn readFailed(conn: *ztls.Connection, reader: *const ztls.Connection.Reader) nor
 }
 
 fn checkExpectations(gpa: std.mem.Allocator, io: std.Io, o: *const Options, conn: *const ztls.Connection) !void {
+    if (o.expect_version != 0 and @intFromEnum(conn.version.?) != o.expect_version) {
+        fail("Version was {x}, wanted {x}", .{ @intFromEnum(conn.version.?), o.expect_version });
+    }
     if (o.expect_cipher != 0 and @intFromEnum(conn.suite.?) != o.expect_cipher) {
         fail("Cipher ID was {x}, wanted {x}", .{ @intFromEnum(conn.suite.?), o.expect_cipher });
     }

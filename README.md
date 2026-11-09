@@ -1,6 +1,6 @@
 # ztls
 
-A TLS 1.3 library for Zig, built on [AWS-LC](https://github.com/aws/aws-lc)'s
+A TLS library for Zig, built on [AWS-LC](https://github.com/aws/aws-lc)'s
 libcrypto. It runs over any `std.Io.Reader` and `std.Io.Writer` and hands
 back a cleartext reader and writer of the same kind, on both the client and
 the server side.
@@ -15,8 +15,11 @@ Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system.
 
 ## Features
 
-- Client and server per [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846).
-  Older protocol versions are refused with a protocol_version alert.
+- TLS 1.3 client and server per [RFC 9846](https://www.rfc-editor.org/rfc/rfc9846).
+- A TLS 1.2 client, for servers that have nothing newer: ECDHE with
+  AES-GCM or ChaCha20-Poly1305 and the extended master secret, and no
+  renegotiation. Older versions are refused. The `tls12` build option,
+  set to false, leaves it out.
 - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305.
 - X25519MLKEM768, X25519, P-256 and P-384 key exchange, with
   HelloRetryRequest on both sides.

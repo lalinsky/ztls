@@ -20,17 +20,21 @@ const log = std.log.scoped(.ztls);
 
 /// The transport reader's buffer must hold one whole record.
 pub const input_buffer_len = cipher.max_record_len;
-/// The transport writer's buffer must hold one whole sealed record and the
-/// KeyUpdate that may have to go out ahead of it.
-pub const output_buffer_len = cipher.max_sealed_record_len + key_update_record_len;
+/// The transport writer's buffer must hold one whole sealed record and, in
+/// TLS 1.3, the KeyUpdate that may have to go out ahead of it.
+pub const output_buffer_len = @max(
+    cipher.Keys.sealedLenTls13(cipher.max_plaintext_len) + key_update_record_len,
+    cipher.max_sealed_record_len,
+);
 
 const key_update_msg_len = 4 + 1;
-const key_update_record_len = cipher.Keys.sealedLen(key_update_msg_len);
-/// Sealing the first `head` bytes of a window writes past them: the
-/// content type and tag land at window[head..head + 17], and when a
+const key_update_record_len = cipher.Keys.sealedLenTls13(key_update_msg_len);
+/// Sealing the first `head` bytes of a window writes past them. In TLS 1.3
+/// the content type and tag land at window[head..head + 17], and when a
 /// KeyUpdate is moved in ahead the plaintext shifts up by 27 first, so the
-/// record ends at window[head + 44]. Exactly that much of what follows is
-/// saved aside by `rebaseInPlace`.
+/// record ends at window[head + 44]; that much of what follows is saved
+/// aside by `rebaseInPlace`. A TLS 1.2 record writes only its 16-byte tag
+/// past `head` (the explicit nonce goes before the window), well within.
 const seal_spill = cipher.seal_overhead + key_update_record_len;
 /// Records carrying no application data (empty ones, post-handshake
 /// messages) a peer may send in a row before it is cut off.
@@ -38,9 +42,10 @@ const max_idle_records = 32;
 /// KeyUpdates a sender may make over a connection's life (§4.7.3).
 const max_key_updates: u64 = (1 << 48) - 1;
 
-/// Warning alerts a peer may send over a connection's life; TLS 1.3 has
-/// only user_canceled, and that once.
-const max_warning_alerts = 4;
+/// Warning alerts a peer may send in a row, with no other record between
+/// them, as BoringSSL counts them; TLS 1.3 has only user_canceled. TLS 1.2
+/// peers send others (unrecognized_name, say), each ignored.
+pub const max_warning_alerts = 4;
 
 /// What a read or write can fail with: the transport's own failure,
 /// something the record layer found, or an alert the peer sent.
@@ -53,6 +58,8 @@ pub const Failure = error{
     TlsUnexpectedMessage,
     TlsIllegalParameter,
     TlsInternalError,
+    TlsNoRenegotiation,
+    TlsProtocolVersion,
 } || proto.Alert.Error;
 /// What a read can fail with: the transport reader's failure, which does
 /// not end the connection, or a `Failure`, which does.
@@ -84,7 +91,9 @@ pub const Connection = struct {
 
     /// The protocol agreed through ALPN, pointing into the configuration.
     alpn_protocol: ?[]const u8 = null,
-    /// What the handshake settled on.
+    /// What the handshake settled on: TLS 1.3 or 1.2, the suite, the
+    /// (EC)DHE group.
+    version: ?proto.Version = null,
     suite: ?proto.CipherSuite = null,
     group: ?proto.NamedGroup = null,
     /// A HelloRetryRequest was needed.
@@ -110,12 +119,25 @@ pub const Connection = struct {
         cleartext: []u8 = &.{},
         /// Records in a row that carried no application data.
         idle_records: u32 = 0,
-        /// change_cipher_spec records and warning alerts seen, each capped.
+        /// change_cipher_spec records seen, and warning alerts in a row,
+        /// each capped.
         ccs_records: u32 = 0,
         warning_alerts: u32 = 0,
-        /// Whether a change_cipher_spec may arrive: the handshake says so
-        /// while §5 allows one, never afterwards.
-        accept_ccs: bool = false,
+        /// What a change_cipher_spec does, as the handshake says.
+        ccs: CcsMode = .refuse,
+        /// Every record must carry legacy_record_version 0x0303, as a TLS
+        /// 1.2 handshake demands once the version is agreed. TLS 1.3
+        /// ignores the field (RFC 9846 §5.1).
+        check_record_version: bool = false,
+    };
+
+    pub const CcsMode = enum {
+        /// Not now: unexpected_message.
+        refuse,
+        /// TLS 1.3 middlebox compatibility (§5): one byte of 0x01, dropped.
+        drop,
+        /// TLS 1.2: handed to the handshake, whose read keys it switches.
+        deliver,
     };
 
     /// Touched by the writing task only.
@@ -189,6 +211,8 @@ pub const Connection = struct {
         TlsDecodeError,
         TlsUnexpectedMessage,
         TlsInternalError,
+        TlsIllegalParameter,
+        TlsProtocolVersion,
     };
 
     /// The next record. With keys it is opened in place, or into `dest` when
@@ -203,7 +227,9 @@ pub const Connection = struct {
                 error.ReadFailed => return error.ReadFailed,
             };
             const content_type: proto.ContentType = @enumFromInt(header[0]);
-            // legacy_record_version is ignored, as RFC 9846 §5.1 says.
+            if (proto.tls12_enabled and c.read.check_record_version and std.mem.readInt(u16, header[1..3], .big) != @intFromEnum(proto.Version.tls_1_2)) {
+                return error.TlsProtocolVersion;
+            }
             const body_len = std.mem.readInt(u16, header[3..5], .big);
             if (body_len > cipher.max_ciphertext_len) return error.TlsRecordOverflow;
             const record = c.input.take(cipher.header_len + body_len) catch |err| switch (err) {
@@ -213,26 +239,29 @@ pub const Connection = struct {
             const body = record[cipher.header_len..];
 
             if (c.read.keys) |*keys| {
+                // TLS 1.3 hides the content type inside application_data;
+                // TLS 1.2 protects each type under its own.
+                const protected = switch (keys.version) {
+                    .tls13 => content_type == .application_data,
+                    .tls12 => content_type == .application_data or content_type == .handshake or content_type == .alert,
+                };
+                if (protected) {
+                    const inner_len = keys.openLen(record.len);
+                    // In place: where the ciphertext starts. A record too
+                    // short for that fails in `open` before writing.
+                    const in_place = record[@min(record.len, keys.payloadOffset())..];
+                    const out = if (dest) |d| (if (d.len >= inner_len) d else in_place) else in_place;
+                    const opened = keys.open(record, out) catch |err| switch (err) {
+                        error.TlsBadRecordMac => return error.TlsBadRecordMac,
+                        error.TlsDecodeError => return error.TlsDecodeError,
+                        error.TlsRecordOverflow => return error.TlsRecordOverflow,
+                        error.TlsUnexpectedMessage => return error.TlsUnexpectedMessage,
+                        error.TlsInternalError => return error.TlsInternalError,
+                    };
+                    return .{ .content_type = opened.content_type, .payload = out[0..opened.len] };
+                }
                 switch (content_type) {
-                    .application_data => {
-                        const inner_len = body_len -| crypto.aead.tag_length;
-                        const out = if (dest) |d| (if (d.len >= inner_len) d else body) else body;
-                        const opened = keys.open(record, out) catch |err| switch (err) {
-                            error.TlsBadRecordMac => return error.TlsBadRecordMac,
-                            error.TlsDecodeError => return error.TlsDecodeError,
-                            error.TlsRecordOverflow => return error.TlsRecordOverflow,
-                            error.TlsUnexpectedMessage => return error.TlsUnexpectedMessage,
-                            error.TlsInternalError => return error.TlsInternalError,
-                        };
-                        return .{ .content_type = opened.content_type, .payload = out[0..opened.len] };
-                    },
-                    .change_cipher_spec => {
-                        // Middlebox compatibility (§5): one byte of 0x01,
-                        // dropped, where the handshake allows it.
-                        if (!c.read.accept_ccs or body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
-                        try c.countChangeCipherSpec();
-                        continue;
-                    },
+                    .change_cipher_spec => if (try c.changeCipherSpec(body)) |r| return r else continue,
                     else => return error.TlsUnexpectedMessage,
                 }
             } else {
@@ -247,11 +276,7 @@ pub const Connection = struct {
                         if (body_len > cipher.max_plaintext_len) return error.TlsRecordOverflow;
                         return .{ .content_type = content_type, .payload = body };
                     },
-                    .change_cipher_spec => {
-                        if (!c.read.accept_ccs or body_len != 1 or body[0] != 1) return error.TlsUnexpectedMessage;
-                        try c.countChangeCipherSpec();
-                        continue;
-                    },
+                    .change_cipher_spec => if (try c.changeCipherSpec(body)) |r| return r else continue,
                     else => return error.TlsUnexpectedMessage,
                 }
             }
@@ -304,6 +329,9 @@ pub const Connection = struct {
                     return e;
                 },
             };
+            // Empty records leave the count be, as in BoringSSL: they are
+            // capped on their own.
+            if (record.content_type != .alert and record.payload.len > 0) c.read.warning_alerts = 0;
             switch (record.content_type) {
                 .application_data => {
                     if (record.payload.len == 0) {
@@ -326,6 +354,18 @@ pub const Connection = struct {
                         return error.TlsIllegalParameter;
                     }
                     const alert = proto.Alert.decode(record.payload[0..2]);
+                    // TLS 1.2 warnings other than close_notify are notes,
+                    // not failures (RFC 5246 §7.2), within the cap.
+                    if (proto.tls12_enabled and level == 1 and alert != .close_notify and c.read.keys.?.version == .tls12) {
+                        c.read.warning_alerts += 1;
+                        if (c.read.warning_alerts > max_warning_alerts) {
+                            c.failRead(error.TlsUnexpectedMessage);
+                            return error.TlsUnexpectedMessage;
+                        }
+                        // Not idle records: warnings and empty records
+                        // have caps of their own, as in BoringSSL.
+                        continue;
+                    }
                     if (alert.toError()) |err| {
                         // The peer's failure, whatever level it claims
                         // (§6): it will not read an alert back.
@@ -367,10 +407,24 @@ pub const Connection = struct {
         }
     }
 
-    /// One per side is the norm; a flood is a peer wasting our time.
-    fn countChangeCipherSpec(c: *Connection) error{TlsUnexpectedMessage}!void {
-        c.read.ccs_records += 1;
-        if (c.read.ccs_records > max_idle_records) return error.TlsUnexpectedMessage;
+    /// A change_cipher_spec record, as `read.ccs` says: refused, dropped
+    /// (null), or returned to the handshake. Its body is one byte of 0x01.
+    fn changeCipherSpec(c: *Connection, body: []u8) ReadRecordError!?Record {
+        const valid = body.len == 1 and body[0] == 1;
+        switch (c.read.ccs) {
+            .refuse => return error.TlsUnexpectedMessage,
+            .drop => {
+                if (!valid) return error.TlsUnexpectedMessage;
+                // One per side is the norm; a flood is a peer wasting our time.
+                c.read.ccs_records += 1;
+                if (c.read.ccs_records > max_idle_records) return error.TlsUnexpectedMessage;
+                return null;
+            },
+            .deliver => {
+                if (!valid) return error.TlsIllegalParameter;
+                return .{ .content_type = .change_cipher_spec, .payload = body };
+            },
+        }
     }
 
     fn countIdleRecord(c: *Connection) Failure!void {
@@ -381,12 +435,29 @@ pub const Connection = struct {
         }
     }
 
-    /// Handshake messages after the handshake: KeyUpdate, and
+    /// Handshake messages after the handshake. In TLS 1.3: KeyUpdate, and
     /// NewSessionTicket, which v1 drops. Each must be whole within its
     /// record (every known stack sends them so; a ticket split across
     /// records would be an interop failure rather than a violation), and
-    /// KeyUpdate must be the record's last message (§4.7.3).
+    /// KeyUpdate must be the record's last message (§4.7.3). In TLS 1.2
+    /// only HelloRequest, the server asking to renegotiate, which we never
+    /// do: it is refused with a fatal no_renegotiation (RFC 5746 §4.2),
+    /// as AWS-LC and Go do by default, so a server waiting for it fails at
+    /// once rather than at its timeout.
     fn handlePostHandshake(c: *Connection, payload: []const u8) Failure!void {
+        const keys = &c.read.keys.?;
+        const tls13 = switch (keys.version) {
+            .tls13 => |*tls13| tls13,
+            // HelloRequest is refused on its first fragment: a peer may
+            // split its four bytes across records, and the rest changes
+            // nothing.
+            .tls12 => {
+                if (!proto.tls12_enabled) unreachable;
+                if (payload[0] != @intFromEnum(proto.HandshakeType.hello_request)) return error.TlsUnexpectedMessage;
+                for (payload[0..@min(payload.len, 4)]) |b| if (b != 0) return error.TlsDecodeError;
+                return error.TlsNoRenegotiation;
+            },
+        };
         var d = codec.Decoder.init(payload);
         while (!d.eof()) {
             const handshake_type = d.decode(proto.HandshakeType) catch return error.TlsDecodeError;
@@ -401,7 +472,7 @@ pub const Connection = struct {
                         .update_requested => c.shared.key_update_requested.store(true, .monotonic),
                         _ => return error.TlsIllegalParameter,
                     }
-                    c.read.keys.?.update() catch return error.TlsInternalError;
+                    keys.update(tls13) catch return error.TlsInternalError;
                 },
                 .new_session_ticket => {},
                 else => return error.TlsUnexpectedMessage,
@@ -515,9 +586,9 @@ pub const Connection = struct {
     fn writeRecord(c: *Connection, content_type: proto.ContentType, payload: []const u8) WriteRecordError!void {
         assert(payload.len <= cipher.max_plaintext_len);
         const keys = &c.write.keys.?;
-        const record_len = cipher.Keys.sealedLen(payload.len);
+        const record_len = keys.sealedLen(payload.len);
         const dest = c.output.writableSliceGreedy(record_len) catch return error.WriteFailed;
-        @memcpy(dest[cipher.header_len..][0..payload.len], payload);
+        @memcpy(dest[keys.payloadOffset()..][0..payload.len], payload);
         try keys.seal(dest[0..record_len], content_type, payload.len);
         c.output.advance(record_len);
     }
@@ -555,25 +626,32 @@ pub const Connection = struct {
         c.output.flush() catch return error.WriteFailed;
     }
 
-    /// Whether a KeyUpdate has to go out before the next record, claiming
+    /// The TLS 1.3 key state a KeyUpdate has to go out with before the next
+    /// record, or null when none is due, claiming
     /// the peer's request if there is one. The claim happens before the
     /// update is sent, so a request arriving in between stays set and is
     /// answered before the record after this one. A request is answered
     /// only when something is written, which §4.7.3 allows: a connection
     /// that never writes again never answers, and the peer is not blocked.
     /// Past `max_key_updates` there is no update (§4.7.3): a request is
-    /// ignored and the keys stay until `seal` refuses them.
-    fn claimKeyUpdate(c: *Connection) bool {
+    /// ignored and the keys stay until `seal` refuses them. TLS 1.2 has no
+    /// KeyUpdate; its keys last until the sequence number runs out.
+    fn claimKeyUpdate(c: *Connection) ?*const cipher.Tls13 {
+        const keys = &c.write.keys.?;
+        const tls13 = switch (keys.version) {
+            .tls13 => |*tls13| tls13,
+            .tls12 => return null,
+        };
         const requested = c.shared.key_update_requested.load(.monotonic) and
             c.shared.key_update_requested.swap(false, .monotonic);
-        if (c.write.key_updates >= max_key_updates) return false;
-        return requested or c.write.keys.?.seq >= c.write.keys.?.recordLimit();
+        if (c.write.key_updates >= max_key_updates) return null;
+        return if (requested or keys.seq >= keys.recordLimit()) tls13 else null;
     }
 
     /// Moves the write keys to the next generation, after the KeyUpdate
     /// announcing it was sealed with the old ones.
-    fn advanceWriteKeys(c: *Connection) error{TlsInternalError}!void {
-        c.write.keys.?.update() catch return error.TlsInternalError;
+    fn advanceWriteKeys(c: *Connection, tls13: *const cipher.Tls13) error{TlsInternalError}!void {
+        c.write.keys.?.update(tls13) catch return error.TlsInternalError;
         c.write.key_updates += 1;
     }
 
@@ -582,17 +660,22 @@ pub const Connection = struct {
     }
 
     /// Sends a KeyUpdate and moves the write keys to the next generation.
-    fn sendKeyUpdate(c: *Connection, request: proto.KeyUpdateRequest) WriteError!void {
+    fn sendKeyUpdate(c: *Connection, request: proto.KeyUpdateRequest, tls13: *const cipher.Tls13) WriteError!void {
         try c.writeRecord(.handshake, &keyUpdateMessage(request));
-        try c.advanceWriteKeys();
+        try c.advanceWriteKeys(tls13);
     }
 
     /// Asks the peer to update its keys, updating ours first (§4.7.3).
-    /// For the writing task. Does nothing past `max_key_updates`.
+    /// For the writing task. Does nothing past `max_key_updates`, nor in
+    /// TLS 1.2, which has no KeyUpdate.
     pub fn requestKeyUpdate(c: *Connection) WriteError!void {
         try c.checkWritable();
+        const tls13 = switch (c.write.keys.?.version) {
+            .tls13 => |*tls13| tls13,
+            .tls12 => return,
+        };
         if (c.write.key_updates >= max_key_updates) return;
-        c.sendKeyUpdate(.update_requested) catch |err| return c.failWrite(err);
+        c.sendKeyUpdate(.update_requested, tls13) catch |err| return c.failWrite(err);
         try c.flushOutput();
     }
 
@@ -626,13 +709,19 @@ pub const Connection = struct {
     }
 
     /// Where the next in-place record's plaintext goes: inside `output`'s
-    /// unused capacity, after the header, with room left for the trailer
-    /// and for a KeyUpdate ahead of it. Empty when `output` needs flushing.
+    /// unused capacity, after the header (and TLS 1.2 AES-GCM's explicit
+    /// nonce), with room left for the trailer and, in TLS 1.3, for a
+    /// KeyUpdate ahead of it. Empty when `output` needs flushing.
     fn payloadWindow(c: *Connection) []u8 {
+        const keys = &c.write.keys.?;
         const unused = c.output.unusedCapacitySlice();
-        const reserved = cipher.header_len + seal_spill;
+        const offset = keys.payloadOffset();
+        const reserved = offset + switch (keys.version) {
+            .tls13 => seal_spill,
+            .tls12 => keys.trailerLen(),
+        };
         if (unused.len <= reserved) return unused[0..0];
-        return unused[cipher.header_len..][0..@min(cipher.max_plaintext_len, unused.len - reserved)];
+        return unused[offset..][0..@min(cipher.max_plaintext_len, unused.len - reserved)];
     }
 
     /// Seals the first `len` bytes of `payloadWindow()` where they are, as
@@ -644,17 +733,18 @@ pub const Connection = struct {
         const keys = &c.write.keys.?;
         const buf = c.output.unusedCapacitySlice();
         var at: usize = 0;
-        if (c.claimKeyUpdate()) {
+        if (c.claimKeyUpdate()) |tls13| {
+            // TLS 1.3 only, so the plaintext starts right after the header.
             std.mem.copyBackwards(u8, buf[key_update_record_len + cipher.header_len ..][0..len], buf[cipher.header_len..][0..len]);
             const msg = keyUpdateMessage(.update_not_requested);
             buf[cipher.header_len..][0..msg.len].* = msg;
             keys.seal(buf[0..key_update_record_len], .handshake, msg.len) catch |err| return c.failWrite(err);
-            c.advanceWriteKeys() catch |err| return c.failWrite(err);
+            c.advanceWriteKeys(tls13) catch |err| return c.failWrite(err);
             at = key_update_record_len;
         }
         if (len > 0) {
             keys.seal(buf[at..], .application_data, len) catch |err| return c.failWrite(err);
-            at += cipher.Keys.sealedLen(len);
+            at += keys.sealedLen(len);
         }
         c.output.advance(at);
         if (c.output.unusedCapacityLen() < output_buffer_len) {
@@ -875,15 +965,31 @@ const testing = std.testing;
 const testu = @import("testu.zig");
 const key_schedule = @import("key_schedule.zig");
 
+/// The record protection a self-talk runs under.
+const Mode = union(enum) {
+    tls13: proto.CipherSuite,
+    tls12: crypto.aead.Algorithm,
+};
+
+const every_mode = [_]Mode{
+    .{ .tls13 = .aes_128_gcm_sha256 },
+    .{ .tls13 = .aes_256_gcm_sha384 },
+    .{ .tls13 = .chacha20_poly1305_sha256 },
+} ++ if (proto.tls12_enabled) [_]Mode{
+    .{ .tls12 = .aes_128_gcm },
+    .{ .tls12 = .aes_256_gcm },
+    .{ .tls12 = .chacha20_poly1305 },
+} else [_]Mode{};
+
 /// Both ends of a connection with pre-derived keys, over a loopback
 /// socket: the peer runs as a concurrent task.
 const SelfTalk = struct {
     io: Io,
     loopback: testu.Loopback,
-    suite: proto.CipherSuite,
+    mode: Mode,
 
-    fn init(io: Io, suite: proto.CipherSuite) !SelfTalk {
-        return .{ .io = io, .loopback = try testu.Loopback.init(io), .suite = suite };
+    fn init(io: Io, mode: Mode) !SelfTalk {
+        return .{ .io = io, .loopback = try testu.Loopback.init(io), .mode = mode };
     }
 
     fn deinit(self: *SelfTalk) void {
@@ -891,8 +997,18 @@ const SelfTalk = struct {
     }
 
     fn keys(self: *const SelfTalk, which: key_schedule.TrafficLabel) !cipher.Keys {
-        const ks = key_schedule.KeySchedule.init(cipher.suiteHash(self.suite).?);
-        return cipher.Keys.init(self.suite, ks.trafficSecret(which, "self-talk"));
+        switch (self.mode) {
+            .tls13 => |suite| {
+                const ks = key_schedule.KeySchedule.init(cipher.suiteHash(suite).?);
+                return cipher.Keys.init(suite, ks.trafficSecret(which, "self-talk"));
+            },
+            .tls12 => |algorithm| {
+                // A different key and IV for each direction.
+                const key: [crypto.aead.max_key_length]u8 = @splat(@as(u8, @intFromEnum(which)) + 1);
+                const iv: [crypto.aead.nonce_length]u8 = @splat(@as(u8, @intFromEnum(which)) + 0x41);
+                return cipher.Keys.initTls12(algorithm, key[0..algorithm.keyLength()], iv[0..cipher.tls12FixedIvLen(algorithm)]);
+            },
+        }
     }
 
     /// One end, with its transport buffers; `deinit` before leaving the task.
@@ -934,8 +1050,8 @@ const SelfTalk = struct {
 
 test "application data both ways, then close_notify" {
     const io = testing.io;
-    for (proto.CipherSuite.all) |suite| {
-        var st = try SelfTalk.init(io, suite);
+    for (every_mode) |mode| {
+        var st = try SelfTalk.init(io, mode);
         defer st.deinit();
 
         const Peer = struct {
@@ -983,8 +1099,15 @@ test "application data both ways, then close_notify" {
 }
 
 test "large transfers through both writers, with small and swapped reader buffers" {
+    for ([_]Mode{ .{ .tls13 = .aes_128_gcm_sha256 }, .{ .tls12 = .aes_128_gcm }, .{ .tls12 = .chacha20_poly1305 } }) |mode| {
+        if (mode == .tls12 and !proto.tls12_enabled) continue;
+        try largeTransfer(mode);
+    }
+}
+
+fn largeTransfer(mode: Mode) !void {
     const io = testing.io;
-    var st = try SelfTalk.init(io, .aes_128_gcm_sha256);
+    var st = try SelfTalk.init(io, mode);
     defer st.deinit();
     const total = 300 * 1024;
 
@@ -1076,7 +1199,7 @@ test "large transfers through both writers, with small and swapped reader buffer
 
 test "key updates from both sides" {
     const io = testing.io;
-    var st = try SelfTalk.init(io, .chacha20_poly1305_sha256);
+    var st = try SelfTalk.init(io, .{ .tls13 = .chacha20_poly1305_sha256 });
     defer st.deinit();
 
     const Peer = struct {
@@ -1107,8 +1230,8 @@ test "key updates from both sides" {
     var rbuf: [256]u8 = undefined;
     var r = end.conn.reader(&rbuf);
     var w = end.conn.inPlaceWriter();
-    const write_gen0 = end.conn.write.keys.?.secret;
-    const read_gen0 = end.conn.read.keys.?.secret;
+    const write_gen0 = end.conn.write.keys.?.version.tls13.secret;
+    const read_gen0 = end.conn.read.keys.?.version.tls13.secret;
     for (0..6) |i| {
         if (i == 4) try end.conn.requestKeyUpdate();
         try w.interface.print("message {d}\n", .{i});
@@ -1120,17 +1243,17 @@ test "key updates from both sides" {
     // before message 3 went out; our request before message 4 rotated
     // them again, and the peer's answer rotated its write keys, our read
     // keys, twice in all.
-    try testing.expect(!std.mem.eql(u8, write_gen0.slice(), end.conn.write.keys.?.secret.slice()));
-    try testing.expect(!std.mem.eql(u8, read_gen0.slice(), end.conn.read.keys.?.secret.slice()));
+    try testing.expect(!std.mem.eql(u8, write_gen0.slice(), end.conn.write.keys.?.version.tls13.secret.slice()));
+    try testing.expect(!std.mem.eql(u8, read_gen0.slice(), end.conn.read.keys.?.version.tls13.secret.slice()));
     const expected_write = key_schedule.nextTrafficSecret(.sha256, &key_schedule.nextTrafficSecret(.sha256, &write_gen0));
-    try testing.expectEqualSlices(u8, expected_write.slice(), end.conn.write.keys.?.secret.slice());
+    try testing.expectEqualSlices(u8, expected_write.slice(), end.conn.write.keys.?.version.tls13.secret.slice());
     try end.conn.close();
     try peer.await(io);
 }
 
 test "past the key update cap a sender ignores requests and keeps its keys" {
     const io = testing.io;
-    var st = try SelfTalk.init(io, .aes_128_gcm_sha256);
+    var st = try SelfTalk.init(io, .{ .tls13 = .aes_128_gcm_sha256 });
     defer st.deinit();
 
     const Peer = struct {
@@ -1155,7 +1278,7 @@ test "past the key update cap a sender ignores requests and keeps its keys" {
     try st.client(&end);
     defer end.deinit();
     end.conn.write.key_updates = max_key_updates;
-    const before = end.conn.write.keys.?.secret;
+    const before = end.conn.write.keys.?.version.tls13.secret;
     var rbuf: [256]u8 = undefined;
     var r = end.conn.reader(&rbuf);
     var w = end.conn.inPlaceWriter();
@@ -1163,7 +1286,7 @@ test "past the key update cap a sender ignores requests and keeps its keys" {
     try end.conn.requestKeyUpdate(); // nothing happens at the cap
     try w.interface.writeAll("pong\n");
     try w.interface.flush();
-    try testing.expectEqualSlices(u8, before.slice(), end.conn.write.keys.?.secret.slice());
+    try testing.expectEqualSlices(u8, before.slice(), end.conn.write.keys.?.version.tls13.secret.slice());
     try testing.expectEqual(max_key_updates, end.conn.write.key_updates);
     try end.conn.close();
     try peer.await(io);
@@ -1188,7 +1311,7 @@ test "malformed post-handshake records: empty, and a KeyUpdate with trailing byt
         .{ .payload = &.{ @intFromEnum(proto.HandshakeType.key_update), 0, 0, 2, 0, 0 }, .expected = error.TlsDecodeError },
     };
     for (cases) |case| {
-        var st = try SelfTalk.init(io, .aes_128_gcm_sha256);
+        var st = try SelfTalk.init(io, .{ .tls13 = .aes_128_gcm_sha256 });
         defer st.deinit();
 
         const Peer = struct {
@@ -1223,7 +1346,7 @@ test "malformed post-handshake records: empty, and a KeyUpdate with trailing byt
 
 test "a bad record fails the reader, and the writer sends the alert" {
     const io = testing.io;
-    var st = try SelfTalk.init(io, .aes_256_gcm_sha384);
+    var st = try SelfTalk.init(io, .{ .tls13 = .aes_256_gcm_sha384 });
     defer st.deinit();
 
     const Peer = struct {
@@ -1237,11 +1360,12 @@ test "a bad record fails the reader, and the writer sends the alert" {
             try w.interface.writeAll("fine\n");
             try w.interface.flush();
             // Corrupt the next record on the wire: seal it, then flip a bit.
-            const rec = try end.output.interface.writableSliceGreedy(cipher.Keys.sealedLen(5));
-            rec[cipher.header_len..][0..5].* = "oops\n".*;
-            try end.conn.write.keys.?.seal(rec[0..cipher.Keys.sealedLen(5)], .application_data, 5);
-            rec[cipher.header_len + 2] ^= 0x40;
-            end.output.interface.advance(cipher.Keys.sealedLen(5));
+            const keys = &end.conn.write.keys.?;
+            const rec = try end.output.interface.writableSliceGreedy(keys.sealedLen(5));
+            rec[keys.payloadOffset()..][0..5].* = "oops\n".*;
+            try keys.seal(rec[0..keys.sealedLen(5)], .application_data, 5);
+            rec[keys.payloadOffset() + 2] ^= 0x40;
+            end.output.interface.advance(keys.sealedLen(5));
             try end.output.interface.flush();
             // The client's reader fails and its writer sends bad_record_mac.
             try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
@@ -1276,7 +1400,7 @@ test "a bad record fails the reader, and the writer sends the alert" {
 test "transport ending without close_notify: clean at a record boundary, truncated inside one" {
     const io = testing.io;
     for ([_]bool{ false, true }) |strict| {
-        var st = try SelfTalk.init(io, .aes_128_gcm_sha256);
+        var st = try SelfTalk.init(io, .{ .tls13 = .aes_128_gcm_sha256 });
         defer st.deinit();
 
         const Peer = struct {
@@ -1288,10 +1412,11 @@ test "transport ending without close_notify: clean at a record boundary, truncat
                 try w.interface.writeAll("whole record\n");
                 try w.interface.flush();
                 if (cut) {
-                    const rec = try end.output.interface.writableSliceGreedy(cipher.Keys.sealedLen(4));
-                    rec[cipher.header_len..][0..4].* = "half".*;
-                    try end.conn.write.keys.?.seal(rec[0..cipher.Keys.sealedLen(4)], .application_data, 4);
-                    end.output.interface.advance(cipher.Keys.sealedLen(4) - 3);
+                    const keys = &end.conn.write.keys.?;
+                    const rec = try end.output.interface.writableSliceGreedy(keys.sealedLen(4));
+                    rec[keys.payloadOffset()..][0..4].* = "half".*;
+                    try keys.seal(rec[0..keys.sealedLen(4)], .application_data, 4);
+                    end.output.interface.advance(keys.sealedLen(4) - 3);
                     try end.output.interface.flush();
                 }
                 // Then just hang up.
@@ -1324,8 +1449,15 @@ test "transport ending without close_notify: clean at a record boundary, truncat
 }
 
 test "concurrent reading and writing tasks on both ends" {
+    for ([_]Mode{ .{ .tls13 = .aes_128_gcm_sha256 }, .{ .tls12 = .aes_256_gcm } }) |mode| {
+        if (mode == .tls12 and !proto.tls12_enabled) continue;
+        try concurrentTasks(mode);
+    }
+}
+
+fn concurrentTasks(mode: Mode) !void {
     const io = testing.io;
-    var st = try SelfTalk.init(io, .aes_128_gcm_sha256);
+    var st = try SelfTalk.init(io, mode);
     defer st.deinit();
     const lines = 2000;
 
@@ -1367,5 +1499,127 @@ test "concurrent reading and writing tasks on both ends" {
     defer sender.cancel(io) catch {};
     try Tasks.receive(&end.conn, "server");
     try sender.await(io);
+    try peer.await(io);
+}
+
+test "TLS 1.2: warning alerts are ignored, KeyUpdate is not" {
+    if (!proto.tls12_enabled) return error.SkipZigTest;
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .{ .tls12 = .aes_128_gcm });
+    defer st.deinit();
+
+    const Peer = struct {
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            // Warnings in protected alert records, more than the cap over
+            // the connection but never more than it in a row.
+            for (0..max_warning_alerts + 2) |_| {
+                try end.conn.writeRecord(.alert, &.{ 1, @intFromEnum(proto.Alert.unrecognized_name) });
+                try end.conn.writeRecord(.application_data, "data\n");
+            }
+            try end.conn.flushOutput();
+            var rbuf: [256]u8 = undefined;
+            var r = end.conn.reader(&rbuf);
+            try testing.expectEqualStrings("ack", (try r.interface.takeDelimiter('\n')).?);
+            // A KeyUpdate has no place in TLS 1.2.
+            try end.conn.writeRecord(.handshake, &.{ @intFromEnum(proto.HandshakeType.key_update), 0, 0, 1, 0 });
+            try end.conn.flushOutput();
+            try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+            try testing.expectEqual(error.TlsAlertUnexpectedMessage, r.err.?);
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = end.conn.reader(&rbuf);
+    var w = end.conn.inPlaceWriter();
+    for (0..max_warning_alerts + 2) |_| {
+        try testing.expectEqualStrings("data", (try r.interface.takeDelimiter('\n')).?);
+    }
+    // No KeyUpdate in TLS 1.2: asking for one does nothing.
+    const seq = end.conn.write.keys.?.seq;
+    try end.conn.requestKeyUpdate();
+    try testing.expectEqual(seq, end.conn.write.keys.?.seq);
+    try w.interface.writeAll("ack\n");
+    try w.interface.flush();
+    try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+    try testing.expectEqual(error.TlsUnexpectedMessage, r.err.?);
+    // The writer sends the alert and fails with the reader's cause.
+    try w.interface.writeAll("x");
+    try testing.expectError(error.WriteFailed, w.interface.flush());
+    try testing.expectEqual(error.TlsUnexpectedMessage, w.err.?);
+    try peer.await(io);
+}
+
+test "TLS 1.2: HelloRequest is refused with no_renegotiation" {
+    if (!proto.tls12_enabled) return error.SkipZigTest;
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .{ .tls12 = .aes_256_gcm });
+    defer st.deinit();
+
+    const Peer = struct {
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            try end.conn.writeRecord(.handshake, &.{ @intFromEnum(proto.HandshakeType.hello_request), 0, 0, 0 });
+            try end.conn.flushOutput();
+            var rbuf: [256]u8 = undefined;
+            var r = end.conn.reader(&rbuf);
+            try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+            try testing.expectEqual(error.TlsAlertNoRenegotiation, r.err.?);
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = end.conn.reader(&rbuf);
+    var w = end.conn.inPlaceWriter();
+    try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+    try testing.expectEqual(error.TlsNoRenegotiation, r.err.?);
+    // The fatal alert goes out with the next write.
+    try w.interface.writeAll("x");
+    try testing.expectError(error.WriteFailed, w.interface.flush());
+    try testing.expectEqual(error.TlsNoRenegotiation, w.err.?);
+    try peer.await(io);
+}
+
+test "TLS 1.2: a fifth warning alert in a row is too many" {
+    if (!proto.tls12_enabled) return error.SkipZigTest;
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .{ .tls12 = .chacha20_poly1305 });
+    defer st.deinit();
+
+    const Peer = struct {
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            for (0..max_warning_alerts + 1) |_| {
+                try end.conn.writeRecord(.alert, &.{ 1, @intFromEnum(proto.Alert.unrecognized_name) });
+            }
+            try end.conn.flushOutput();
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = end.conn.reader(&rbuf);
+    try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+    try testing.expectEqual(error.TlsUnexpectedMessage, r.err.?);
     try peer.await(io);
 }

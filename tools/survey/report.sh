@@ -19,7 +19,9 @@ echo "   negotiated 1.2 and ztls was refused, or ztls alone got a 1.2 answer."
 awk -F'\t' 'NR == FNR { o[$1] = $2; next }
     {
         z = ($2 == "ok") ? "ok" : $3
-        if (o[$1] == "tls13" || z == "ok") k = "TLS 1.3"
+        if (o[$1] == "tls13") k = "TLS 1.3"
+        else if (z == "ok" && $3 ~ /^ecdhe_/) k = "TLS 1.2 only"
+        else if (z == "ok") k = "TLS 1.3"
         else if (o[$1] == "tls12_only" || z == "TlsAlertProtocolVersion" || z == "TlsAlertHandshakeFailure") k = "TLS 1.2 only"
         else next
         c[k]++; n++
@@ -27,8 +29,15 @@ awk -F'\t' 'NR == FNR { o[$1] = $2; next }
     END { for (k in c) printf "  %-32s %6d  %5.1f%%\n", k, c[k], 100 * c[k] / n; printf "  %-32s %6d\n", "answered", n }' "$o" "$z" | sort -k2 -nr
 echo
 echo "== ztls results on hosts that offer TLS 1.3"
-awk -F'\t' 'NR == FNR { if ($2 == "tls13") t[$1] = 1; next } ($1 in t) { c[$2 == "ok" ? "ok" : $3]++; n++ }
+awk -F'\t' 'NR == FNR { if ($2 == "tls13") t[$1] = 1; next } ($1 in t) { c[$2 != "ok" ? $3 : $3 ~ /^ecdhe_/ ? "ok (1.2)" : "ok"]++; n++ }
     END { for (k in c) printf "  %-32s %6d  %5.1f%%\n", k, c[k], 100 * c[k] / n }' "$o" "$z" | sort -k2 -nr
+echo
+echo "== ztls results on hosts that offer only TLS 1.2 (not with --tls13-only)"
+awk -F'\t' 'NR == FNR { if ($2 == "tls12_only") t[$1] = 1; next } ($1 in t) { c[$2 == "ok" ? "ok" : $3]++; n++ }
+    END { for (k in c) printf "  %-32s %6d  %5.1f%%\n", k, c[k], 100 * c[k] / n }' "$o" "$z" | sort -k2 -nr
+echo
+echo "== TLS 1.2-only hosts that failed with ztls (first 5 per error)"
+awk -F'\t' 'NR == FNR { if ($2 == "tls12_only") t[$1] = $4; next } ($1 in t) && $2 == "fail" { if (shown[$3]++ < 5) printf "  %-28s %-40s openssl: %s\n", $3, $1, t[$1] }' "$o" "$z" | sort
 echo
 echo "== HTTP after a good handshake"
 awk -F'\t' '$2 == "ok" { c[$9 ~ /^HTTP\// ? "response" : "none: " $9]++ } END { for (k in c) printf "  %-40s %6d\n", k, c[k] }' "$z" | sort -k2 -nr
@@ -45,4 +54,4 @@ echo "== What ztls negotiated (suite, group, peer key, scheme, ALPN), top 20"
 awk -F'\t' '$2 == "ok" { c[$3 "  " $4 "  " $6 "  " $7 "  " $8]++ } END { for (k in c) printf "  %6d  %s\n", c[k], k }' "$z" | sort -nr | awk 'NR <= 20'
 echo
 echo "== Hosts that ztls reached but openssl could not with TLS 1.3, first 20"
-awk -F'\t' 'NR == FNR { if ($2 != "tls13") t[$1] = $2; next } ($1 in t) && $2 == "ok" { if (n++ < 20) printf "  %-32s %s\n", $1, t[$1] }' "$o" "$z"
+awk -F'\t' 'NR == FNR { if ($2 != "tls13") t[$1] = $2; next } ($1 in t) && $2 == "ok" && $3 !~ /^ecdhe_/ { if (n++ < 20) printf "  %-32s %s\n", $1, t[$1] }' "$o" "$z"

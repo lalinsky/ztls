@@ -3,6 +3,9 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const tls12 = b.option(bool, "tls12", "Build the TLS 1.2 client in (default: true)") orelse true;
+    const options = b.addOptions();
+    options.addOption(bool, "tls12", tls12);
 
     // libcrypto is built optimized even in Debug builds: a debug AWS-LC makes
     // handshakes and tests needlessly slow and adds nothing to debugging ztls.
@@ -28,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "c", .module = translate_c.createModule() }},
     });
     mod.linkLibrary(libcrypto);
+    mod.addOptions("build_options", options);
 
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
@@ -55,5 +59,5 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "ztls", .module = mod }},
         }),
     });
-    b.step("survey-probe", "Build the TLS 1.3 survey probe").dependOn(&b.addInstallArtifact(probe, .{}).step);
+    b.step("survey-probe", "Build the survey probe").dependOn(&b.addInstallArtifact(probe, .{}).step);
 }
