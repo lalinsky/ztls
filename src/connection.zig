@@ -185,7 +185,10 @@ pub const Connection = struct {
         /// We asked the peer for a KeyUpdate and none has come since: no
         /// other request may go out until one does (§4.7.3). Set by the
         /// write side before it sends the request, cleared by the read
-        /// side on any KeyUpdate from the peer.
+        /// side on any KeyUpdate from the peer. One that crossed ours
+        /// counts, so a second request can go out before the first is
+        /// answered; but a peer may fold its answer into a request of its
+        /// own (BoringSSL does), which nothing else would clear this for.
         key_update_awaited: std.atomic.Value(bool) = .init(false),
     };
 
