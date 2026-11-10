@@ -93,7 +93,7 @@ pub fn Hash(comptime algorithm: Algorithm) type {
 pub fn hmac(algorithm: Algorithm, key: []const u8, data: []const u8, out: *[max_digest_length]u8) []u8 {
     var out_len: c_uint = 0;
     const p = c.HMAC(algorithm.md(), key.ptr, key.len, data.ptr, data.len, out, &out_len);
-    std.debug.assert(p != null and out_len == algorithm.digestLength());
+    if (p == null or out_len != algorithm.digestLength()) @panic("HMAC failed");
     return out[0..out_len];
 }
 

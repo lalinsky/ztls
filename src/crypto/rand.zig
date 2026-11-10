@@ -7,7 +7,7 @@ pub fn bytes(buf: []u8) void {
     if (buf.len == 0) return;
     // AWS-LC aborts rather than return failure here.
     const ok = c.RAND_bytes(buf.ptr, buf.len);
-    std.debug.assert(ok == 1);
+    if (ok != 1) @panic("RAND_bytes failed");
 }
 
 test "two draws differ" {

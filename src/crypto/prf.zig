@@ -14,7 +14,7 @@ pub fn tls12(algorithm: hash.Algorithm, secret: []const u8, label: []const u8, s
     assert(out.len > 0);
     const ok = c.CRYPTO_tls1_prf(algorithm.md(), out.ptr, out.len, secret.ptr, secret.len, label.ptr, label.len, seed1.ptr, seed1.len, seed2.ptr, seed2.len);
     // Fails only on misuse, such as a hash it does not take.
-    assert(ok == 1);
+    if (ok != 1) @panic("CRYPTO_tls1_prf failed");
 }
 
 const testing = std.testing;
