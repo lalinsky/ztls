@@ -598,13 +598,13 @@ pub const Handshake = struct {
     /// new ones is a violation.
     pub fn installReadKeys(h: *Handshake, secret: Secret) Error!void {
         if (h.pending.len != 0) return error.TlsUnexpectedMessage;
-        if (h.conn.read.keys) |*old| old.deinit();
-        h.conn.read.keys = cipher.Keys.init(h.suite, secret) catch return error.TlsInternalError;
+        var keys = cipher.Keys.init(h.suite, secret) catch return error.TlsInternalError;
+        cipher.Keys.replace(&h.conn.read.keys, &keys);
     }
 
     pub fn installWriteKeys(h: *Handshake, secret: Secret) Error!void {
-        if (h.conn.write.keys) |*old| old.deinit();
-        h.conn.write.keys = cipher.Keys.init(h.suite, secret) catch return error.TlsInternalError;
+        var keys = cipher.Keys.init(h.suite, secret) catch return error.TlsInternalError;
+        cipher.Keys.replace(&h.conn.write.keys, &keys);
     }
 
     // Certificate, CertificateVerify, Finished
@@ -748,12 +748,14 @@ pub const Handshake = struct {
             }
             peer.chain[peer.len] = x509.Certificate.parseDer(der) catch return error.TlsDecodeError;
             peer.len += 1;
-            try copies.append(h.allocator, try h.allocator.dupe(u8, der));
+            try copies.ensureUnusedCapacity(h.allocator, 1);
+            copies.appendAssumeCapacity(try h.allocator.dupe(u8, der));
         }
         peer.public_key = peer.chain[0].publicKey() catch |err| switch (err) {
             error.UnsupportedKey => return error.TlsUnsupportedCertificate,
             error.CryptoFailed => return error.TlsInternalError,
         };
+        errdefer peer.public_key.deinit();
         h.conn.peer_certificates = try copies.toOwnedSlice(h.allocator);
         h.conn.allocator = h.allocator;
         return peer;

@@ -108,8 +108,8 @@ pub fn run(h: *Handshake, opt: config.Client, client_random: *const [32]u8, hell
     defer keys.wipe();
 
     h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
-    if (h.conn.write.keys) |*old| old.deinit();
-    h.conn.write.keys = keys.clientKeys() catch return error.TlsInternalError;
+    var write_keys = keys.clientKeys() catch return error.TlsInternalError;
+    cipher.Keys.replace(&h.conn.write.keys, &write_keys);
     try writeFinished(h, hash_algorithm, &master);
     try h.flush();
 
@@ -117,8 +117,8 @@ pub fn run(h: *Handshake, opt: config.Client, client_random: *const [32]u8, hell
     // and its Finished, the first message under them, closes the
     // handshake.
     try h.readChangeCipherSpec();
-    if (h.conn.read.keys) |*old| old.deinit();
-    h.conn.read.keys = keys.serverKeys() catch return error.TlsInternalError;
+    var read_keys = keys.serverKeys() catch return error.TlsInternalError;
+    cipher.Keys.replace(&h.conn.read.keys, &read_keys);
 
     msg = try h.nextMessage();
     try h.expect(msg, .finished);
