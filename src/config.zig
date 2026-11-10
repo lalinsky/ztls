@@ -242,8 +242,8 @@ pub const Client = struct {
     allocator: Allocator,
     /// The server's name, sent as SNI and checked against its
     /// certificate. An IP literal is checked against the certificate's IP
-    /// addresses instead and sent as no SNI. Empty only with
-    /// `insecure_skip_verify`.
+    /// addresses instead and sent as no SNI. At most 255 bytes, and empty
+    /// only with `insecure_skip_verify`.
     host: []const u8,
     /// What the server's certificate must chain to. Required unless
     /// `insecure_skip_verify`.
