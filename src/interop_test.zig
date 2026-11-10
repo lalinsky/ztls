@@ -301,7 +301,7 @@ test "our client against openssl s_server" {
 
         var rbuf: [256]u8 = undefined;
         var r = conn.reader(&rbuf);
-        var w = conn.writer();
+        var w = conn.inPlaceWriter();
         try w.interface.writeAll("hello openssl\n");
         try w.interface.flush();
         try testing.expectEqualStrings("lssnepo olleh", (try r.interface.takeDelimiter('\n')).?);
@@ -357,7 +357,7 @@ fn serveOnce(loopback: *testu.Loopback, options: config.Server, outcome: *Outcom
 fn echo(conn: *ztls.Connection) !void {
     var rbuf: [1024]u8 = undefined;
     var r = conn.reader(&rbuf);
-    var w = conn.writer();
+    var w = conn.inPlaceWriter();
     while (r.interface.takeDelimiter('\n') catch |err| return r.err orelse err) |line| {
         try w.interface.print("echo: {s}\n", .{line});
         try w.interface.flush();
@@ -551,7 +551,7 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
 
         var rbuf: [256]u8 = undefined;
         var r = conn.reader(&rbuf);
-        var w = conn.writer();
+        var w = conn.inPlaceWriter();
         try w.interface.writeAll("hello go\n");
         try w.interface.flush();
         try testing.expectEqualStrings("echo: hello go", (try r.interface.takeDelimiter('\n')).?);

@@ -64,7 +64,7 @@ defer conn.deinit(); // after both tasks are done
 
 var read_buffer: [16 * 1024]u8 = undefined;
 var reader = conn.reader(&read_buffer);
-var writer = conn.writer();           // encrypts inside the transport buffer
+var writer = conn.inPlaceWriter();      // encrypts inside the transport buffer
 
 while (try reader.interface.takeDelimiter('\n')) |line| {
     try writer.interface.print("echo: {s}\n", .{line});
@@ -107,11 +107,20 @@ application can peek, for example to see a whole HTTP header. A record
 that fits in it is decrypted straight into it; a larger one is decrypted
 in the transport buffer and copied out in pieces as it is read.
 
-The writer has no buffer of its own: its buffer is the plaintext of the
-next record, inside the transport buffer, where it is sealed. A record
-carries at most 16 KiB, so that is as large as the writer's buffer gets,
-and `output_buffer_len` is all the transport needs. A larger transport
-buffer only lets several sealed records go out in one transport write.
+The buffer given to `writer` is an ordinary `std.Io.Writer` buffer, again
+owned by the application, which may swap it between writes. What is
+written is copied into it, and from there into the record where it is
+sealed. A record carries at most 16 KiB, so a larger buffer gains nothing.
+
+`inPlaceWriter` saves that copy: it has no buffer of its own, and its buffer
+is the plaintext of the next record, inside the transport buffer. That puts
+two rules on the application. The writer's buffer moves with every record
+and must not be replaced, and the transport writer must leave its unused
+capacity alone while it drains, as std's and zio's socket writers do.
+
+`output_buffer_len` is all the transport needs either way. A larger
+transport buffer only lets several sealed records go out in one transport
+write.
 
 The handshake keeps about 16 KiB on the stack of the task that runs it, plus
 AWS-LC's ML-KEM working memory, so give that task at least 64 KiB of stack.
