@@ -282,8 +282,9 @@ pub const Client = struct {
     /// Treat a transport that ends without close_notify as truncated even
     /// between records.
     strict_close_notify: bool = false,
-    /// The longest handshake message accepted from the peer; the
-    /// Certificate message is the one that gets big.
+    /// The longest Certificate or CertificateRequest message accepted
+    /// from the peer. Other handshake messages are held to 16 KiB, or to
+    /// this if it is less.
     max_handshake_message_len: usize = 64 * 1024,
 };
 
@@ -328,6 +329,9 @@ pub const Server = struct {
     /// For client certificate validity.
     now: std.Io.Timestamp,
     strict_close_notify: bool = false,
+    /// The longest client Certificate message accepted. Other handshake
+    /// messages, and all of them without `client_auth`, are held to
+    /// 16 KiB, or to this if it is less.
     max_handshake_message_len: usize = 64 * 1024,
 };
 

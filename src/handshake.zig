@@ -251,6 +251,10 @@ pub const Message = struct {
     raw: []const u8,
 };
 
+/// The longest handshake message other than a Certificate or a
+/// CertificateRequest.
+pub const max_small_message_len = 16 * 1024;
+
 pub const Handshake = struct {
     conn: *Connection,
     allocator: Allocator,
@@ -311,7 +315,7 @@ pub const Handshake = struct {
             if (h.pending.len >= 4) {
                 const len = std.mem.readInt(u24, h.pending[1..4], .big);
                 // Bigger than we take; the peer's doing, so it hears so.
-                if (len > h.max_message_len) return error.TlsIllegalParameter;
+                if (len > h.maxMessageLen(h.pending[0])) return error.TlsIllegalParameter;
                 if (h.pending.len >= 4 + len) {
                     const raw = h.pending[0 .. 4 + len];
                     h.pending = h.pending[raw.len..];
@@ -320,6 +324,16 @@ pub const Handshake = struct {
             }
             try h.readHandshakeRecord();
         }
+    }
+
+    /// Certificate chains, and the CA names a CertificateRequest may list,
+    /// take up to `max_message_len`; nothing else needs more than
+    /// `max_small_message_len`.
+    fn maxMessageLen(h: *const Handshake, handshake_type: u8) usize {
+        return switch (@as(proto.HandshakeType, @enumFromInt(handshake_type))) {
+            .certificate, .certificate_request => h.max_message_len,
+            else => @min(h.max_message_len, max_small_message_len),
+        };
     }
 
     /// Reads the next handshake record. Its payload is used where it was
@@ -349,21 +363,24 @@ pub const Handshake = struct {
     }
 
     /// Moves the pending bytes, a message not yet whole, to the start of
-    /// the inbox, with room for all of it once its length is known.
+    /// the inbox, with room for at least the next record's worth of it.
+    /// Room for all of it waits until it arrives: the length is only the
+    /// peer's word.
     fn spill(h: *Handshake) Error!void {
         const len = h.pending.len;
         // In the inbox, pending is what is left at its end.
         assert(h.inbox.items.len == 0 or h.pending.ptr + len == h.inbox.items.ptr + h.inbox.items.len);
         const total = if (len >= 4) 4 + @as(usize, std.mem.readInt(u24, h.pending[1..4], .big)) else len;
+        const want = @min(total, len + cipher.max_plaintext_len);
         if (h.inbox.items.len > 0) {
             // Already in the inbox, at its end, and usually all of it.
             if (h.pending.ptr != h.inbox.items.ptr) std.mem.copyForwards(u8, h.inbox.items[0..len], h.pending);
             h.inbox.shrinkRetainingCapacity(len);
-            try h.inbox.ensureTotalCapacityPrecise(h.allocator, total);
-        } else {
-            try h.inbox.ensureTotalCapacityPrecise(h.allocator, total);
-            h.inbox.appendSliceAssumeCapacity(h.pending);
         }
+        // Doubling, so a message in small records is not reallocated for
+        // every one of them.
+        if (h.inbox.capacity < want) try h.inbox.ensureTotalCapacityPrecise(h.allocator, @min(total, @max(want, 2 * h.inbox.capacity)));
+        if (h.inbox.items.len == 0) h.inbox.appendSliceAssumeCapacity(h.pending);
         h.pending = h.inbox.items;
     }
 
@@ -1060,6 +1077,51 @@ fn testFragments(buf: []u8, messages: []const u8, fragment: usize) ![]const u8 {
         rest = rest[n..];
     }
     return w.written();
+}
+
+test "only certificate messages may be large, and are not reserved before they arrive" {
+    for ([_]proto.HandshakeType{ .client_hello, .certificate }) |handshake_type| {
+        // A header that says 40000 bytes, and the first 100 of them.
+        var message: [4 + 100]u8 = @splat(0);
+        message[0] = @intFromEnum(handshake_type);
+        std.mem.writeInt(u24, message[1..4], 40000, .big);
+        var wire: [128]u8 = undefined;
+        var input: Io.Reader = .fixed(try testFragments(&wire, &message, message.len));
+        var input_buffer: [@import("connection.zig").input_buffer_len]u8 = undefined;
+        var limited = input.limited(.unlimited, &input_buffer);
+        var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
+        var output: Io.Writer = .fixed(&output_buffer);
+        var conn = Connection.init(&limited.interface, &output, .client);
+        var h = Handshake.init(&conn, testing.allocator, 64 * 1024);
+        defer h.deinit();
+        if (handshake_type == .certificate) {
+            try testing.expectError(error.EndOfStream, h.nextMessage());
+            try testing.expect(h.inbox.capacity < 40000);
+        } else {
+            try testing.expectError(error.TlsIllegalParameter, h.nextMessage());
+        }
+    }
+}
+
+test "a large message in small records is reallocated only a few times" {
+    var message: [4 + 40000]u8 = undefined;
+    for (&message, 0..) |*b, i| b.* = @truncate(i);
+    message[0] = @intFromEnum(proto.HandshakeType.certificate);
+    std.mem.writeInt(u24, message[1..4], 40000, .big);
+    const wire = try testing.allocator.alloc(u8, message.len / 100 * 105 + 105);
+    defer testing.allocator.free(wire);
+    var input: Io.Reader = .fixed(try testFragments(wire, &message, 100));
+    var input_buffer: [@import("connection.zig").input_buffer_len]u8 = undefined;
+    var limited = input.limited(.unlimited, &input_buffer);
+    var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_buffer);
+    var conn = Connection.init(&limited.interface, &output, .client);
+    var counting: testu.CountingAllocator = .init(testing.allocator);
+    var h = Handshake.init(&conn, counting.allocator(), 64 * 1024);
+    defer h.deinit();
+    const msg = try h.nextMessage();
+    try testing.expectEqualSlices(u8, &message, msg.raw);
+    try testing.expect(counting.allocs <= 3);
 }
 
 test "messages are taken from records whole, split, or several to a record" {
