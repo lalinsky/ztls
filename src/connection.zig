@@ -212,9 +212,9 @@ pub const Connection = struct {
         return if (c.server_name_len == 0) null else c.server_name_buf[0..c.server_name_len];
     }
 
-    pub fn setServerName(c: *Connection, name: ?[]const u8) void {
+    pub fn setServerName(c: *Connection, name: ?[]const u8) error{TlsInternalError}!void {
         const n = name orelse "";
-        assert(n.len <= c.server_name_buf.len);
+        if (n.len > c.server_name_buf.len) return error.TlsInternalError;
         @memcpy(c.server_name_buf[0..n.len], n);
         c.server_name_len = @intCast(n.len);
     }

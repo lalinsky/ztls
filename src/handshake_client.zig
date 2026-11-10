@@ -73,6 +73,7 @@ const CertificateRequest = struct {
 fn checkOptions(opt: config.Client) error{TlsInternalError}!void {
     if (opt.root_ca == null and !opt.insecure_skip_verify) return error.TlsInternalError;
     if (opt.host.len == 0 and !opt.insecure_skip_verify) return error.TlsInternalError;
+    if (opt.host.len > 255) return error.TlsInternalError;
     if (opt.named_groups.len == 0) return error.TlsInternalError;
     if (opt.verify_schemes.len == 0) return error.TlsInternalError;
     if (!handshake.schemesSupported(opt.verify_schemes) or !handshake.schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
@@ -131,7 +132,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
             h.setSuite(hello.suite);
             try h.hashMessage(msg);
             try tls12.run(h, opt, &random, hello);
-            h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
+            try h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
             return;
         },
     };
@@ -252,7 +253,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     try h.installWriteKeys(ap.client);
     h.conn.read.ccs = .refuse;
     h.conn.alpn_protocol = alpn;
-    h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
+    try h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
     h.conn.strict_close_notify = opt.strict_close_notify;
 }
 
@@ -733,6 +734,12 @@ test "a CertificateRequest needs a non-empty signature_algorithms" {
         const result = parseCertificateRequest(w.written(), null, &config.default_signature_schemes);
         if (ext.expected) |err| try testing.expectError(err, result) else _ = try result;
     }
+}
+
+test "a host longer than 255 bytes is a misconfiguration" {
+    const long: [256]u8 = @splat('a');
+    try checkOptions(.{ .allocator = testing.allocator, .host = long[0..255], .insecure_skip_verify = true, .now = undefined });
+    try testing.expectError(error.TlsInternalError, checkOptions(.{ .allocator = testing.allocator, .host = &long, .insecure_skip_verify = true, .now = undefined }));
 }
 
 test "TLS 1.2 suites are refused in a build without TLS 1.2" {

@@ -107,7 +107,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     const choices = try choose(&hello, opt, auth);
     h.setSuite(choices.suite);
     h.conn.group = choices.group;
-    h.conn.setServerName(hello.server_name);
+    try h.conn.setServerName(hello.server_name);
     try h.hashMessage(msg);
 
     var session_id_buf: [32]u8 = undefined;
