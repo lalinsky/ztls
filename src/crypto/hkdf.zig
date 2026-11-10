@@ -12,7 +12,7 @@ pub const max_length = hash.max_digest_length;
 pub fn extract(algorithm: hash.Algorithm, salt: []const u8, ikm: []const u8, out: *[max_length]u8) []u8 {
     var out_len: usize = 0;
     const ok = c.HKDF_extract(out, &out_len, algorithm.md(), ikm.ptr, ikm.len, salt.ptr, salt.len);
-    assert(ok == 1 and out_len == algorithm.digestLength());
+    if (ok != 1 or out_len != algorithm.digestLength()) @panic("HKDF_extract failed");
     return out[0..out_len];
 }
 
@@ -20,7 +20,7 @@ pub fn extract(algorithm: hash.Algorithm, salt: []const u8, ikm: []const u8, out
 pub fn expand(algorithm: hash.Algorithm, prk: []const u8, info: []const u8, out: []u8) void {
     assert(out.len <= 255 * algorithm.digestLength());
     const ok = c.HKDF_expand(out.ptr, out.len, algorithm.md(), prk.ptr, prk.len, info.ptr, info.len);
-    assert(ok == 1);
+    if (ok != 1) @panic("HKDF_expand failed");
 }
 
 pub const max_label_length = 32;

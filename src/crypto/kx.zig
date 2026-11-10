@@ -7,7 +7,6 @@
 //! the way are accepted.
 
 const std = @import("std");
-const assert = std.debug.assert;
 const c = @import("c");
 const err = @import("err.zig");
 
@@ -95,7 +94,7 @@ pub const Ecdh = struct {
         const group = c.EC_KEY_get0_group(self.key);
         const point = c.EC_KEY_get0_public_key(self.key);
         const n = c.EC_POINT_point2oct(group, point, c.POINT_CONVERSION_UNCOMPRESSED, out, out.len, null);
-        assert(n == self.curve.publicLength());
+        if (n != self.curve.publicLength()) @panic("EC_POINT_point2oct failed");
         return out[0..n];
     }
 
@@ -169,7 +168,7 @@ pub const MlKem768 = struct {
             _ = err.take();
             return error.InvalidPublicKey;
         }
-        assert(ct_len == ciphertext_length and ss_len == shared_secret_length);
+        if (ct_len != ciphertext_length or ss_len != shared_secret_length) return error.CryptoFailed;
         return e;
     }
 
@@ -182,7 +181,7 @@ pub const MlKem768 = struct {
         var ss: [shared_secret_length]u8 = undefined;
         var ss_len: usize = shared_secret_length;
         if (c.EVP_PKEY_decapsulate(ctx, &ss, &ss_len, ciphertext, ciphertext_length) != 1) return err.fail();
-        assert(ss_len == shared_secret_length);
+        if (ss_len != shared_secret_length) return error.CryptoFailed;
         return ss;
     }
 };
