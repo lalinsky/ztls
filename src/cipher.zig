@@ -179,6 +179,14 @@ pub const Keys = struct {
         std.crypto.secureZero(u8, std.mem.asBytes(&next));
     }
 
+    /// Moves `keys` into `slot`, in place of the keys there, which are
+    /// freed only now that the new ones exist. The copy in `keys` is wiped.
+    pub fn replace(slot: *?Keys, keys: *Keys) void {
+        if (slot.*) |*old| old.deinit();
+        slot.* = keys.*;
+        std.crypto.secureZero(u8, std.mem.asBytes(keys));
+    }
+
     /// How many records one generation of keys may seal before the sender
     /// updates them: for TLS 1.3 AES-GCM a little under the 2^24.5 that
     /// §5.5 allows, so the update goes out with margin. TLS 1.2 has no key

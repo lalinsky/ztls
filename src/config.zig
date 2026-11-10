@@ -119,11 +119,11 @@ pub const CertKeyPair = struct {
         while (try it.next()) |block| {
             if (!std.mem.eql(u8, block.label, "CERTIFICATE")) continue;
             if (chain.items.len == max_chain_len) return error.ChainTooLong;
+            try chain.ensureUnusedCapacity(allocator, 1);
             const buf = try allocator.alloc(u8, block.decodedSizeUpperBound());
             errdefer allocator.free(buf);
             const der = try block.decode(buf);
-            const exact = try allocator.realloc(buf, der.len);
-            try chain.append(allocator, exact);
+            chain.appendAssumeCapacity(try allocator.realloc(buf, der.len));
         }
         if (chain.items.len == 0) return error.InvalidCertificate;
 
@@ -332,6 +332,16 @@ pub const Server = struct {
 };
 
 const testing = std.testing;
+
+test "CertKeyPair frees what it has when an allocation fails" {
+    const S = struct {
+        fn load(allocator: Allocator) !void {
+            var pair = try CertKeyPair.fromSlice(allocator, @embedFile("testdata/pki/server-chain.pem"), @embedFile("testdata/pki/server-chain.key"));
+            pair.deinit(allocator);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, S.load, .{});
+}
 
 test "CertKeyPair from the test PKI" {
     var pair = try CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-chain.pem"), @embedFile("testdata/pki/server-chain.key"));
