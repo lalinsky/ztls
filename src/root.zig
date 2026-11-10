@@ -2,8 +2,8 @@
 //! DESIGN.md.
 //!
 //! `client` and `server` run a handshake over a transport's reader and
-//! writer and return a `Connection`, whose `reader` and `writer` carry
-//! cleartext.
+//! writer and return a `Connection`, whose `reader`, `writer` and
+//! `writerInPlace` carry cleartext.
 
 const std = @import("std");
 const Io = std.Io;
@@ -169,7 +169,7 @@ fn serveOnce(loopback: *testu.Loopback, options: config.Server, outcome: *Server
 fn echo(conn: *Connection) !void {
     var rbuf: [1024]u8 = undefined;
     var r = conn.reader(&rbuf);
-    var w = conn.writer();
+    var w = conn.writerInPlace();
     while (r.interface.takeDelimiter('\n') catch |err| return r.err orelse err) |line| {
         try w.interface.print("echo: {s}\n", .{line});
         try w.interface.flush();
@@ -189,7 +189,7 @@ fn clientOnce(loopback: *const testu.Loopback, options: config.Client) !Connecti
     defer conn.deinit();
     var rbuf: [1024]u8 = undefined;
     var r = conn.reader(&rbuf);
-    var w = conn.writer();
+    var w = conn.writerInPlace();
     for (0..3) |i| {
         try w.interface.print("hello {d}\n", .{i});
         try w.interface.flush();

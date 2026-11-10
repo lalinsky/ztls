@@ -92,7 +92,7 @@ fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, groups
 fn request(conn: *ztls.Connection, host: []const u8) ![]const u8 {
     var read_buffer: [8192]u8 = undefined;
     var reader = conn.reader(&read_buffer);
-    var writer = conn.writer();
+    var writer = conn.writerInPlace();
     try writer.interface.print("HEAD / HTTP/1.1\r\nHost: {s}\r\nUser-Agent: ztls-survey\r\nConnection: close\r\n\r\n", .{host});
     try writer.interface.flush();
     const line = reader.interface.takeDelimiter('\n') catch |err| return reader.err orelse err;
