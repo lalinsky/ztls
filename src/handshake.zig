@@ -356,8 +356,8 @@ pub const Handshake = struct {
         assert(h.inbox.items.len == 0 or h.pending.ptr + len == h.inbox.items.ptr + h.inbox.items.len);
         const total = if (len >= 4) 4 + @as(usize, std.mem.readInt(u24, h.pending[1..4], .big)) else len;
         if (h.inbox.items.len > 0) {
-            // Already in the inbox, at its end.
-            std.mem.copyForwards(u8, h.inbox.items[0..len], h.pending);
+            // Already in the inbox, at its end, and usually all of it.
+            if (h.pending.ptr != h.inbox.items.ptr) std.mem.copyForwards(u8, h.inbox.items[0..len], h.pending);
             h.inbox.shrinkRetainingCapacity(len);
             try h.inbox.ensureTotalCapacityPrecise(h.allocator, total);
         } else {
