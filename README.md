@@ -108,9 +108,10 @@ that fits in it is decrypted straight into it; a larger one is decrypted
 in the transport buffer and copied out in pieces as it is read.
 
 The buffer given to `writer` is an ordinary `std.Io.Writer` buffer, again
-owned by the application, which may swap it between writes. What is
-written is copied into it, and from there into the record where it is
-sealed. A record carries at most 16 KiB, so a larger buffer gains nothing.
+owned by the application, which may swap it between writes. Writes that
+fit are copied into it, and from there into the record where it is sealed;
+larger ones go straight into the record. A record carries at most 16 KiB,
+so a larger buffer gains nothing.
 
 `inPlaceWriter` saves that copy: it has no buffer of its own, and its buffer
 is the plaintext of the next record, inside the transport buffer. That puts

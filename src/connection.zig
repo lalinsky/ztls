@@ -1004,6 +1004,8 @@ pub const Connection = struct {
                 }
             }
             self.conn.flushWrite() catch |err| return self.fail(err);
+            // Flushed, `output` is empty and the next window is at its start.
+            if (w.vtable.drain == drainInPlace) w.buffer = self.conn.payloadWindow();
         }
     };
 
@@ -1054,6 +1056,8 @@ const SelfTalk = struct {
     io: Io,
     loopback: testu.Loopback,
     mode: Mode,
+    /// How much of `End.output_buffer` the transport writer gets.
+    output_len: usize = output_buffer_len,
 
     fn init(io: Io, mode: Mode) !SelfTalk {
         return .{ .io = io, .loopback = try testu.Loopback.init(io), .mode = mode };
@@ -1083,14 +1087,14 @@ const SelfTalk = struct {
         io: Io,
         stream: Io.net.Stream,
         input_buffer: [input_buffer_len]u8 = undefined,
-        output_buffer: [output_buffer_len]u8 = undefined,
+        output_buffer: [2 * @as(usize, output_buffer_len)]u8 = undefined,
         input: Io.net.Stream.Reader = undefined,
         output: Io.net.Stream.Writer = undefined,
         conn: Connection = undefined,
 
         fn setUp(end: *End, self: *const SelfTalk, side: proto.Side) !void {
             end.input = end.stream.reader(end.io, &end.input_buffer);
-            end.output = end.stream.writer(end.io, &end.output_buffer);
+            end.output = end.stream.writer(end.io, end.output_buffer[0..self.output_len]);
             end.conn = Connection.init(&end.input.interface, &end.output.interface, side);
             end.conn.read.keys = try self.keys(if (side == .client) .server_application else .client_application);
             end.conn.write.keys = try self.keys(if (side == .client) .client_application else .server_application);
@@ -1117,9 +1121,12 @@ const SelfTalk = struct {
 
 test "application data both ways, then close_notify" {
     const io = testing.io;
-    for (every_mode) |mode| {
+    // With room for more than one record, the in-place writer's window
+    // does not start at the front of the transport buffer.
+    for ([_]usize{ output_buffer_len, 2 * @as(usize, output_buffer_len) }) |output_len| for (every_mode) |mode| {
         var st = try SelfTalk.init(io, mode);
         defer st.deinit();
+        st.output_len = output_len;
 
         const Peer = struct {
             fn run(s: *SelfTalk) !void {
@@ -1162,7 +1169,7 @@ test "application data both ways, then close_notify" {
         try testing.expectEqual(null, r.err);
         try testing.expectEqual(State.closed, end.conn.shared.read_state.load(.monotonic));
         try peer.await(io);
-    }
+    };
 }
 
 test "large transfers through both writers, with small and swapped reader buffers" {
