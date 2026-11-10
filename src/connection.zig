@@ -1024,7 +1024,7 @@ pub const Connection = struct {
     /// while draining (std's and zio's socket writers do). Its buffer moves
     /// with each record and must not be replaced. One per connection, for
     /// the writing task.
-    pub fn inPlaceWriter(c: *Connection) Writer {
+    pub fn writerInPlace(c: *Connection) Writer {
         assert(c.write.keys != null);
         return Writer.initInPlace(c);
     }
@@ -1135,7 +1135,7 @@ test "application data both ways, then close_notify" {
                 defer end.deinit();
                 var rbuf: [256]u8 = undefined;
                 var r = end.conn.reader(&rbuf);
-                var w = end.conn.inPlaceWriter();
+                var w = end.conn.writerInPlace();
                 while (try r.interface.takeDelimiter('\n')) |line| {
                     try w.interface.print("echo: {s}\n", .{line});
                     try w.interface.flush();
@@ -1194,7 +1194,7 @@ fn largeTransfer(mode: Mode) !void {
             // handed out in pieces.
             var rbuf: [100]u8 = undefined;
             var r = end.conn.reader(&rbuf);
-            var w = end.conn.inPlaceWriter();
+            var w = end.conn.writerInPlace();
             var received: usize = 0;
             var next: u8 = 0;
             while (received < total) {
@@ -1221,7 +1221,7 @@ fn largeTransfer(mode: Mode) !void {
     var end: SelfTalk.End = undefined;
     try st.client(&end);
     defer end.deinit();
-    var w = end.conn.inPlaceWriter();
+    var w = end.conn.writerInPlace();
     const Sender = struct {
         fn run(wr: *Io.Writer) !void {
             var pattern: [7919]u8 = undefined;
@@ -1303,7 +1303,7 @@ test "key updates from both sides" {
     defer end.deinit();
     var rbuf: [256]u8 = undefined;
     var r = end.conn.reader(&rbuf);
-    var w = end.conn.inPlaceWriter();
+    var w = end.conn.writerInPlace();
     const write_gen0 = end.conn.write.keys.?.version.tls13.secret;
     const read_gen0 = end.conn.read.keys.?.version.tls13.secret;
     for (0..6) |i| {
@@ -1355,7 +1355,7 @@ test "past the key update cap a sender ignores requests and keeps its keys" {
     const before = end.conn.write.keys.?.version.tls13.secret;
     var rbuf: [256]u8 = undefined;
     var r = end.conn.reader(&rbuf);
-    var w = end.conn.inPlaceWriter();
+    var w = end.conn.writerInPlace();
     try testing.expectEqualStrings("ping", (try r.interface.takeDelimiter('\n')).?);
     try end.conn.requestKeyUpdate(); // nothing happens at the cap
     try w.interface.writeAll("pong\n");
@@ -1540,7 +1540,7 @@ test "a bad record fails the reader, and the writer sends the alert" {
             defer end.deinit();
             var rbuf: [256]u8 = undefined;
             var r = end.conn.reader(&rbuf);
-            var w = end.conn.inPlaceWriter();
+            var w = end.conn.writerInPlace();
             try w.interface.writeAll("fine\n");
             try w.interface.flush();
             // Corrupt the next record on the wire: seal it, then flip a bit.
@@ -1592,7 +1592,7 @@ test "transport ending without close_notify: clean at a record boundary, truncat
                 var end: SelfTalk.End = undefined;
                 try s.server(&end);
                 defer end.deinit();
-                var w = end.conn.inPlaceWriter();
+                var w = end.conn.writerInPlace();
                 try w.interface.writeAll("whole record\n");
                 try w.interface.flush();
                 if (cut) {
@@ -1647,7 +1647,7 @@ fn concurrentTasks(mode: Mode) !void {
 
     const Tasks = struct {
         fn send(c: *Connection, tag: []const u8) !void {
-            var w = c.inPlaceWriter();
+            var w = c.writerInPlace();
             for (0..lines) |i| try w.interface.print("{s} {d}\n", .{ tag, i });
             try w.interface.flush();
             try c.close();
@@ -1722,7 +1722,7 @@ test "TLS 1.2: warning alerts are ignored, KeyUpdate is not" {
     defer end.deinit();
     var rbuf: [256]u8 = undefined;
     var r = end.conn.reader(&rbuf);
-    var w = end.conn.inPlaceWriter();
+    var w = end.conn.writerInPlace();
     for (0..max_warning_alerts + 2) |_| {
         try testing.expectEqualStrings("data", (try r.interface.takeDelimiter('\n')).?);
     }
@@ -1768,7 +1768,7 @@ test "TLS 1.2: HelloRequest is refused with no_renegotiation" {
     defer end.deinit();
     var rbuf: [256]u8 = undefined;
     var r = end.conn.reader(&rbuf);
-    var w = end.conn.inPlaceWriter();
+    var w = end.conn.writerInPlace();
     try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
     try testing.expectEqual(error.TlsNoRenegotiation, r.err.?);
     // The fatal alert goes out with the next write.

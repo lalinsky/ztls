@@ -64,7 +64,7 @@ defer conn.deinit(); // after both tasks are done
 
 var read_buffer: [16 * 1024]u8 = undefined;
 var reader = conn.reader(&read_buffer);
-var writer = conn.inPlaceWriter();      // encrypts inside the transport buffer
+var writer = conn.writerInPlace();      // encrypts inside the transport buffer
 
 while (try reader.interface.takeDelimiter('\n')) |line| {
     try writer.interface.print("echo: {s}\n", .{line});
@@ -113,7 +113,7 @@ fit are copied into it, and from there into the record where it is sealed;
 larger ones go straight into the record. A record carries at most 16 KiB,
 so a larger buffer gains nothing.
 
-`inPlaceWriter` saves that copy: it has no buffer of its own, and its buffer
+`writerInPlace` saves that copy: it has no buffer of its own, and its buffer
 is the plaintext of the next record, inside the transport buffer. That puts
 rules on the application. The writer's buffer moves with every record and
 must not be replaced. `requestKeyUpdate` and `close` write to the transport

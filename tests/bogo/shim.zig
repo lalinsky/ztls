@@ -472,7 +472,7 @@ pub fn main(init: std.process.Init) !void {
 
     var read_buf: [16384]u8 = undefined;
     var reader = conn.reader(&read_buf);
-    var writer = conn.inPlaceWriter();
+    var writer = conn.writerInPlace();
 
     if (o.shim_writes_first) {
         for (0..o.repeat_shim_initial_write) |_| {
