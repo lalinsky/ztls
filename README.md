@@ -114,9 +114,11 @@ sealed. A record carries at most 16 KiB, so a larger buffer gains nothing.
 
 `inPlaceWriter` saves that copy: it has no buffer of its own, and its buffer
 is the plaintext of the next record, inside the transport buffer. That puts
-two rules on the application. The writer's buffer moves with every record
-and must not be replaced, and the transport writer must leave its unused
-capacity alone while it drains, as std's and zio's socket writers do.
+rules on the application. The writer's buffer moves with every record and
+must not be replaced. `requestKeyUpdate` and `close` write to the transport
+buffer too, so the writer is flushed before either. And the transport writer
+must leave its unused capacity alone while it drains, as std's and zio's
+socket writers do.
 
 `output_buffer_len` is all the transport needs either way. A larger
 transport buffer only lets several sealed records go out in one transport

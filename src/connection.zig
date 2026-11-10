@@ -1016,11 +1016,12 @@ pub const Connection = struct {
 
     /// A cleartext writer whose buffer is the next record's plaintext in
     /// `output`, so what is written is copied once, to where it is sealed.
-    /// While it is in use nothing else may write to `output`, except
-    /// `close` after its last flush, and the transport writer must leave
-    /// `output`'s unused capacity alone while draining (std's socket
-    /// writers do). Its buffer moves with each record and must not be
-    /// replaced. One per connection, for the writing task.
+    /// While it is in use nothing else may write to `output`, and
+    /// `requestKeyUpdate` and `close`, which do, come after a flush of it.
+    /// The transport writer must leave `output`'s unused capacity alone
+    /// while draining (std's and zio's socket writers do). Its buffer moves
+    /// with each record and must not be replaced. One per connection, for
+    /// the writing task.
     pub fn inPlaceWriter(c: *Connection) Writer {
         assert(c.write.keys != null);
         return Writer.initInPlace(c);
