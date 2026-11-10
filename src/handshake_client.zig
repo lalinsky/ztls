@@ -575,6 +575,8 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair, s
             .signature_algorithms => {
                 var list = try data.vector(u16);
                 try data.expectEof();
+                // supported_signature_algorithms<2..2^16-2> (§4.2.3).
+                if (list.eof()) return error.TlsDecodeError;
                 var n: usize = 0;
                 while (!list.eof()) {
                     const scheme = try list.decode(proto.SignatureScheme);
@@ -715,6 +717,22 @@ test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
     // ALPN, as in TLS 1.3's EncryptedExtensions, but with none offered.
     const alpn = [_]u8{ 0, 16, 0, 5, 0, 3, 2, 'h', '2' };
     try testing.expectError(error.TlsUnsupportedExtension, parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, &alpn), opt, &ours));
+}
+
+test "a CertificateRequest needs a non-empty signature_algorithms" {
+    var buf: [64]u8 = undefined;
+    const Ext = struct { bytes: []const u8, expected: ?anyerror };
+    for ([_]Ext{
+        .{ .bytes = &.{}, .expected = error.TlsMissingExtension },
+        .{ .bytes = &.{ 0, 13, 0, 2, 0, 0 }, .expected = error.TlsDecodeError },
+        .{ .bytes = &.{ 0, 13, 0, 4, 0, 2, 4, 3 }, .expected = null },
+    }) |ext| {
+        var w = codec.Writer.init(&buf);
+        try w.vector(u8, &.{}); // certificate_request_context
+        try w.vector(u16, ext.bytes);
+        const result = parseCertificateRequest(w.written(), null, &config.default_signature_schemes);
+        if (ext.expected) |err| try testing.expectError(err, result) else _ = try result;
+    }
 }
 
 test "TLS 1.2 suites are refused in a build without TLS 1.2" {
