@@ -702,7 +702,7 @@ pub const Connection = struct {
     }
 
     /// Sends what is in `output`.
-    pub fn flushOutput(c: *Connection) error{WriteFailed}!void {
+    fn flushOutput(c: *Connection) error{WriteFailed}!void {
         c.output.flush() catch return error.WriteFailed;
     }
 
@@ -764,7 +764,7 @@ pub const Connection = struct {
         c.shared.key_update_requested.store(false, .monotonic);
         const request: proto.KeyUpdateRequest = if (awaited) .update_not_requested else .update_requested;
         c.sendKeyUpdate(request, tls13) catch |err| return c.failWrite(err);
-        try c.flushOutput();
+        c.output.flush() catch return c.failWrite(error.WriteFailed);
     }
 
     /// The write side's state, with the read side's failure delivered
@@ -860,8 +860,8 @@ pub const Connection = struct {
         }
         try c.checkWritable();
         c.writeRecord(.alert, &proto.Alert.close_notify.encode()) catch |err| return c.failWrite(err);
+        c.output.flush() catch return c.failWrite(error.WriteFailed);
         c.shared.write_state.store(.closed, .release);
-        c.output.flush() catch return error.WriteFailed;
     }
 
     /// Copies the start of `header` then `data` (the last element `splat`
@@ -1428,6 +1428,30 @@ test "a header that rules a record out is refused without its body" {
             conn.read.keys = try cipher.Keys.init(.aes_128_gcm_sha256, ks.trafficSecret(.server_application, "header"));
         }
         try testing.expectError(case.err, conn.readRecord(null));
+    }
+}
+
+test "a transport that fails a flush in close or requestKeyUpdate fails the write direction" {
+    const Failing = struct {
+        fn drain(_: *Io.Writer, _: []const []const u8, _: usize) Io.Writer.Error!usize {
+            return error.WriteFailed;
+        }
+    };
+    for ([_]bool{ false, true }) |key_update| {
+        var input_buffer: [input_buffer_len]u8 = undefined;
+        var input: Io.Reader = .fixed(&input_buffer);
+        input.end = 0;
+        var output_buffer: [output_buffer_len]u8 = undefined;
+        var output: Io.Writer = .{ .vtable = &.{ .drain = Failing.drain }, .buffer = &output_buffer };
+        var conn = Connection.init(&input, &output, .client);
+        defer conn.deinit();
+        const ks = key_schedule.KeySchedule.init(cipher.suiteHash(.aes_128_gcm_sha256).?);
+        conn.write.keys = try cipher.Keys.init(.aes_128_gcm_sha256, ks.trafficSecret(.client_application, "flush"));
+        // The transport's WriteFailed, whose own error says why.
+        try testing.expectError(error.WriteFailed, if (key_update) conn.requestKeyUpdate() else conn.close());
+        // Not closed: close_notify never went out.
+        try testing.expectError(error.TlsConnectionFailed, conn.close());
+        try testing.expectError(error.TlsConnectionFailed, conn.requestKeyUpdate());
     }
 }
 
