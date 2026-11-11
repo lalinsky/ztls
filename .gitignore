@@ -3,3 +3,4 @@ zig-out/
 zig-pkg/
 .bogo/
 tools/survey/out/
+.tlsfuzzer/

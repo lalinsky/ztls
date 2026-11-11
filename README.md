@@ -165,8 +165,10 @@ zig build test -fqemu -Dtarget=aarch64-linux-musl
 The tests include client-server tests over a loopback socket and interoperability
 with `openssl s_server` and `s_client` when OpenSSL 1.1.1 or newer is on the
 PATH. `tests/bogo/run.sh` runs BoringSSL's test runner against the library;
-it needs Go. Format with Zig 0.16's `zig fmt`: 0.17's rewrites builtins
-that 0.16 does not accept.
+it needs Go. `tests/tlsfuzzer/run.sh` runs
+[tlsfuzzer](https://github.com/tlsfuzzer/tlsfuzzer)'s TLS 1.3 scripts
+against the server; it needs Python 3. Format with Zig 0.16's `zig fmt`:
+0.17's rewrites builtins that 0.16 does not accept.
 
 `-Dasm=false` builds AWS-LC's portable C code instead of its assembly,
 which is quicker to build the first time and on x86_64 Windows does
