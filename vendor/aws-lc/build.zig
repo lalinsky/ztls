@@ -43,6 +43,7 @@ pub fn build(b: *std.Build) void {
         "AWS_LC_STDALIGN_AVAILABLE",
         "AWS_LC_BUILTIN_SWAP_SUPPORTED",
         "OPENSSL_NO_ASM",
+        "DISABLE_CPU_JITTER_ENTROPY",
     };
     for (defines) |d| {
         if (std.mem.indexOfScalar(u8, d, '=')) |eq| {
@@ -66,7 +67,6 @@ pub fn build(b: *std.Build) void {
 
     mod.addIncludePath(upstream.path("include"));
     mod.addIncludePath(upstream.path("third_party/s2n-bignum/s2n-bignum-imported/include"));
-    mod.addIncludePath(upstream.path("third_party/jitterentropy/jitterentropy-library"));
 
     const c_flags: []const []const u8 = &.{
         "-std=gnu11",
@@ -78,13 +78,6 @@ pub fn build(b: *std.Build) void {
         .root = upstream.path(""),
         .files = sources.c,
         .flags = c_flags,
-    });
-    mod.addCSourceFiles(.{
-        .root = upstream.path(""),
-        .files = sources.jitter,
-        // jitterentropy measures timing jitter of its own code and must not
-        // be optimized.
-        .flags = &.{ "-std=gnu11", "-fvisibility=hidden", "-DAWSLC", "-O0", "-fwrapv" },
     });
     if (platform) |p| {
         mod.addCSourceFiles(.{

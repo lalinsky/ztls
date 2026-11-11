@@ -256,16 +256,6 @@ pub const c: []const []const u8 = &.{
     "generated-src/err_data.c",
 };
 
-/// Compiled without optimization, as upstream requires.
-pub const jitter: []const []const u8 = &.{
-    "third_party/jitterentropy/jitterentropy-library/src/jitterentropy-base.c",
-    "third_party/jitterentropy/jitterentropy-library/src/jitterentropy-gcd.c",
-    "third_party/jitterentropy/jitterentropy-library/src/jitterentropy-health.c",
-    "third_party/jitterentropy/jitterentropy-library/src/jitterentropy-noise.c",
-    "third_party/jitterentropy/jitterentropy-library/src/jitterentropy-sha3.c",
-    "third_party/jitterentropy/jitterentropy-library/src/jitterentropy-timer.c",
-};
-
 pub const x86_64_linux: Target = .{
     .@"asm" = &.{
         "crypto/fipsmodule/ml_kem/mlkem/native/x86_64/src/intt.S",
@@ -372,6 +362,7 @@ pub const x86_64_linux: Target = .{
         "AWS_LC_STDALIGN_AVAILABLE",
         "BORINGSSL_IMPLEMENTATION",
         "BORINGSSL_RELEASE_BUILD",
+        "DISABLE_CPU_JITTER_ENTROPY",
         "HAVE_LINUX_RANDOM_H",
         "_XOPEN_SOURCE=700",
     },
@@ -478,6 +469,7 @@ pub const aarch64_linux: Target = .{
         "AWS_LC_STDALIGN_AVAILABLE",
         "BORINGSSL_IMPLEMENTATION",
         "BORINGSSL_RELEASE_BUILD",
+        "DISABLE_CPU_JITTER_ENTROPY",
         "HAVE_LINUX_RANDOM_H",
         "_XOPEN_SOURCE=700",
     },
@@ -584,6 +576,7 @@ pub const aarch64_macos: Target = .{
         "AWS_LC_STDALIGN_AVAILABLE",
         "BORINGSSL_IMPLEMENTATION",
         "BORINGSSL_RELEASE_BUILD",
+        "DISABLE_CPU_JITTER_ENTROPY",
     },
 };
 
