@@ -167,7 +167,8 @@ pub const SelectCertificate = struct {
         /// Whether the client can verify signatures by a key of this type,
         /// under a scheme in the server's `signing_schemes`.
         accepts: *const fn (hello: *const Hello, key_type: crypto.sig.KeyType) bool,
-        /// The client's signature_algorithms.
+        /// The client's signature_algorithms that ztls supports, in the
+        /// client's order.
         schemes: []const proto.SignatureScheme,
         /// The server's `signing_schemes`, for `accepts`; a callback that
         /// uses `acceptsKey` need not look at it.
