@@ -84,8 +84,10 @@ fn checkOptions(opt: config.Client) error{TlsInternalError}!void {
     if (!offers(opt, .tls_1_3) and !offers(opt, .tls_1_2)) return error.TlsInternalError;
     if (offers(opt, .tls_1_3)) {
         if (opt.key_shares.len == 0) return error.TlsInternalError;
-        for (opt.key_shares) |group| {
+        for (opt.key_shares, 0..) |group, i| {
             if (std.mem.indexOfScalar(proto.NamedGroup, opt.named_groups, group) == null) return error.TlsInternalError;
+            // One share per group (§4.2.8).
+            if (std.mem.indexOfScalar(proto.NamedGroup, opt.key_shares[0..i], group) != null) return error.TlsInternalError;
         }
     }
 }
@@ -741,6 +743,18 @@ test "a host longer than 255 bytes is a misconfiguration" {
     const long: [256]u8 = @splat('a');
     try checkOptions(.{ .gpa = testing.allocator, .host = long[0..255], .insecure_skip_verify = true, .now = undefined });
     try testing.expectError(error.TlsInternalError, checkOptions(.{ .gpa = testing.allocator, .host = &long, .insecure_skip_verify = true, .now = undefined }));
+}
+
+test "a key share for a group listed twice is a misconfiguration" {
+    const opt: config.Client = .{
+        .gpa = testing.allocator,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = undefined,
+        .named_groups = &.{.secp256r1},
+        .key_shares = &.{ .secp256r1, .secp256r1 },
+    };
+    try testing.expectError(error.TlsInternalError, checkOptions(opt));
 }
 
 test "TLS 1.2 suites are refused in a build without TLS 1.2" {

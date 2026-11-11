@@ -117,13 +117,17 @@ pub const KeyShares = struct {
     pub fn generate(groups: []const proto.NamedGroup) Error!KeyShares {
         var shares: KeyShares = .{};
         errdefer shares.deinit();
-        for (groups) |group| switch (group) {
-            .x25519 => shares.x25519 = kx.X25519.generate(),
-            .secp256r1 => shares.p256 = kx.Ecdh.generate(.p256) catch return error.TlsInternalError,
-            .secp384r1 => shares.p384 = kx.Ecdh.generate(.p384) catch return error.TlsInternalError,
-            .x25519_ml_kem768 => shares.hybrid = kx.X25519MlKem768.generate() catch return error.TlsInternalError,
-            else => return error.TlsInternalError,
-        };
+        for (groups) |group| {
+            // A second key for a group would overwrite, and leak, the first.
+            if (shares.has(group)) return error.TlsInternalError;
+            switch (group) {
+                .x25519 => shares.x25519 = kx.X25519.generate(),
+                .secp256r1 => shares.p256 = kx.Ecdh.generate(.p256) catch return error.TlsInternalError,
+                .secp384r1 => shares.p384 = kx.Ecdh.generate(.p384) catch return error.TlsInternalError,
+                .x25519_ml_kem768 => shares.hybrid = kx.X25519MlKem768.generate() catch return error.TlsInternalError,
+                else => return error.TlsInternalError,
+            }
+        }
         return shares;
     }
 
@@ -887,6 +891,7 @@ test "key shares agree for every group" {
         try testing.expectError(error.TlsIllegalParameter, KeyShares.respond(group, client_share[1..], &server_share_buf, &server_secret_buf));
     }
     try testing.expectError(error.TlsInternalError, KeyShares.generate(&.{.ffdhe2048}));
+    try testing.expectError(error.TlsInternalError, KeyShares.generate(&.{ .secp256r1, .x25519, .secp256r1 }));
 }
 
 test "scheme selection" {
