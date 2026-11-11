@@ -505,9 +505,7 @@ pub const Handshake = struct {
                 break :blk cipher.header_len + w.len;
             };
             c.output.advance(record_len);
-            if (c.output.unusedCapacityLen() < cipher.max_sealed_record_len) {
-                c.output.flush() catch return error.WriteFailed;
-            }
+            try flushIfFull(c);
             w.window = recordWindow(c);
             w.len = 0;
         }
@@ -529,10 +527,19 @@ pub const Handshake = struct {
     }
 
     pub fn messageWriter(h: *Handshake) Error!MessageWriter {
-        if (h.conn.output.unusedCapacityLen() < cipher.max_sealed_record_len) {
-            h.conn.output.flush() catch return error.WriteFailed;
-        }
+        try flushIfFull(h.conn);
         return .{ .h = h, .window = recordWindow(h.conn) };
+    }
+
+    /// Handshake records fill what is left of `output`, so that a flight
+    /// goes out in one transport write; only a sliver is not worth a
+    /// record of its own.
+    const min_record_room = 512;
+
+    fn flushIfFull(c: *Connection) Error!void {
+        if (c.output.unusedCapacityLen() < min_record_room) {
+            c.output.flush() catch return error.WriteFailed;
+        }
     }
 
     /// Writes one whole message, header included.
@@ -1017,6 +1024,32 @@ test "certificate, certificate verify and finished round-trip through records" {
     var received_hash: [crypto.hash.max_digest_length]u8 = undefined;
     try testing.expectEqualSlices(u8, sender.transcriptHash(&sent_hash), receiver.transcriptHash(&received_hash));
     try testing.expectError(error.EndOfStream, receiver.nextMessage());
+}
+
+test "a flight goes out in one transport write" {
+    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
+    defer pair.deinit(testing.allocator);
+
+    var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
+    var output: Io.Writer.Discarding = .init(&output_buffer);
+    var unused_input: [@import("connection.zig").input_buffer_len]u8 = undefined;
+    var input: Io.Reader = .fixed(&unused_input);
+    var conn = Connection.init(&input, &output.writer, .server);
+    defer conn.deinit();
+    var h = Handshake.init(&conn, testing.allocator, 64 * 1024);
+    defer h.deinit();
+    h.setSuite(.aes_128_gcm_sha256);
+    h.transcript.update("ClientHello..ServerHello");
+    const secrets = h.deriveHandshakeSecrets("shared secret");
+    try h.installWriteKeys(secrets.server);
+
+    try h.writeCertificate("", &pair);
+    try h.writeCertificateVerify(&pair, .ecdsa_secp256r1_sha256, .server);
+    try h.writeFinished(&secrets.server);
+    try testing.expectEqual(0, output.count);
+    const flight = output.writer.end;
+    try h.flush();
+    try testing.expectEqual(flight, output.count);
 }
 
 test "a handshake message that spans a key change is refused" {
