@@ -505,9 +505,7 @@ pub const Handshake = struct {
                 break :blk cipher.header_len + w.len;
             };
             c.output.advance(record_len);
-            if (c.output.unusedCapacityLen() < cipher.max_sealed_record_len) {
-                c.output.flush() catch return error.WriteFailed;
-            }
+            try flushIfFull(c);
             w.window = recordWindow(c);
             w.len = 0;
         }
@@ -529,10 +527,19 @@ pub const Handshake = struct {
     }
 
     pub fn messageWriter(h: *Handshake) Error!MessageWriter {
-        if (h.conn.output.unusedCapacityLen() < cipher.max_sealed_record_len) {
-            h.conn.output.flush() catch return error.WriteFailed;
-        }
+        try flushIfFull(h.conn);
         return .{ .h = h, .window = recordWindow(h.conn) };
+    }
+
+    /// Handshake records fill what is left of `output`, so that a flight
+    /// goes out in one transport write; only a sliver is not worth a
+    /// record of its own.
+    const min_record_room = 512;
+
+    fn flushIfFull(c: *Connection) Error!void {
+        if (c.output.unusedCapacityLen() < min_record_room) {
+            c.output.flush() catch return error.WriteFailed;
+        }
     }
 
     /// Writes one whole message, header included.
@@ -1016,6 +1023,104 @@ test "certificate, certificate verify and finished round-trip through records" {
     // Both transcripts agree, and the sender's hashed exactly what it sent.
     var received_hash: [crypto.hash.max_digest_length]u8 = undefined;
     try testing.expectEqualSlices(u8, sender.transcriptHash(&sent_hash), receiver.transcriptHash(&received_hash));
+    try testing.expectError(error.EndOfStream, receiver.nextMessage());
+}
+
+test "a flight goes out in one transport write" {
+    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
+    defer pair.deinit(testing.allocator);
+
+    var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
+    var output: Io.Writer.Discarding = .init(&output_buffer);
+    var unused_input: [@import("connection.zig").input_buffer_len]u8 = undefined;
+    var input: Io.Reader = .fixed(&unused_input);
+    var conn = Connection.init(&input, &output.writer, .server);
+    defer conn.deinit();
+    var h = Handshake.init(&conn, testing.allocator, 64 * 1024);
+    defer h.deinit();
+    h.setSuite(.aes_128_gcm_sha256);
+    h.transcript.update("ClientHello..ServerHello");
+    const secrets = h.deriveHandshakeSecrets("shared secret");
+    try h.installWriteKeys(secrets.server);
+
+    try h.writeCertificate("", &pair);
+    try h.writeCertificateVerify(&pair, .ecdsa_secp256r1_sha256, .server);
+    try h.writeFinished(&secrets.server);
+    try testing.expectEqual(0, output.count);
+    const flight = output.writer.end;
+    try h.flush();
+    try testing.expectEqual(flight, output.count);
+}
+
+test "records cut short by the end of the transport buffer read back whole" {
+    // A transport writer that keeps what it sends.
+    const Capture = struct {
+        sent: std.ArrayList(u8) = .empty,
+        writer: Io.Writer,
+
+        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+            self.sent.appendSlice(testing.allocator, w.buffered()) catch return error.WriteFailed;
+            w.end = 0;
+            var n: usize = 0;
+            for (data[0 .. data.len - 1]) |bytes| {
+                self.sent.appendSlice(testing.allocator, bytes) catch return error.WriteFailed;
+                n += bytes.len;
+            }
+            for (0..splat) |_| {
+                self.sent.appendSlice(testing.allocator, data[data.len - 1]) catch return error.WriteFailed;
+                n += data[data.len - 1].len;
+            }
+            return n;
+        }
+    };
+    var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
+    var capture: Capture = .{ .writer = .{ .buffer = &output_buffer, .vtable = &.{ .drain = Capture.drain } } };
+    defer capture.sent.deinit(testing.allocator);
+
+    var unused_input: [@import("connection.zig").input_buffer_len]u8 = undefined;
+    var input: Io.Reader = .fixed(&unused_input);
+    var sender_conn = Connection.init(&input, &capture.writer, .server);
+    defer sender_conn.deinit();
+    var sender = Handshake.init(&sender_conn, testing.allocator, 64 * 1024);
+    defer sender.deinit();
+    sender.setSuite(.aes_128_gcm_sha256);
+    sender.transcript.update("ClientHello..ServerHello");
+    const secrets = sender.deriveHandshakeSecrets("shared secret");
+    try sender.installWriteKeys(secrets.server);
+
+    // The second message starts in a partly filled buffer, so its first
+    // record is cut short where the buffer ends.
+    var small: [4 + 1000]u8 = undefined;
+    var large: [4 + 20000]u8 = undefined;
+    for (&small, 0..) |*b, i| b.* = @truncate(i);
+    for (&large, 0..) |*b, i| b.* = @truncate(i * 7);
+    small[0] = @intFromEnum(proto.HandshakeType.encrypted_extensions);
+    std.mem.writeInt(u24, small[1..4], small.len - 4, .big);
+    large[0] = @intFromEnum(proto.HandshakeType.certificate);
+    std.mem.writeInt(u24, large[1..4], large.len - 4, .big);
+    try sender.writeMessage(&small);
+    try sender.writeMessage(&large);
+    try sender.flush();
+
+    var input_buffer: [@import("connection.zig").input_buffer_len]u8 = undefined;
+    var fixed: Io.Reader = .fixed(capture.sent.items);
+    var limited = fixed.limited(.unlimited, &input_buffer);
+    var unused_output: [@import("connection.zig").output_buffer_len]u8 = undefined;
+    var discard: Io.Writer = .fixed(&unused_output);
+    var receiver_conn = Connection.init(&limited.interface, &discard, .client);
+    defer receiver_conn.deinit();
+    var receiver = Handshake.init(&receiver_conn, testing.allocator, 64 * 1024);
+    defer receiver.deinit();
+    receiver.setSuite(.aes_128_gcm_sha256);
+    receiver.transcript.update("ClientHello..ServerHello");
+    const peer_secrets = receiver.deriveHandshakeSecrets("shared secret");
+    try receiver.installReadKeys(peer_secrets.server);
+
+    for ([_][]const u8{ &small, &large }) |sent| {
+        const msg = try receiver.nextMessage();
+        try testing.expectEqualSlices(u8, sent, msg.raw);
+    }
     try testing.expectError(error.EndOfStream, receiver.nextMessage());
 }
 
