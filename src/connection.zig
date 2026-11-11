@@ -1062,6 +1062,17 @@ pub const Connection = struct {
             };
         }
 
+        /// Sends what is buffered, then close_notify; see
+        /// `Connection.close`.
+        pub fn close(self: *Writer) WriteError!void {
+            // Once close_notify is sealed, only `output` is left to flush.
+            if (!self.conn.write.closing) self.interface.flush() catch return self.err.?;
+            self.conn.close() catch |err| {
+                self.fail(err) catch {};
+                return err;
+            };
+        }
+
         /// Seals what is buffered and sends everything sealed.
         fn flush(w: *Io.Writer) Io.Writer.Error!void {
             const self: *Writer = @fieldParentPtr("interface", w);
@@ -1087,8 +1098,8 @@ pub const Connection = struct {
 
     /// A cleartext writer whose buffer is the next record's plaintext in
     /// `output`, so what is written is copied once, to where it is sealed.
-    /// While it is in use nothing else may write to `output`, and `close`,
-    /// which does, comes after a flush of it.
+    /// While it is in use nothing else may write to `output`: close it
+    /// with `Writer.close`, not `Connection.close`.
     /// The transport writer must leave `output`'s unused capacity alone
     /// while draining (std's and zio's socket writers do). Its buffer moves
     /// with each record and must not be replaced. One per connection, for
@@ -1553,12 +1564,12 @@ test "after a transport failure, what was sealed goes out with the next flush" {
         sink.failing = false;
         try w.interface.flush();
         sink.failing = true;
-        try testing.expectError(error.WriteFailed, conn.close());
-        try testing.expectError(error.WriteFailed, conn.close());
+        try testing.expectError(error.WriteFailed, w.close());
+        try testing.expectError(error.WriteFailed, w.close());
         // As under cancel protection in a defer, once the transport works.
         sink.failing = false;
-        try conn.close();
-        try conn.close();
+        try w.close();
+        try w.close();
         w.interface.writeAll("late") catch {};
         try testing.expectError(error.WriteFailed, w.interface.flush());
         try testing.expectEqual(error.TlsConnectionFailed, w.err.?);
