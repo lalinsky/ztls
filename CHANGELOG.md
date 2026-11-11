@@ -14,4 +14,4 @@ The first release. ztls is a TLS library for Zig on AWS-LC's libcrypto, for clie
 - A cleartext reader and writer that are ordinary `std.Io.Reader` and `std.Io.Writer`, plus an in-place writer that encrypts inside the transport buffer. A transport failure, such as a cancelled read or write, does not end the connection: the operation may be retried, and a `defer` under cancel protection can still close cleanly.
 - Session resumption, 0-RTT, a TLS 1.2 server, CBC suites and RSA key exchange are left out.
 
-Tested with BoGo, tlsfuzzer and TLS-Anvil, against OpenSSL and Go's `crypto/tls`, and with a survey of real servers from the Chrome UX Report's top million.
+Tested with BoGo, tlsfuzzer and TLS-Anvil, against OpenSSL and Go's `crypto/tls`, and with a survey of real servers: the Chrome UX Report's top 10,000 sites and 5,000 more drawn at random from its list.
