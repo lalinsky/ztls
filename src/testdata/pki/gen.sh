@@ -46,4 +46,23 @@ openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -set_serial 4 -days $d
 openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out selfsigned.key
 openssl req -x509 -new -key selfsigned.key -days $days -subj "/CN=localhost" -addext "subjectAltName=$san" -out selfsigned.pem
 
+# SHA-1 signatures: on a leaf and on the intermediate, which are refused,
+# and on a root, the same CA as above, whose own signature nobody checks.
+openssl req -new -key server-ec.key -subj "/CN=localhost" -out server-sha1.csr
+openssl x509 -req -in server-sha1.csr -CA ca.pem -CAkey ca.key -set_serial 5 -days $days -sha1 -extfile server.ext -out server-sha1.pem
+openssl x509 -req -in intermediate.csr -CA ca.pem -CAkey ca.key -set_serial 7 -days $days -sha1 -extfile intermediate.ext -out intermediate-sha1.pem
+openssl req -x509 -new -key ca.key -sha1 -days $days -subj "/CN=ztls test CA" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -out ca-sha1.pem
+
+# An RSA CA, and leaves it signed with RSASSA-PSS: over SHA-1, which the
+# parameters leave unnamed as the default, and over SHA-256.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out ca-rsa.key 2>/dev/null
+openssl req -x509 -new -key ca-rsa.key -sha256 -days $days -subj "/CN=ztls test RSA CA" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -out ca-rsa.pem
+openssl req -new -key server-ec.key -subj "/CN=localhost" -out server-pss.csr
+for h in sha1 sha256; do
+  openssl x509 -req -in server-pss.csr -CA ca-rsa.pem -CAkey ca-rsa.key -set_serial 6 -days $days -$h \
+    -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest -extfile server.ext -out server-pss-$h.pem
+done
+
 rm -f *.csr *.ext server-chain-leaf.pem

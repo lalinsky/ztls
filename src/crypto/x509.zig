@@ -446,7 +446,7 @@ pub fn verify(store: *const TrustStore, chain: []const Certificate, options: Ver
         if (c.X509_VERIFY_PARAM_set1_ip(param, ip.ptr, ip.len) != 1) return err.fail();
     }
 
-    if (c.X509_verify_cert(ctx) == 1) return;
+    if (c.X509_verify_cert(ctx) == 1) return checkSignatureDigests(ctx);
     const code = c.X509_STORE_CTX_get_error(ctx);
     _ = err.take();
     return switch (code) {
@@ -475,6 +475,53 @@ pub fn verify(store: *const TrustStore, chain: []const Certificate, options: Ver
     };
 }
 
+/// AWS-LC refuses MD4 and MD5 signatures in a chain; SHA-1 is refused
+/// here. AWS-LC has checked the signature of every certificate on the
+/// path it built but the last, usually the trust anchor.
+fn checkSignatureDigests(ctx: *c.X509_STORE_CTX) VerifyError!void {
+    const path = c.X509_STORE_CTX_get0_chain(ctx);
+    const n: usize = c.sk_X509_num(path);
+    for (0..n -| 1) |i| {
+        if (signatureDigest(c.sk_X509_value(path, i).?) == c.NID_sha1) {
+            log.debug("certificate verification failed at depth {d}: signed with SHA-1", .{i});
+            return error.BadCertificate;
+        }
+    }
+}
+
+/// The hash a certificate was signed with, or `NID_undef` for a signature
+/// algorithm that has none of its own, such as Ed25519.
+fn signatureDigest(cert: *const c.X509) c_int {
+    const nid = c.X509_get_signature_nid(cert);
+    if (nid == c.NID_rsassaPss) return pssDigest(cert);
+    var digest: c_int = c.NID_undef;
+    if (c.OBJ_find_sigid_algs(nid, &digest, null) != 1) return c.NID_undef;
+    return digest;
+}
+
+/// RSASSA-PSS names its hash in its parameters, and SHA-1 by naming none
+/// (RFC 4055 §3.1). Parameters that do not parse count as SHA-1; AWS-LC
+/// would not have verified with them anyway.
+fn pssDigest(cert: *const c.X509) c_int {
+    var alg: ?*const c.X509_ALGOR = null;
+    c.X509_get0_signature(null, &alg, cert);
+    var param_type: c_int = c.V_ASN1_UNDEF;
+    var param: ?*const anyopaque = null;
+    c.X509_ALGOR_get0(null, &param_type, &param, alg);
+    if (param_type != c.V_ASN1_SEQUENCE) return c.NID_sha1;
+    const sequence: *const c.ASN1_STRING = @ptrCast(@alignCast(param.?));
+    var der: [*c]const u8 = c.ASN1_STRING_get0_data(sequence);
+    const params = c.d2i_RSA_PSS_PARAMS(null, &der, c.ASN1_STRING_length(sequence)) orelse {
+        _ = err.take();
+        return c.NID_sha1;
+    };
+    defer c.RSA_PSS_PARAMS_free(params);
+    const hash = params.*.hashAlgorithm orelse return c.NID_sha1;
+    var obj: ?*const c.ASN1_OBJECT = null;
+    c.X509_ALGOR_get0(&obj, null, null, hash);
+    return c.OBJ_obj2nid(obj);
+}
+
 const testing = std.testing;
 
 const pki = struct {
@@ -488,6 +535,12 @@ const pki = struct {
     const client = @embedFile("../testdata/pki/client.pem");
     const client_key = @embedFile("../testdata/pki/client.key");
     const selfsigned = @embedFile("../testdata/pki/selfsigned.pem");
+    const server_sha1 = @embedFile("../testdata/pki/server-sha1.pem");
+    const ca_sha1 = @embedFile("../testdata/pki/ca-sha1.pem");
+    const intermediate_sha1 = @embedFile("../testdata/pki/intermediate-sha1.pem");
+    const ca_rsa = @embedFile("../testdata/pki/ca-rsa.pem");
+    const server_pss_sha1 = @embedFile("../testdata/pki/server-pss-sha1.pem");
+    const server_pss_sha256 = @embedFile("../testdata/pki/server-pss-sha256.pem");
 };
 
 /// Within the test PKI's validity (2027-01-15).
@@ -665,6 +718,49 @@ test "the system's roots" {
     // A system has a hundred or so roots, and AWS-LC accepts all that
     // std does; much fewer would mean part of the bundle went unread.
     try testing.expect(store.count() > 50);
+}
+
+test "SHA-1 signatures are refused, except on the trust anchor" {
+    var store = try trustTestCa();
+    defer store.deinit();
+    var sha1_leaf = try Certificate.parsePem(testing.allocator, pki.server_sha1);
+    defer sha1_leaf.deinit();
+    try testing.expectEqual(c.NID_sha1, signatureDigest(sha1_leaf.x509));
+    try testing.expectError(error.BadCertificate, verify(&store, &.{sha1_leaf}, .{ .now = valid_now, .purpose = .server, .host = "localhost" }));
+
+    // The intermediate of "a chain through an intermediate", re-signed with
+    // SHA-1: refused below the root, fine as the trust anchor itself.
+    var chain_leaf = try Certificate.parsePem(testing.allocator, pki.server_chain);
+    defer chain_leaf.deinit();
+    var sha1_intermediate = try Certificate.parsePem(testing.allocator, pki.intermediate_sha1);
+    defer sha1_intermediate.deinit();
+    try testing.expectEqual(c.NID_sha1, signatureDigest(sha1_intermediate.x509));
+    try testing.expectError(error.BadCertificate, verify(&store, &.{ chain_leaf, sha1_intermediate }, .{ .now = valid_now, .purpose = .server, .host = "localhost" }));
+    var sha1_anchor = try TrustStore.init();
+    defer sha1_anchor.deinit();
+    try sha1_anchor.addPem(testing.allocator, pki.intermediate_sha1);
+    try verify(&sha1_anchor, &.{chain_leaf}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
+
+    // The same CA, self-signed with SHA-1.
+    var sha1_root = try TrustStore.init();
+    defer sha1_root.deinit();
+    try sha1_root.addPem(testing.allocator, pki.ca_sha1);
+    var leaf = try Certificate.parsePem(testing.allocator, pki.server_ec);
+    defer leaf.deinit();
+    try verify(&sha1_root, &.{leaf}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
+
+    // RSASSA-PSS names its hash in its parameters.
+    var rsa_ca = try TrustStore.init();
+    defer rsa_ca.deinit();
+    try rsa_ca.addPem(testing.allocator, pki.ca_rsa);
+    var pss_sha1 = try Certificate.parsePem(testing.allocator, pki.server_pss_sha1);
+    defer pss_sha1.deinit();
+    try testing.expectEqual(c.NID_sha1, signatureDigest(pss_sha1.x509));
+    try testing.expectError(error.BadCertificate, verify(&rsa_ca, &.{pss_sha1}, .{ .now = valid_now, .purpose = .server, .host = "localhost" }));
+    var pss_sha256 = try Certificate.parsePem(testing.allocator, pki.server_pss_sha256);
+    defer pss_sha256.deinit();
+    try testing.expectEqual(c.NID_sha256, signatureDigest(pss_sha256.x509));
+    try verify(&rsa_ca, &.{pss_sha256}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
 }
 
 test "untrusted and client certificates" {
