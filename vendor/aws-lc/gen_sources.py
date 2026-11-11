@@ -26,6 +26,8 @@ TARGETS = [
     ("x86_64_linux", "x86_64-linux-gnu", "Linux", "x86_64", "linux-x86_64"),
     ("aarch64_linux", "aarch64-linux-gnu", "Linux", "aarch64", "linux-aarch64"),
     ("aarch64_macos", "aarch64-macos", "Darwin", "arm64", "ios-aarch64"),
+    ("x86_64_macos", "x86_64-macos", "Darwin", "x86_64", "mac-x86_64"),
+    ("aarch64_windows", "aarch64-windows-gnu", "Windows", "ARM64", "win-aarch64"),
 ]
 
 # Defines that every target gets from the build script itself, or that only

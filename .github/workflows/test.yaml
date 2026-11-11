@@ -12,6 +12,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         zig: [0.16.0, 0.17.0]
+        # The other targets AWS-LC's assembly is built for.
+        include:
+          - os: macos-15-intel
+            zig: 0.17.0
+          - os: windows-11-arm
+            zig: 0.17.0
     runs-on: ${{ matrix.os }}
     name: Test (${{ matrix.os }}, zig ${{ matrix.zig }})
     steps:
