@@ -311,6 +311,7 @@ pub const Handshake = struct {
     /// the next `nextMessage` or `readChangeCipherSpec`. The caller hashes
     /// it into the transcript (`hashMessage`) once it is dealt with.
     pub fn nextMessage(h: *Handshake) Error!Message {
+        @setRuntimeSafety(true);
         while (true) {
             if (h.pending.len >= 4) {
                 const len = std.mem.readInt(u24, h.pending[1..4], .big);
@@ -341,6 +342,7 @@ pub const Handshake = struct {
     /// the inbox. Alerts end the handshake; application data is out of
     /// place.
     fn readHandshakeRecord(h: *Handshake) Error!void {
+        @setRuntimeSafety(true);
         // The next read may reuse the transport buffer that pending bytes
         // from the last record are in: they move to the inbox first. With
         // nothing pending, the last message is done with, and the inbox
@@ -367,6 +369,7 @@ pub const Handshake = struct {
     /// Room for all of it waits until it arrives: the length is only the
     /// peer's word.
     fn spill(h: *Handshake) Error!void {
+        @setRuntimeSafety(true);
         const len = h.pending.len;
         // In the inbox, pending is what is left at its end.
         assert(h.inbox.items.len == 0 or h.pending.ptr + len == h.inbox.items.ptr + h.inbox.items.len);

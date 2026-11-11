@@ -251,6 +251,7 @@ pub const Connection = struct {
     /// handshake runs. close_notify and clean transport ends are
     /// `EndOfStream`; other alerts are returned for the caller to act on.
     pub fn readRecord(c: *Connection, dest: ?[]u8) ReadRecordError!Record {
+        @setRuntimeSafety(true);
         while (true) {
             const header = c.input.peek(cipher.header_len) catch |err| switch (err) {
                 error.EndOfStream => return c.inputEnded(),
@@ -485,6 +486,7 @@ pub const Connection = struct {
     /// §4.2), as AWS-LC and Go do by default, so a server waiting for it
     /// fails at once rather than at its timeout.
     fn handlePostHandshake(c: *Connection, payload: []const u8) Failure!void {
+        @setRuntimeSafety(true);
         const keys = &c.read.keys.?;
         const tls13 = switch (keys.version) {
             .tls13 => |*tls13| tls13,
@@ -579,6 +581,7 @@ pub const Connection = struct {
         /// next record, decrypted straight into the first destination when
         /// it fits.
         fn readVec(r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+            @setRuntimeSafety(true);
             const self: *Reader = @fieldParentPtr("interface", r);
             const c = self.conn;
             var dest_buffer: [8][]u8 = undefined;
@@ -782,6 +785,7 @@ pub const Connection = struct {
     /// nonce), with room left for the trailer and, in TLS 1.3, for a
     /// KeyUpdate ahead of it. Empty when `output` needs flushing.
     fn payloadWindow(c: *Connection) []u8 {
+        @setRuntimeSafety(true);
         const keys = &c.write.keys.?;
         const unused = c.output.unusedCapacitySlice();
         const offset = keys.payloadOffset();
@@ -798,6 +802,7 @@ pub const Connection = struct {
     /// plaintext moved up to make room. `output` is flushed when it has no
     /// room for another full record.
     fn sealWindow(c: *Connection, len: usize) WriteError!void {
+        @setRuntimeSafety(true);
         try c.checkWritable();
         const keys = &c.write.keys.?;
         const buf = c.output.unusedCapacitySlice();
@@ -846,6 +851,7 @@ pub const Connection = struct {
     /// Copies the start of `header` then `data` (the last element `splat`
     /// times) into `dest`, as much as fits.
     fn gather(dest: []u8, header: []const u8, data: []const []const u8, splat: usize) void {
+        @setRuntimeSafety(true);
         var i = copyPrefix(dest, header);
         for (data[0 .. data.len - 1]) |bytes| {
             if (i == dest.len) return;
@@ -864,6 +870,7 @@ pub const Connection = struct {
     }
 
     fn copyPrefix(dest: []u8, src: []const u8) usize {
+        @setRuntimeSafety(true);
         const len = @min(dest.len, src.len);
         @memcpy(dest[0..len], src[0..len]);
         return len;
@@ -960,6 +967,7 @@ pub const Connection = struct {
         /// saves them, seals, and moves them to the front of the next
         /// window.
         fn rebaseInPlace(w: *Io.Writer, preserve: usize, minimum_len: usize) Io.Writer.Error!void {
+            @setRuntimeSafety(true);
             const self: *Writer = @fieldParentPtr("interface", w);
             const c = self.conn;
             while (w.buffer.len - w.end < minimum_len) {
