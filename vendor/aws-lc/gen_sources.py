@@ -10,13 +10,15 @@ files and the defines for each target into sources.zig.
 Usage:
     python3 gen_sources.py /path/to/aws-lc > sources.zig
 
-Requires cmake, ninja and zig on PATH. The assembly comes from AWS-LC's
-pre-generated `generated-src/`, so neither Perl nor Go is needed.
+Requires cmake, ninja and zig on PATH, and NASM on PATH or in $NASM. The
+assembly comes from AWS-LC's pre-generated `generated-src/`, so neither Perl
+nor Go is needed.
 """
 
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +30,7 @@ TARGETS = [
     ("aarch64_macos", "aarch64-macos", "Darwin", "arm64", "ios-aarch64"),
     ("x86_64_macos", "x86_64-macos", "Darwin", "x86_64", "mac-x86_64"),
     ("aarch64_windows", "aarch64-windows-gnu", "Windows", "ARM64", "win-aarch64"),
+    ("x86_64_windows", "x86_64-windows-gnu", "Windows", "AMD64", "win-x86_64"),
 ]
 
 # Defines that every target gets from the build script itself, or that only
@@ -67,9 +70,20 @@ def configure(src, work, name, triple, system, processor):
     ]
     if system == "Darwin":
         args.append(f"-DCMAKE_OSX_ARCHITECTURES={processor}")
+    if system == "Windows" and processor == "AMD64":
+        # Upstream's x86_64 Windows assembly is NASM. Configuring only
+        # needs a NASM to exist; the Zig build assembles with its own.
+        args.append(f"-DNASM_EXECUTABLE={nasm()}")
     subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
     with open(os.path.join(build, "compile_commands.json")) as f:
         return build, json.load(f)
+
+
+def nasm():
+    path = os.environ.get("NASM") or shutil.which("nasm")
+    if not path:
+        raise SystemExit("x86_64 Windows needs NASM to configure: put it on PATH or set NASM")
+    return path
 
 
 def relpath(path, src, build, asm_dir):
@@ -82,7 +96,7 @@ def relpath(path, src, build, asm_dir):
     rel = os.path.relpath(path, build)
     if rel == os.path.join("crypto", "err_data.c"):
         return os.path.join("generated-src", "err_data.c")
-    if rel.endswith(".S") and rel.startswith("crypto" + os.sep):
+    if rel.endswith((".S", ".asm")) and rel.startswith("crypto" + os.sep):
         # CMake copies generated-src/<platform>/crypto/ into the build tree.
         candidate = os.path.join("generated-src", asm_dir, rel)
         if os.path.exists(os.path.join(src, candidate)):
@@ -97,7 +111,7 @@ def collect(src, build, commands, asm_dir):
         rel = relpath(cmd["file"], src, build, asm_dir)
         if os.sep + "test" + os.sep in rel and "trampoline" in rel:
             continue  # test-only assembly
-        if rel.endswith(".S"):
+        if rel.endswith((".S", ".asm")):
             asm_files.append(rel)
         else:
             c_files.append(rel)

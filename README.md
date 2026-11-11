@@ -168,6 +168,10 @@ PATH. `tests/bogo/run.sh` runs BoringSSL's test runner against the library;
 it needs Go. Format with Zig 0.16's `zig fmt`: 0.17's rewrites builtins
 that 0.16 does not accept.
 
+`-Dasm=false` builds AWS-LC's portable C code instead of its assembly,
+which is quicker to build the first time and on x86_64 Windows does
+without NASM.
+
 `vendor/aws-lc` builds libcrypto; `gen_sources.py` there regenerates the
 file lists from upstream's CMake build after an upgrade. AWS-LC's headers
 reach Zig through translate-c from `src/c.h`.

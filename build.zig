@@ -4,6 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const tls12 = b.option(bool, "tls12", "Build the TLS 1.2 client in (default: true)") orelse true;
+    const use_asm = b.option(bool, "asm", "Build AWS-LC's assembly; false builds its portable C code, without NASM on x86_64 Windows (default: true)") orelse true;
     const options = b.addOptions();
     options.addOption(bool, "tls12", tls12);
 
@@ -12,6 +13,7 @@ pub fn build(b: *std.Build) void {
     const aws_lc = b.dependency("aws_lc", .{
         .target = target,
         .optimize = if (optimize == std.builtin.OptimizeMode.Debug) std.builtin.OptimizeMode.ReleaseSafe else optimize,
+        .@"asm" = use_asm,
     });
     const libcrypto = aws_lc.artifact("crypto");
 
