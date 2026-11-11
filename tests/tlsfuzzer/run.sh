@@ -206,12 +206,10 @@ tests=(
         'tls 1.3 negotiation with SSL 3.0 in record layer'
         'tls 1.3 negotiation with SSL 3.1 in record layer'
         'tls 1.3 negotiation with SSL 3.2 in record layer'
-        'tls 1.3 negotiation with SSL 3.3 in record layer'"
+        'tls 1.3 negotiation with SSL 3.3 in record layer'
+        'SSL 2.0 ClientHello with TLS 1.3 version and TLS 1.3 only ciphersuites'"
         # Only these: the rest expect a fall back to TLS 1.2, which the
-        # server does not speak. Also out: 'SSL 2.0 ClientHello with TLS 1.3
-        # version and TLS 1.3 only ciphersuites', BUG: the record header's
-        # 0x80 content type is not refused until the 772 byte body its
-        # length claims arrives, so the server waits until the client gives up.
+        # server does not speak.
     "test-tls13-hrr.py"
     "test-tls13-finished.py
         -e 'padding - cipher TLS_AES_128_GCM_SHA256, pad_byte 0, pad_left 0, pad_right 131072'

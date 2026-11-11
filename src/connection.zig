@@ -258,6 +258,12 @@ pub const Connection = struct {
                 error.ReadFailed => return error.ReadFailed,
             };
             const content_type: proto.ContentType = @enumFromInt(header[0]);
+            // Before waiting for a body that may never come, as for an
+            // SSLv2-style hello.
+            switch (content_type) {
+                .change_cipher_spec, .alert, .handshake, .application_data => {},
+                else => return error.TlsUnexpectedMessage,
+            }
             if (proto.tls12_enabled and c.read.check_record_version and std.mem.readInt(u16, header[1..3], .big) != @intFromEnum(proto.Version.tls_1_2)) {
                 return error.TlsProtocolVersion;
             }
