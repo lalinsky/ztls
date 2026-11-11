@@ -99,6 +99,7 @@ const Choices = struct {
 };
 
 fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
+    @setRuntimeSafety(true);
     if (opt.cipher_suites.len == 0 or opt.named_groups.len == 0) return error.TlsInternalError;
 
     var msg = try h.nextMessage();
@@ -279,6 +280,7 @@ fn selectAlpn(ours: []const []const u8, offered: ?[]const u8) Error!?[]const u8 
 }
 
 fn parseClientHello(body: []const u8) Error!ClientHello {
+    @setRuntimeSafety(true);
     var d = codec.Decoder.init(body);
     // legacy_version plays no part once supported_versions is there
     // (§4.3.1), and that extension is required below.

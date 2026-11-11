@@ -265,6 +265,7 @@ pub const Keys = struct {
     /// forestalls; the record at the limit itself is that KeyUpdate, or
     /// an alert that ends the direction.
     pub fn seal(keys: *Keys, record: []u8, content_type: proto.ContentType, len: usize) error{TlsInternalError}!void {
+        @setRuntimeSafety(true);
         assert(len <= max_plaintext_len);
         assert(record.len >= keys.sealedLen(len));
         if (keys.seq > keys.recordLimit()) return error.TlsInternalError;
@@ -319,6 +320,7 @@ pub const Keys = struct {
     }
 
     fn openTls13(keys: *Keys, record: []const u8, out: []u8) error{ TlsBadRecordMac, TlsDecodeError, TlsRecordOverflow, TlsUnexpectedMessage }!Opened {
+        @setRuntimeSafety(true);
         if (record.len < header_len + seal_overhead) return error.TlsDecodeError;
         const inner_len = record.len - header_len - aead.tag_length;
         if (inner_len > max_inner_len) return error.TlsRecordOverflow;
@@ -345,6 +347,7 @@ pub const Keys = struct {
     }
 
     fn openTls12(keys: *Keys, record: []const u8, out: []u8) error{ TlsBadRecordMac, TlsDecodeError, TlsRecordOverflow, TlsUnexpectedMessage }!Opened {
+        @setRuntimeSafety(true);
         const content_type: proto.ContentType = @enumFromInt(record[0]);
         switch (content_type) {
             .handshake, .alert, .application_data => {},

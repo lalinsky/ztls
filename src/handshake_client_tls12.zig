@@ -191,6 +191,7 @@ const KeyExchange = struct {
 /// The server's ECDHE parameters (RFC 8422 §5.4) and its signature over
 /// them and both randoms, made with the leaf's key.
 fn parseServerKeyExchange(body: []const u8, opt: config.Client, public_key: *const sig.PublicKey, randoms: Randoms) Error!KeyExchange {
+    @setRuntimeSafety(true);
     var d = codec.Decoder.init(body);
     // ECCurveType: named_curve only; explicit curves are long gone.
     if (try d.decode(u8) != 3) return error.TlsIllegalParameter;
