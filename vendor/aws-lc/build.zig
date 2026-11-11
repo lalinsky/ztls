@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const use_asm = b.option(bool, "asm", "Build the assembly where there is any (default: true)") orelse true;
     const upstream = b.dependency("upstream", .{});
 
     const mod = b.createModule(.{
@@ -24,7 +25,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const t = target.result;
-    const platform: ?sources.Target = switch (t.os.tag) {
+    const platform: ?sources.Target = if (!use_asm) null else switch (t.os.tag) {
         .linux => switch (t.cpu.arch) {
             .x86_64 => sources.x86_64_linux,
             .aarch64 => sources.aarch64_linux,
