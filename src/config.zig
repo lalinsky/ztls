@@ -264,7 +264,8 @@ pub const Client = struct {
     /// equal to it; any other list is offered as given.
     cipher_suites: []const proto.CipherSuite = &default_cipher_suites,
     named_groups: []const proto.NamedGroup = &default_named_groups,
-    /// Groups to send key shares for; each must be in `named_groups`.
+    /// Groups to send key shares for; each must be in `named_groups`, and
+    /// listed once.
     key_shares: []const proto.NamedGroup = &default_key_shares,
     /// Sent as signature_algorithms, and the only schemes the server may
     /// sign the handshake with: its CertificateVerify, or in TLS 1.2 its
