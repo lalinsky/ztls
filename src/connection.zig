@@ -384,8 +384,9 @@ pub const Connection = struct {
                 },
             };
             // A message split across records has nothing between its
-            // pieces (§5.1).
-            if (c.read.message.len != 0 and record.content_type != .handshake) {
+            // pieces but alerts (§5.1), which BoringSSL and s2n let
+            // through too.
+            if (c.read.message.len != 0 and record.content_type != .handshake and record.content_type != .alert) {
                 c.failRead(error.TlsUnexpectedMessage);
                 return error.TlsUnexpectedMessage;
             }
@@ -434,6 +435,12 @@ pub const Connection = struct {
                     }
                     switch (alert) {
                         .close_notify => {
+                            // Not in the middle of a message, as at the
+                            // transport's end.
+                            if (c.read.message.len != 0) {
+                                c.failRead(error.TlsUnexpectedMessage);
+                                return error.TlsUnexpectedMessage;
+                            }
                             c.shared.read_state.store(.closed, .release);
                             return error.EndOfStream;
                         },
@@ -1629,17 +1636,20 @@ test "post-handshake messages split across records and sharing them" {
             var end: SelfTalk.End = undefined;
             try s.server(&end);
             defer end.deinit();
-            // A ticket in three pieces, the header itself split; then a
-            // KeyUpdate that starts in the ticket's last record and ends
-            // a record of its own; then a ticket and a KeyUpdate whole in
-            // one record.
+            // A ticket in three pieces, the header itself split and a
+            // user_canceled between the first two; then a KeyUpdate that
+            // starts in the ticket's last record and ends a record of its
+            // own; then a ticket and a KeyUpdate whole in one record.
             const records = [_][]const u8{
                 &.{ nst, 0 },
                 &.{ 0, 14, 1, 2, 3, 4, 5 },
                 &.{ 6, 7, 8, 9, 10, 11, 12, 13, 14, ku, 0 },
                 &.{ 0, 1, 0 },
             };
-            for (records) |payload| try end.conn.writeRecord(.handshake, payload);
+            for (records, 0..) |payload, i| {
+                try end.conn.writeRecord(.handshake, payload);
+                if (i == 0) try end.conn.writeRecord(.alert, &.{ 1, @intFromEnum(proto.Alert.user_canceled) });
+            }
             try end.conn.advanceWriteKeys(&end.conn.write.keys.?.version.tls13);
             try end.conn.writeRecord(.handshake, &[_]u8{ nst, 0, 0, 14 } ++ @as([14]u8, @splat(0)) ++ [_]u8{ ku, 0, 0, 1, 0 });
             try end.conn.advanceWriteKeys(&end.conn.write.keys.?.version.tls13);
@@ -1683,7 +1693,8 @@ test "malformed post-handshake records" {
         .{ .records = &.{.{ .payload = &.{ nst, 0, 0, 13 } }}, .expected = error.TlsDecodeError },
         // A message only a handshake has.
         .{ .records = &.{.{ .payload = &.{ @intFromEnum(proto.HandshakeType.finished), 0, 0, 0 } }}, .expected = error.TlsUnexpectedMessage },
-        // Application data, or an alert, between a message's pieces.
+        // Application data between a message's pieces, or close_notify,
+        // which ends the stream inside the message.
         .{ .records = &.{ .{ .payload = &.{ nst, 0, 0, 14, 0 } }, .{ .content_type = .application_data, .payload = "x" } }, .expected = error.TlsUnexpectedMessage },
         .{ .records = &.{ .{ .payload = &.{ ku, 0 } }, .{ .content_type = .alert, .payload = &.{ 1, 0 } } }, .expected = error.TlsUnexpectedMessage },
         // A ticket sent to a server.
