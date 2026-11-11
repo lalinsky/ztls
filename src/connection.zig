@@ -257,6 +257,11 @@ pub const Connection = struct {
                 error.EndOfStream => return c.inputEnded(),
                 error.ReadFailed => return error.ReadFailed,
             };
+            if (proto.tls12_enabled and c.read.check_record_version and std.mem.readInt(u16, header[1..3], .big) != @intFromEnum(proto.Version.tls_1_2)) {
+                return error.TlsProtocolVersion;
+            }
+            const body_len = std.mem.readInt(u16, header[3..5], .big);
+            if (body_len > cipher.max_ciphertext_len) return error.TlsRecordOverflow;
             const content_type: proto.ContentType = @enumFromInt(header[0]);
             // Before waiting for a body that may never come, as for an
             // SSLv2-style hello.
@@ -264,11 +269,6 @@ pub const Connection = struct {
                 .change_cipher_spec, .alert, .handshake, .application_data => {},
                 else => return error.TlsUnexpectedMessage,
             }
-            if (proto.tls12_enabled and c.read.check_record_version and std.mem.readInt(u16, header[1..3], .big) != @intFromEnum(proto.Version.tls_1_2)) {
-                return error.TlsProtocolVersion;
-            }
-            const body_len = std.mem.readInt(u16, header[3..5], .big);
-            if (body_len > cipher.max_ciphertext_len) return error.TlsRecordOverflow;
             const record = c.input.take(cipher.header_len + body_len) catch |err| switch (err) {
                 error.EndOfStream => return error.TlsConnectionTruncated,
                 error.ReadFailed => return error.ReadFailed,
