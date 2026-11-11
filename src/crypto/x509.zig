@@ -46,9 +46,13 @@ pub const Certificate = struct {
         self.* = undefined;
     }
 
-    /// The subject's key, for verifying CertificateVerify.
-    pub fn publicKey(self: *const Certificate) error{ UnsupportedKey, CryptoFailed }!sig.PublicKey {
-        const pkey = c.X509_get_pubkey(self.x509) orelse return err.fail();
+    /// The subject's key, for verifying CertificateVerify. A key AWS-LC
+    /// cannot load, such as DSA or one on a curve it lacks, is unsupported.
+    pub fn publicKey(self: *const Certificate) error{UnsupportedKey}!sig.PublicKey {
+        const pkey = c.X509_get_pubkey(self.x509) orelse {
+            _ = err.take();
+            return error.UnsupportedKey;
+        };
         return sig.PublicKey.fromPkey(pkey);
     }
 
@@ -848,6 +852,19 @@ fn malformedKeyUsage(text: []const u8, buf: []u8) !Certificate {
     const bits = oid + std.mem.indexOf(u8, der[oid..], &.{ 0x03, 0x02 }).?;
     der[bits + 2] = 9;
     return Certificate.parseDer(der);
+}
+
+test "a key on a curve AWS-LC lacks is unsupported" {
+    var it = pem.Iterator.init(pki.server_ec);
+    var buf: [2048]u8 = undefined;
+    const der = try (try it.next()).?.decode(&buf);
+    // prime256v1, 1.2.840.10045.3.1.7, becomes 3.1.8, which names none.
+    const at = std.mem.indexOf(u8, der, &.{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }).?;
+    der[at + 9] = 8;
+    var cert = try Certificate.parseDer(der);
+    defer cert.deinit();
+    try testing.expectError(error.UnsupportedKey, cert.publicKey());
+    try testing.expectEqual(0, c.ERR_peek_error());
 }
 
 test "malformed certificates" {

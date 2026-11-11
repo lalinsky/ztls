@@ -795,7 +795,6 @@ pub const Handshake = struct {
         }
         peer.public_key = peer.chain[0].publicKey() catch |err| switch (err) {
             error.UnsupportedKey => return error.TlsUnsupportedCertificate,
-            error.CryptoFailed => return error.TlsInternalError,
         };
         errdefer peer.public_key.deinit();
         if (h.keep_peer_certificates) {
