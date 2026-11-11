@@ -485,14 +485,14 @@ pub fn main(init: std.process.Init) !void {
 
     if (!o.shim_shuts_down) {
         while (true) {
-            if (o.key_update_before_read) conn.requestKeyUpdate() catch |err| fail("key update: {s}", .{@errorName(err)});
+            if (o.key_update_before_read) writer.requestKeyUpdate() catch |err| fail("key update: {s}", .{@errorName(err)});
             // Whatever has arrived, up to the read size, like SSL_read.
             const avail = reader.interface.peekGreedy(1) catch |err| switch (err) {
                 error.EndOfStream => break,
                 error.ReadFailed => readFailed(&conn, &reader),
             };
             const n = @min(avail.len, o.read_size);
-            if (o.key_update) conn.requestKeyUpdate() catch |err| fail("key update: {s}", .{@errorName(err)});
+            if (o.key_update) writer.requestKeyUpdate() catch |err| fail("key update: {s}", .{@errorName(err)});
             for (avail[0..n]) |*b| b.* ^= 0xff;
             writer.interface.writeAll(avail[0..n]) catch fail("write: {s}", .{@errorName(writer.err orelse error.WriteFailed)});
             writer.interface.flush() catch fail("write: {s}", .{@errorName(writer.err orelse error.WriteFailed)});
