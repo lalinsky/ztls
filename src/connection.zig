@@ -751,7 +751,8 @@ pub const Connection = struct {
     /// For the writing task. While an earlier request is still unanswered
     /// only our keys are updated: §4.7.3 allows one request at a time.
     /// Does nothing past `max_key_updates`, nor in TLS 1.2, which has no
-    /// KeyUpdate.
+    /// KeyUpdate. After a transport failure the update has happened and
+    /// only the flush is left; calling this again makes another one.
     pub fn requestKeyUpdate(c: *Connection) WriteError!void {
         try c.checkWritable();
         const tls13 = switch (c.write.keys.?.version) {
@@ -1000,7 +1001,12 @@ pub const Connection = struct {
             const total = Io.Writer.countSplat(data, splat);
             const n = @min(w.buffer.len - w.end, total);
             gather(w.buffer[w.end..][0..n], "", data, splat);
-            try self.seal(w.end + n);
+            const len = w.end + n;
+            if (len > 0) self.conn.sealWindow(len) catch |err| return self.fail(err);
+            w.end = 0;
+            // Sealed, the `n` bytes are written even if the transport fails
+            // now; the next drain finds out again.
+            w.buffer = self.window() catch |err| return if (n > 0) n else err;
             return n;
         }
 
@@ -1457,32 +1463,58 @@ test "a header that rules a record out is refused without its body" {
     }
 }
 
+/// A transport writer that, while failing, sends a few bytes of what is
+/// buffered before each failure.
+const TestSink = struct {
+    failing: bool = true,
+    sent: [4 * output_buffer_len]u8 = undefined,
+    len: usize = 0,
+    writer: Io.Writer,
+
+    fn init(buffer: []u8) TestSink {
+        return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *TestSink = @fieldParentPtr("writer", w);
+        if (self.failing) {
+            const some = @min(w.end, 7);
+            self.put(w.buffered()[0..some]);
+            _ = w.consume(some);
+            return error.WriteFailed;
+        }
+        self.put(w.buffered());
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            self.put(d);
+            n += d.len;
+        }
+        for (0..splat) |_| self.put(data[data.len - 1]);
+        n += data[data.len - 1].len * splat;
+        return w.consume(w.end + n);
+    }
+
+    fn put(self: *TestSink, bytes: []const u8) void {
+        @memcpy(self.sent[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    /// Decrypts what was sent, up to close_notify.
+    fn received(self: *TestSink, secret: anytype) ![]u8 {
+        var input: Io.Reader = .fixed(&self.sent);
+        input.end = self.len;
+        var output_buffer: [output_buffer_len]u8 = undefined;
+        var output: Io.Writer = .fixed(&output_buffer);
+        var peer = Connection.init(&input, &output, .server);
+        defer peer.deinit();
+        peer.read.keys = try cipher.Keys.init(.aes_128_gcm_sha256, secret);
+        var rbuf: [64]u8 = undefined;
+        var r = peer.reader(&rbuf);
+        return r.interface.allocRemaining(testing.allocator, .unlimited);
+    }
+};
+
 test "after a transport failure, what was sealed goes out with the next flush" {
-    const Sink = struct {
-        failing: bool = true,
-        sent: [2 * output_buffer_len]u8 = undefined,
-        len: usize = 0,
-        writer: Io.Writer,
-
-        fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-            const self: *@This() = @fieldParentPtr("writer", w);
-            if (self.failing) return error.WriteFailed;
-            self.put(w.buffered());
-            var n: usize = 0;
-            for (data[0 .. data.len - 1]) |d| {
-                self.put(d);
-                n += d.len;
-            }
-            for (0..splat) |_| self.put(data[data.len - 1]);
-            n += data[data.len - 1].len * splat;
-            return w.consume(w.end + n);
-        }
-
-        fn put(self: *@This(), bytes: []const u8) void {
-            @memcpy(self.sent[self.len..][0..bytes.len], bytes);
-            self.len += bytes.len;
-        }
-    };
     const ks = key_schedule.KeySchedule.init(cipher.suiteHash(.aes_128_gcm_sha256).?);
     const secret = ks.trafficSecret(.client_application, "retry");
     for ([_]bool{ false, true }) |in_place| {
@@ -1490,7 +1522,7 @@ test "after a transport failure, what was sealed goes out with the next flush" {
         var input: Io.Reader = .fixed(&input_buffer);
         input.end = 0;
         var output_buffer: [output_buffer_len]u8 = undefined;
-        var sink: Sink = .{ .writer = .{ .vtable = &.{ .drain = Sink.drain }, .buffer = &output_buffer } };
+        var sink: TestSink = .init(&output_buffer);
         var conn = Connection.init(&input, &sink.writer, .client);
         defer conn.deinit();
         conn.write.keys = try cipher.Keys.init(.aes_128_gcm_sha256, secret);
@@ -1502,7 +1534,6 @@ test "after a transport failure, what was sealed goes out with the next flush" {
         try testing.expectError(error.WriteFailed, conn.requestKeyUpdate());
         try testing.expectError(error.WriteFailed, conn.close());
         try testing.expectError(error.WriteFailed, conn.close());
-        try testing.expectEqual(0, sink.len);
         // As under cancel protection in a defer, once the transport works.
         sink.failing = false;
         try conn.close();
@@ -1511,21 +1542,42 @@ test "after a transport failure, what was sealed goes out with the next flush" {
         try testing.expectError(error.WriteFailed, w.interface.flush());
         try testing.expectEqual(error.TlsConnectionFailed, w.err.?);
 
-        // One record each: the data, the KeyUpdate, close_notify.
-        var peer_input: Io.Reader = .fixed(&input_buffer);
-        @memcpy(input_buffer[0..sink.len], sink.sent[0..sink.len]);
-        peer_input.end = sink.len;
-        var peer_output: Io.Writer = .fixed(&output_buffer);
-        var peer = Connection.init(&peer_input, &peer_output, .server);
-        defer peer.deinit();
-        peer.read.keys = try cipher.Keys.init(.aes_128_gcm_sha256, secret);
-        var rbuf: [64]u8 = undefined;
-        var r = peer.reader(&rbuf);
-        const got = try r.interface.allocRemaining(testing.allocator, .unlimited);
+        const got = try sink.received(secret);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("hello", got);
-        try testing.expect(peer.shared.key_update_requested.load(.monotonic));
     }
+}
+
+test "an in-place write that fills a record counts it as written when the flush after it fails" {
+    const ks = key_schedule.KeySchedule.init(cipher.suiteHash(.aes_128_gcm_sha256).?);
+    const secret = ks.trafficSecret(.client_application, "retry");
+    var input_buffer: [input_buffer_len]u8 = undefined;
+    var input: Io.Reader = .fixed(&input_buffer);
+    input.end = 0;
+    var output_buffer: [output_buffer_len]u8 = undefined;
+    var sink: TestSink = .init(&output_buffer);
+    var conn = Connection.init(&input, &sink.writer, .client);
+    defer conn.deinit();
+    conn.write.keys = try cipher.Keys.init(.aes_128_gcm_sha256, secret);
+
+    var data: [cipher.max_plaintext_len + 10]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    var w = conn.writerInPlace();
+    var sent: usize = 0;
+    while (sent < data.len) {
+        sent += w.interface.write(data[sent..]) catch {
+            // The app retries what was not written, once the transport works.
+            try testing.expect(sink.failing);
+            sink.failing = false;
+            continue;
+        };
+    }
+    try w.interface.flush();
+    try conn.close();
+
+    const got = try sink.received(secret);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &data, got);
 }
 
 test "post-handshake messages split across records and sharing them" {

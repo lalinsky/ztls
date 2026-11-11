@@ -117,7 +117,8 @@ so a larger buffer gains nothing.
 is the plaintext of the next record, inside the transport buffer. That puts
 rules on the application. The writer's buffer moves with every record and
 must not be replaced. `requestKeyUpdate` and `close` write to the transport
-buffer too, so the writer is flushed before either. And the transport writer
+buffer too, so the writer is flushed before either, and once either has
+failed it is not written to again. And the transport writer
 must leave its unused capacity alone while it drains, as std's and zio's
 socket writers do.
 
@@ -146,7 +147,8 @@ does not end the connection and the read may be retried. Nor does a
 transport `WriteFailed`: what was already encrypted stays in the transport
 writer's buffer and goes out with the next flush. A task whose write was
 cancelled can still close cleanly by calling `close`, from a `defer` under
-cancel protection.
+cancel protection. What the writer held and had not yet encrypted is lost
+unless it is flushed first, under the same protection.
 
 A transport that ends between records without close_notify is a clean end
 of stream; the `strict_close_notify` option makes it an error.
