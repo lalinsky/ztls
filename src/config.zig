@@ -238,9 +238,9 @@ pub const default_signature_schemes = [_]proto.SignatureScheme{
 };
 
 pub const Client = struct {
-    /// For the handshake's working memory: the peer's messages are
-    /// reassembled in it. Nothing is kept after the handshake.
-    allocator: Allocator,
+    /// For handshake working memory and retained peer certificates.
+    /// Must remain valid until `Connection.deinit()`.
+    gpa: Allocator,
     /// The server's name, sent as SNI and checked against its
     /// certificate. An IP literal is checked against the certificate's IP
     /// addresses instead and sent as no SNI. At most 255 bytes, and empty
@@ -290,8 +290,9 @@ pub const Client = struct {
 };
 
 pub const Server = struct {
-    /// For the handshake's working memory; nothing is kept afterwards.
-    allocator: Allocator,
+    /// For handshake working memory and retained peer certificates.
+    /// Must remain valid until `Connection.deinit()`.
+    gpa: Allocator,
     /// What the server presents when nothing in `certificates` or from
     /// `select_certificate` fits. Null for a server with no certificate,
     /// which no client accepts in v1.

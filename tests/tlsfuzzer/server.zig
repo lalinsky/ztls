@@ -47,17 +47,17 @@ pub fn main(init: std.process.Init) !void {
 
     const now = Io.Clock.real.now(io);
     const listeners = [_]Listener{
-        .{ .port = 4433, .mode = .http, .options = .{ .allocator = gpa, .auth = &rsa, .now = now } },
+        .{ .port = 4433, .mode = .http, .options = .{ .gpa = gpa, .auth = &rsa, .now = now } },
         .{ .port = 4434, .mode = .http, .options = .{
-            .allocator = gpa,
+            .gpa = gpa,
             .auth = &rsa,
             .client_auth = .{ .root_ca = &ca, .auth_type = .request },
             .now = now,
         } },
-        .{ .port = 4435, .mode = .echo, .options = .{ .allocator = gpa, .auth = &rsa, .now = now } },
-        .{ .port = 4436, .mode = .http, .options = .{ .allocator = gpa, .auth = &ec, .now = now } },
-        .{ .port = 4437, .mode = .http, .options = .{ .allocator = gpa, .auth = &ed25519, .now = now } },
-        .{ .port = 4438, .mode = .http, .options = .{ .allocator = gpa, .auth = &p384, .now = now } },
+        .{ .port = 4435, .mode = .echo, .options = .{ .gpa = gpa, .auth = &rsa, .now = now } },
+        .{ .port = 4436, .mode = .http, .options = .{ .gpa = gpa, .auth = &ec, .now = now } },
+        .{ .port = 4437, .mode = .http, .options = .{ .gpa = gpa, .auth = &ed25519, .now = now } },
+        .{ .port = 4438, .mode = .http, .options = .{ .gpa = gpa, .auth = &p384, .now = now } },
     };
 
     var servers: [listeners.len]Io.net.Server = undefined;
