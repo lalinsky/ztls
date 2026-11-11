@@ -56,7 +56,10 @@ pub const Certificate = struct {
     /// present, must have digitalSignature (RFC 5280 §4.2.1.3), and TLS 1.3
     /// authenticates with signatures only.
     pub fn allowsDigitalSignature(self: *const Certificate) bool {
-        if (c.X509_get_extension_flags(self.x509) & c.EXFLAG_KUSAGE == 0) return true;
+        // Parsing the extensions queues an error for a malformed one.
+        defer c.ERR_clear_error();
+        // All bits without the extension, none if the extensions are
+        // malformed.
         return c.X509_get_key_usage(self.x509) & c.X509v3_KU_DIGITAL_SIGNATURE != 0;
     }
 
@@ -115,6 +118,9 @@ pub const TrustStore = struct {
 
     /// Adds a copy of the certificate.
     pub fn addCertificate(self: *TrustStore, cert: *const Certificate) err.Error!void {
+        // A duplicate is compared with what the store holds, which parses
+        // both certificates' extensions, malformed ones included.
+        defer c.ERR_clear_error();
         if (c.X509_STORE_add_cert(self.store, cert.x509) != 1) return err.fail();
     }
 
@@ -418,6 +424,8 @@ pub const VerifyError = error{
 /// is untrusted: it only helps build a path to a trusted root.
 pub fn verify(store: *const TrustStore, chain: []const Certificate, options: VerifyOptions) VerifyError!void {
     std.debug.assert(chain.len > 0);
+    // On success too: AWS-LC may queue errors it got past.
+    defer c.ERR_clear_error();
     const ctx = c.X509_STORE_CTX_new() orelse return err.fail();
     defer c.X509_STORE_CTX_free(ctx);
 
@@ -808,6 +816,38 @@ test "matching a certificate's names" {
     try testing.expect(!cert.matchesHost("example.test"));
     try testing.expect(!cert.matchesHost("localhost.example.com"));
     try testing.expect(!cert.matchesHost(""));
+}
+
+test "the error queue is left empty" {
+    var store = try trustTestCa();
+    defer store.deinit();
+    var cert = try Certificate.parsePem(testing.allocator, pki.server_ec);
+    defer cert.deinit();
+    try verify(&store, &.{cert}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
+    try testing.expectEqual(0, c.ERR_peek_error());
+
+    var buf: [2048]u8 = undefined;
+    var bad = try malformedKeyUsage(pki.server_ec, &buf);
+    defer bad.deinit();
+    try testing.expect(!bad.allowsDigitalSignature());
+    try testing.expectEqual(0, c.ERR_peek_error());
+
+    // A second CA under the same subject is compared with the first.
+    var bad_ca = try malformedKeyUsage(pki.ca, &buf);
+    defer bad_ca.deinit();
+    try store.addCertificate(&bad_ca);
+    try testing.expectEqual(0, c.ERR_peek_error());
+}
+
+/// The certificate in `text` with its keyUsage BIT STRING claiming nine
+/// unused bits.
+fn malformedKeyUsage(text: []const u8, buf: []u8) !Certificate {
+    var it = pem.Iterator.init(text);
+    const der = try (try it.next()).?.decode(buf);
+    const oid = std.mem.indexOf(u8, der, &.{ 0x06, 0x03, 0x55, 0x1d, 0x0f }).?;
+    const bits = oid + std.mem.indexOf(u8, der[oid..], &.{ 0x03, 0x02 }).?;
+    der[bits + 2] = 9;
+    return Certificate.parseDer(der);
 }
 
 test "malformed certificates" {
