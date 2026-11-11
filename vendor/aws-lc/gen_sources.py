@@ -57,6 +57,10 @@ def configure(src, work, name, triple, system, processor):
         "-DBUILD_TESTING=OFF",
         "-DBUILD_LIBSSL=OFF",
         "-DBUILD_TOOL=OFF",
+        # Seeds the per-thread DRBG from the OS, rather than from CPU jitter
+        # with a read of RDRAND (or RNDR) on every RAND_bytes call, which
+        # is slow where RDRAND is. Jitter is only needed for FIPS.
+        "-DDISABLE_CPU_JITTER_ENTROPY=ON",
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
     ]
     if system == "Darwin":
@@ -85,15 +89,13 @@ def relpath(path, src, build, asm_dir):
 
 
 def collect(src, build, commands, asm_dir):
-    c_files, asm_files, jitter_files = [], [], []
+    c_files, asm_files = [], []
     defines = None
     for cmd in commands:
         rel = relpath(cmd["file"], src, build, asm_dir)
         if os.sep + "test" + os.sep in rel and "trampoline" in rel:
             continue  # test-only assembly
-        if "jitterentropy" in rel:
-            jitter_files.append(rel)
-        elif rel.endswith(".S"):
+        if rel.endswith(".S"):
             asm_files.append(rel)
         else:
             c_files.append(rel)
@@ -102,7 +104,7 @@ def collect(src, build, commands, asm_dir):
                 d = sorted(t[2:] for t in flags if t.startswith("-D") and t[2:] not in SKIP_DEFINES)
                 if defines is None:
                     defines = d
-    return sorted(c_files), sorted(asm_files), sorted(jitter_files), defines
+    return sorted(c_files), sorted(asm_files), defines
 
 
 def zig_list(name, items):
@@ -127,12 +129,12 @@ def main():
             build, commands = configure(src, work, name, triple, system, processor)
             targets.append((name, collect(src, build, commands, asm_dir)))
 
-    # The C files and jitterentropy are the same everywhere; only the
-    # assembly and a few defines depend on the target. Checked rather than
-    # assumed, so an upstream change that breaks it shows up here.
-    _, (c_files, _, jitter_files, _) = targets[0]
-    for name, (c, _, j, _) in targets:
-        if c != c_files or j != jitter_files:
+    # The C files are the same everywhere; only the assembly and a few
+    # defines depend on the target. Checked rather than assumed, so an
+    # upstream change that breaks it shows up here.
+    _, (c_files, _, _) = targets[0]
+    for name, (c, _, _) in targets:
+        if c != c_files:
             raise SystemExit(f"{name}: C sources differ from {targets[0][0]}")
 
     out = [
@@ -146,11 +148,8 @@ def main():
         "pub const c: []const []const u8 = &.{",
     ]
     out += [f'    "{f}",' for f in c_files]
-    out += ["};", "", "/// Compiled without optimization, as upstream requires.",
-            "pub const jitter: []const []const u8 = &.{"]
-    out += [f'    "{f}",' for f in jitter_files]
     out += ["};", ""]
-    for name, (_, a, _, d) in targets:
+    for name, (_, a, d) in targets:
         out.append(f"pub const {name}: Target = .{{")
         out.append(zig_list("@\"asm\"", a))
         out.append(zig_list("defines", d))
