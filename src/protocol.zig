@@ -201,8 +201,10 @@ pub const Alert = enum(u8) {
     };
 
     /// An alert the peer sent, as an error. `close_notify` and
-    /// `user_canceled` are not failures and are not here.
+    /// `user_canceled` are not failures and are not here, except a TLS 1.2
+    /// `user_canceled` sent at the fatal level.
     pub const Error = error{
+        TlsAlertUserCanceled,
         TlsAlertUnexpectedMessage,
         TlsAlertBadRecordMac,
         TlsAlertRecordOverflow,

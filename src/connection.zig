@@ -437,8 +437,13 @@ pub const Connection = struct {
                             c.shared.read_state.store(.closed, .release);
                             return error.EndOfStream;
                         },
-                        // user_canceled is followed by close_notify (§6.1).
-                        else => {
+                        // In TLS 1.2 a fatal user_canceled ends the
+                        // connection (RFC 5246 §7.2).
+                        else => if (proto.tls12_enabled and level == 2 and c.read.keys.?.version == .tls12) {
+                            c.failRead(error.TlsAlertUserCanceled);
+                            return error.TlsAlertUserCanceled;
+                        } else {
+                            // user_canceled is followed by close_notify (§6.1).
                             c.read.warning_alerts += 1;
                             if (c.read.warning_alerts > max_warning_alerts) {
                                 c.failRead(error.TlsUnexpectedMessage);
@@ -1973,6 +1978,38 @@ test "TLS 1.2: warning alerts are ignored, KeyUpdate is not" {
     try w.interface.writeAll("x");
     try testing.expectError(error.WriteFailed, w.interface.flush());
     try testing.expectEqual(error.TlsUnexpectedMessage, w.err.?);
+    try peer.await(io);
+}
+
+test "TLS 1.2: a fatal user_canceled ends the connection" {
+    if (!proto.tls12_enabled) return error.SkipZigTest;
+    const io = testing.io;
+    var st = try SelfTalk.init(io, .{ .tls12 = .aes_128_gcm });
+    defer st.deinit();
+
+    const Peer = struct {
+        fn run(s: *SelfTalk) !void {
+            var end: SelfTalk.End = undefined;
+            try s.server(&end);
+            defer end.deinit();
+            try end.conn.writeRecord(.alert, &.{ 1, @intFromEnum(proto.Alert.user_canceled) });
+            try end.conn.writeRecord(.application_data, "data\n");
+            try end.conn.writeRecord(.alert, &.{ 2, @intFromEnum(proto.Alert.user_canceled) });
+            try end.conn.flushOutput();
+        }
+    };
+    var peer = try io.concurrent(Peer.run, .{&st});
+    defer peer.cancel(io) catch {};
+
+    var end: SelfTalk.End = undefined;
+    try st.client(&end);
+    defer end.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = end.conn.reader(&rbuf);
+    // At the warning level it is a note.
+    try testing.expectEqualStrings("data", (try r.interface.takeDelimiter('\n')).?);
+    try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+    try testing.expectEqual(error.TlsAlertUserCanceled, r.err.?);
     try peer.await(io);
 }
 

@@ -417,6 +417,9 @@ pub const Handshake = struct {
             if (alert.toError()) |err| return err;
             // close_notify during the handshake: the peer gave up.
             if (alert == .close_notify) return error.EndOfStream;
+            // In TLS 1.2 a fatal user_canceled ends the connection (RFC
+            // 5246 §7.2); TLS 1.3 goes by the alert alone.
+            if (h.tolerate_warnings and record.payload[0] == @intFromEnum(proto.Alert.Level.fatal)) return error.TlsAlertUserCanceled;
             // user_canceled, with close_notify to follow, within the cap
             // on warnings.
             h.warning_alerts += 1;
