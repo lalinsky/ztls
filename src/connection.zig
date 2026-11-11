@@ -263,12 +263,7 @@ pub const Connection = struct {
             const body_len = std.mem.readInt(u16, header[3..5], .big);
             if (body_len > cipher.max_ciphertext_len) return error.TlsRecordOverflow;
             const content_type: proto.ContentType = @enumFromInt(header[0]);
-            // Before waiting for a body that may never come, as for an
-            // SSLv2-style hello.
-            switch (content_type) {
-                .change_cipher_spec, .alert, .handshake, .application_data => {},
-                else => return error.TlsUnexpectedMessage,
-            }
+            try c.checkHeader(content_type, body_len);
             const record = c.input.take(cipher.header_len + body_len) catch |err| switch (err) {
                 error.EndOfStream => return error.TlsConnectionTruncated,
                 error.ReadFailed => return error.ReadFailed,
@@ -297,26 +292,40 @@ pub const Connection = struct {
                     };
                     return .{ .content_type = opened.content_type, .payload = out[0..opened.len] };
                 }
-                switch (content_type) {
-                    .change_cipher_spec => if (try c.changeCipherSpec(body)) |r| return r else continue,
-                    else => return error.TlsUnexpectedMessage,
-                }
+                assert(content_type == .change_cipher_spec);
+                if (try c.changeCipherSpec(body)) |r| return r else continue;
             } else {
-                // Before the handshake keys: ClientHello, ServerHello,
-                // HelloRetryRequest, an alert refusing them, and
-                // change_cipher_spec from a middlebox-compatible peer.
                 switch (content_type) {
-                    .handshake, .alert => {
-                        // Zero-length handshake and alert fragments are
-                        // forbidden (§5.1), as is a plaintext record over 2^14.
-                        if (body_len == 0) return error.TlsUnexpectedMessage;
-                        if (body_len > cipher.max_plaintext_len) return error.TlsRecordOverflow;
-                        return .{ .content_type = content_type, .payload = body };
-                    },
+                    .handshake, .alert => return .{ .content_type = content_type, .payload = body },
                     .change_cipher_spec => if (try c.changeCipherSpec(body)) |r| return r else continue,
-                    else => return error.TlsUnexpectedMessage,
+                    else => unreachable,
                 }
             }
+        }
+    }
+
+    /// Refuses what a record's header already rules out, so that no body
+    /// is waited for only to be refused, as for an SSLv2-style hello.
+    fn checkHeader(c: *Connection, content_type: proto.ContentType, body_len: u16) ReadRecordError!void {
+        switch (content_type) {
+            .change_cipher_spec => {
+                if (c.read.ccs == .refuse) return error.TlsUnexpectedMessage;
+                if (body_len != 1) return if (c.read.ccs == .deliver) error.TlsIllegalParameter else error.TlsUnexpectedMessage;
+            },
+            .application_data => if (c.read.keys == null) return error.TlsUnexpectedMessage,
+            .handshake, .alert => if (c.read.keys) |*keys| {
+                // TLS 1.3 sends them inside application_data once there
+                // are keys.
+                if (keys.version == .tls13) return error.TlsUnexpectedMessage;
+            } else {
+                // Before the handshake keys: ClientHello, ServerHello,
+                // HelloRetryRequest and an alert refusing them. Zero-length
+                // handshake and alert fragments are forbidden (§5.1), as is
+                // a plaintext record over 2^14.
+                if (body_len == 0) return error.TlsUnexpectedMessage;
+                if (body_len > cipher.max_plaintext_len) return error.TlsRecordOverflow;
+            },
+            else => return error.TlsUnexpectedMessage,
         }
     }
 
@@ -1383,15 +1392,42 @@ test "past the key update cap a sender ignores requests and keeps its keys" {
     try peer.await(io);
 }
 
-test "a plaintext record over 2^14 bytes is record_overflow" {
-    var input_buffer: [input_buffer_len]u8 = @splat(0);
-    input_buffer[0..cipher.header_len].* = .{ @intFromEnum(proto.ContentType.handshake), 3, 3, 0x40, 0x01 };
-    var output_buffer: [output_buffer_len]u8 = undefined;
-    var input: Io.Reader = .fixed(&input_buffer);
-    var discard: Io.Writer.Discarding = .init(&output_buffer);
-    var conn = Connection.init(&input, &discard.writer, .client);
-    defer conn.deinit();
-    try testing.expectError(error.TlsRecordOverflow, conn.readRecord(null));
+test "a header that rules a record out is refused without its body" {
+    const Case = struct {
+        header: [cipher.header_len]u8,
+        tls13_keys: bool = false,
+        ccs: Connection.CcsMode = .refuse,
+        err: Connection.ReadRecordError,
+    };
+    const handshake = @intFromEnum(proto.ContentType.handshake);
+    const ccs = @intFromEnum(proto.ContentType.change_cipher_spec);
+    const cases = [_]Case{
+        .{ .header = .{ 0x80, 0x2e, 0x01, 0x03, 0x03 }, .err = error.TlsUnexpectedMessage },
+        .{ .header = .{ @intFromEnum(proto.ContentType.application_data), 3, 3, 0, 32 }, .err = error.TlsUnexpectedMessage },
+        .{ .header = .{ handshake, 3, 3, 0, 0 }, .err = error.TlsUnexpectedMessage },
+        .{ .header = .{ handshake, 3, 3, 0x40, 0x01 }, .err = error.TlsRecordOverflow },
+        .{ .header = .{ handshake, 3, 3, 0, 32 }, .tls13_keys = true, .err = error.TlsUnexpectedMessage },
+        .{ .header = .{ ccs, 3, 3, 0, 1 }, .err = error.TlsUnexpectedMessage },
+        .{ .header = .{ ccs, 3, 3, 0, 2 }, .ccs = .drop, .err = error.TlsUnexpectedMessage },
+        .{ .header = .{ ccs, 3, 3, 0, 2 }, .ccs = .deliver, .err = error.TlsIllegalParameter },
+    };
+    for (cases) |case| {
+        var input_buffer: [input_buffer_len]u8 = undefined;
+        input_buffer[0..cipher.header_len].* = case.header;
+        var output_buffer: [output_buffer_len]u8 = undefined;
+        var input: Io.Reader = .fixed(&input_buffer);
+        // Only the header: waiting for the body would end as truncated.
+        input.end = cipher.header_len;
+        var discard: Io.Writer.Discarding = .init(&output_buffer);
+        var conn = Connection.init(&input, &discard.writer, .client);
+        defer conn.deinit();
+        conn.read.ccs = case.ccs;
+        if (case.tls13_keys) {
+            const ks = key_schedule.KeySchedule.init(cipher.suiteHash(.aes_128_gcm_sha256).?);
+            conn.read.keys = try cipher.Keys.init(.aes_128_gcm_sha256, ks.trafficSecret(.server_application, "header"));
+        }
+        try testing.expectError(case.err, conn.readRecord(null));
+    }
 }
 
 test "post-handshake messages split across records and sharing them" {
