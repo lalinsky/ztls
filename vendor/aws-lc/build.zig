@@ -31,7 +31,12 @@ pub fn build(b: *std.Build) void {
             else => null,
         },
         .macos => switch (t.cpu.arch) {
+            .x86_64 => sources.x86_64_macos,
             .aarch64 => sources.aarch64_macos,
+            else => null,
+        },
+        .windows => switch (t.cpu.arch) {
+            .aarch64 => sources.aarch64_windows,
             else => null,
         },
         else => null,
@@ -54,8 +59,8 @@ pub fn build(b: *std.Build) void {
     }
     if (t.os.tag == .windows) {
         // As upstream's CMakeLists.txt; WIN32_LEAN_AND_MEAN also keeps
-        // wincrypt.h's X509_NAME macro out of the X.509 code. Windows has
-        // no assembly here: upstream's is NASM, which Zig cannot assemble.
+        // wincrypt.h's X509_NAME macro out of the X.509 code. x86_64 has no
+        // assembly here: upstream's is NASM, which Zig cannot assemble.
         mod.addCMacro("WIN32_LEAN_AND_MEAN", "1");
         mod.addCMacro("NOMINMAX", "1");
         mod.addCMacro("_CRT_SECURE_NO_WARNINGS", "1");
