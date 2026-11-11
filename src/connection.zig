@@ -19,10 +19,10 @@ const codec = @import("codec.zig");
 const log = std.log.scoped(.ztls);
 
 /// The transport reader's buffer must hold one whole record.
-pub const input_buffer_len = cipher.max_record_len;
+pub const input_buffer_len: usize = cipher.max_record_len;
 /// The transport writer's buffer must hold one whole sealed record and, in
 /// TLS 1.3, the KeyUpdate that may have to go out ahead of it.
-pub const output_buffer_len = @max(
+pub const output_buffer_len: usize = @max(
     cipher.Keys.sealedLenTls13(cipher.max_plaintext_len) + key_update_record_len,
     cipher.max_sealed_record_len,
 );
@@ -1090,7 +1090,7 @@ const SelfTalk = struct {
         io: Io,
         stream: Io.net.Stream,
         input_buffer: [input_buffer_len]u8 = undefined,
-        output_buffer: [2 * @as(usize, output_buffer_len)]u8 = undefined,
+        output_buffer: [2 * output_buffer_len]u8 = undefined,
         input: Io.net.Stream.Reader = undefined,
         output: Io.net.Stream.Writer = undefined,
         conn: Connection = undefined,
@@ -1126,7 +1126,7 @@ test "application data both ways, then close_notify" {
     const io = testing.io;
     // With room for more than one record, the in-place writer's window
     // does not start at the front of the transport buffer.
-    for ([_]usize{ output_buffer_len, 2 * @as(usize, output_buffer_len) }) |output_len| for (every_mode) |mode| {
+    for ([_]usize{ output_buffer_len, 2 * output_buffer_len }) |output_len| for (every_mode) |mode| {
         var st = try SelfTalk.init(io, mode);
         defer st.deinit();
         st.output_len = output_len;
