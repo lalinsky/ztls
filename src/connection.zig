@@ -168,6 +168,8 @@ pub const Connection = struct {
         keys: ?cipher.Keys = null,
         /// KeyUpdates sent so far, capped at `max_key_updates`.
         key_updates: u64 = 0,
+        /// close_notify is sealed in `output`; only a flush is left.
+        closing: bool = false,
     };
 
     /// What the two tasks share. Each state is stored by its own task
@@ -749,7 +751,8 @@ pub const Connection = struct {
     /// For the writing task. While an earlier request is still unanswered
     /// only our keys are updated: §4.7.3 allows one request at a time.
     /// Does nothing past `max_key_updates`, nor in TLS 1.2, which has no
-    /// KeyUpdate.
+    /// KeyUpdate. After a transport failure the update has happened and
+    /// only the flush is left; calling this again makes another one.
     pub fn requestKeyUpdate(c: *Connection) WriteError!void {
         try c.checkWritable();
         const tls13 = switch (c.write.keys.?.version) {
@@ -757,6 +760,7 @@ pub const Connection = struct {
             .tls12 => return,
         };
         if (c.write.key_updates >= max_key_updates) return;
+        try c.reserve(key_update_record_len);
         // Set before the request goes out, so the answer cannot be
         // read before it is.
         const awaited = c.shared.key_update_awaited.swap(true, .monotonic);
@@ -764,7 +768,13 @@ pub const Connection = struct {
         c.shared.key_update_requested.store(false, .monotonic);
         const request: proto.KeyUpdateRequest = if (awaited) .update_not_requested else .update_requested;
         c.sendKeyUpdate(request, tls13) catch |err| return c.failWrite(err);
-        c.output.flush() catch return c.failWrite(error.WriteFailed);
+        c.output.flush() catch return error.WriteFailed;
+    }
+
+    /// Flushes `output` unless it has `len` bytes free, so that a record
+    /// of that length is sealed into it with no transport write between.
+    fn reserve(c: *Connection, len: usize) error{WriteFailed}!void {
+        if (c.output.unusedCapacityLen() < len) c.output.flush() catch return error.WriteFailed;
     }
 
     /// The write side's state, with the read side's failure delivered
@@ -777,6 +787,7 @@ pub const Connection = struct {
             .closed => return error.TlsConnectionFailed,
             .failed => return error.TlsConnectionFailed,
         }
+        if (c.write.closing) return error.TlsConnectionFailed;
         if (c.shared.read_state.load(.acquire) == .failed) {
             const read_error: Failure = @errorCast(@errorFromInt(c.shared.read_error.load(.monotonic)));
             const alert = c.shared.pending_alert.swap(0, .monotonic);
@@ -815,8 +826,7 @@ pub const Connection = struct {
 
     /// Seals the first `len` bytes of `payloadWindow()` where they are, as
     /// one record. A KeyUpdate that is due goes ahead of it, with the
-    /// plaintext moved up to make room. `output` is flushed when it has no
-    /// room for another full record.
+    /// plaintext moved up to make room.
     fn sealWindow(c: *Connection, len: usize) WriteError!void {
         @setRuntimeSafety(true);
         try c.checkWritable();
@@ -837,30 +847,35 @@ pub const Connection = struct {
             at += keys.sealedLen(len);
         }
         c.output.advance(at);
-        if (c.output.unusedCapacityLen() < output_buffer_len) {
-            c.output.flush() catch return c.failWrite(error.WriteFailed);
-        }
     }
 
-    /// Sends what is sealed so far.
+    /// Sends what is sealed so far. A transport failure leaves it
+    /// buffered in `output`, for the next flush.
     fn flushWrite(c: *Connection) WriteError!void {
         try c.checkWritable();
-        c.output.flush() catch return c.failWrite(error.WriteFailed);
+        c.output.flush() catch return error.WriteFailed;
     }
 
     /// Sends close_notify and closes the write direction; later writes
     /// fail. Idempotent. If the read side has an alert pending, that goes
     /// out instead and both directions are failed. For the writing task,
-    /// after its writer was flushed for the last time.
+    /// after its writer was flushed for the last time. When the transport
+    /// fails, close_notify stays sealed in `output` and calling this again
+    /// only flushes.
     pub fn close(c: *Connection) WriteError!void {
         switch (c.shared.write_state.load(.monotonic)) {
             .open => {},
             .closed => return,
             .failed => return error.TlsConnectionFailed,
         }
-        try c.checkWritable();
-        c.writeRecord(.alert, &proto.Alert.close_notify.encode()) catch |err| return c.failWrite(err);
-        c.output.flush() catch return c.failWrite(error.WriteFailed);
+        if (!c.write.closing) {
+            try c.checkWritable();
+            const alert = proto.Alert.close_notify.encode();
+            try c.reserve(c.write.keys.?.sealedLen(alert.len));
+            c.writeRecord(.alert, &alert) catch |err| return c.failWrite(err);
+            c.write.closing = true;
+        }
+        c.output.flush() catch return error.WriteFailed;
         c.shared.write_state.store(.closed, .release);
     }
 
@@ -898,7 +913,9 @@ pub const Connection = struct {
         /// Why the last write failed: a `Failure` of the connection, the
         /// read side's included since its alert goes out this way, or
         /// `WriteFailed` when the transport writer failed and its own
-        /// error says how.
+        /// error says how. That one does not end the connection: what was
+        /// sealed stays in the transport's buffer for the next flush, and
+        /// what the in-place writer held unsealed is dropped.
         err: ?WriteError = null,
 
         fn init(c: *Connection, buffer: []u8) Writer {
@@ -932,19 +949,25 @@ pub const Connection = struct {
 
         fn fail(self: *Writer, err: WriteError) Io.Writer.Error {
             self.err = err;
+            if (self.interface.vtable.drain == drainInPlace) {
+                // A transport write may have moved what is left in
+                // `output`, and the window with it; what was in the window
+                // and not yet sealed is dropped.
+                self.interface.buffer = self.conn.payloadWindow();
+                self.interface.end = 0;
+            }
             return error.WriteFailed;
         }
 
-        /// A window with room in it, flushing `output` when it is full.
+        /// A window for a whole record, flushing `output` when it has no
+        /// room for one.
         fn window(self: *Writer) Io.Writer.Error![]u8 {
             const c = self.conn;
-            var w = c.payloadWindow();
-            if (w.len == 0) {
+            if (c.output.unusedCapacityLen() < output_buffer_len) {
                 c.flushWrite() catch |err| return self.fail(err);
-                w = c.payloadWindow();
-                // Flushed, `output` has room for a whole record.
-                assert(w.len == cipher.max_plaintext_len);
             }
+            const w = c.payloadWindow();
+            assert(w.len == cipher.max_plaintext_len);
             return w;
         }
 
@@ -955,7 +978,11 @@ pub const Connection = struct {
             const buffered = w.buffered();
             var n: usize = 0;
             while (true) {
-                const dest = try self.window();
+                const dest = self.window() catch |err| {
+                    // What was sealed is written, whether or not it went out.
+                    _ = w.consume(n);
+                    return err;
+                };
                 const total = buffered.len - n + Io.Writer.countSplat(data, splat);
                 const len = @min(dest.len, total);
                 if (len == 0) break;
@@ -974,7 +1001,12 @@ pub const Connection = struct {
             const total = Io.Writer.countSplat(data, splat);
             const n = @min(w.buffer.len - w.end, total);
             gather(w.buffer[w.end..][0..n], "", data, splat);
-            try self.seal(w.end + n);
+            const len = w.end + n;
+            if (len > 0) self.conn.sealWindow(len) catch |err| return self.fail(err);
+            w.end = 0;
+            // Sealed, the `n` bytes are written even if the transport fails
+            // now; the next drain finds out again.
+            w.buffer = self.window() catch |err| return if (n > 0) n else err;
             return n;
         }
 
@@ -1015,9 +1047,9 @@ pub const Connection = struct {
 
         /// Seals the first `len` bytes of the window and takes the next one.
         fn seal(self: *Writer, len: usize) Io.Writer.Error!void {
-            self.conn.sealWindow(len) catch |err| return self.fail(err);
-            self.interface.buffer = try self.window();
+            if (len > 0) self.conn.sealWindow(len) catch |err| return self.fail(err);
             self.interface.end = 0;
+            self.interface.buffer = try self.window();
         }
 
         /// Seals what is buffered and sends everything sealed.
@@ -1431,28 +1463,121 @@ test "a header that rules a record out is refused without its body" {
     }
 }
 
-test "a transport that fails a flush in close or requestKeyUpdate fails the write direction" {
-    const Failing = struct {
-        fn drain(_: *Io.Writer, _: []const []const u8, _: usize) Io.Writer.Error!usize {
+/// A transport writer that, while failing, sends a few bytes of what is
+/// buffered before each failure.
+const TestSink = struct {
+    failing: bool = true,
+    sent: [4 * output_buffer_len]u8 = undefined,
+    len: usize = 0,
+    writer: Io.Writer,
+
+    fn init(buffer: []u8) TestSink {
+        return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *TestSink = @fieldParentPtr("writer", w);
+        if (self.failing) {
+            const some = @min(w.end, 7);
+            self.put(w.buffered()[0..some]);
+            _ = w.consume(some);
             return error.WriteFailed;
         }
-    };
-    for ([_]bool{ false, true }) |key_update| {
+        self.put(w.buffered());
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            self.put(d);
+            n += d.len;
+        }
+        for (0..splat) |_| self.put(data[data.len - 1]);
+        n += data[data.len - 1].len * splat;
+        return w.consume(w.end + n);
+    }
+
+    fn put(self: *TestSink, bytes: []const u8) void {
+        @memcpy(self.sent[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    /// Decrypts what was sent, up to close_notify.
+    fn received(self: *TestSink, secret: anytype) ![]u8 {
+        var input: Io.Reader = .fixed(&self.sent);
+        input.end = self.len;
+        var output_buffer: [output_buffer_len]u8 = undefined;
+        var output: Io.Writer = .fixed(&output_buffer);
+        var peer = Connection.init(&input, &output, .server);
+        defer peer.deinit();
+        peer.read.keys = try cipher.Keys.init(.aes_128_gcm_sha256, secret);
+        var rbuf: [64]u8 = undefined;
+        var r = peer.reader(&rbuf);
+        return r.interface.allocRemaining(testing.allocator, .unlimited);
+    }
+};
+
+test "after a transport failure, what was sealed goes out with the next flush" {
+    const ks = key_schedule.KeySchedule.init(cipher.suiteHash(.aes_128_gcm_sha256).?);
+    const secret = ks.trafficSecret(.client_application, "retry");
+    for ([_]bool{ false, true }) |in_place| {
         var input_buffer: [input_buffer_len]u8 = undefined;
         var input: Io.Reader = .fixed(&input_buffer);
         input.end = 0;
         var output_buffer: [output_buffer_len]u8 = undefined;
-        var output: Io.Writer = .{ .vtable = &.{ .drain = Failing.drain }, .buffer = &output_buffer };
-        var conn = Connection.init(&input, &output, .client);
+        var sink: TestSink = .init(&output_buffer);
+        var conn = Connection.init(&input, &sink.writer, .client);
         defer conn.deinit();
-        const ks = key_schedule.KeySchedule.init(cipher.suiteHash(.aes_128_gcm_sha256).?);
-        conn.write.keys = try cipher.Keys.init(.aes_128_gcm_sha256, ks.trafficSecret(.client_application, "flush"));
-        // The transport's WriteFailed, whose own error says why.
-        try testing.expectError(error.WriteFailed, if (key_update) conn.requestKeyUpdate() else conn.close());
-        // Not closed: close_notify never went out.
-        try testing.expectError(error.TlsConnectionFailed, conn.close());
-        try testing.expectError(error.TlsConnectionFailed, conn.requestKeyUpdate());
+        conn.write.keys = try cipher.Keys.init(.aes_128_gcm_sha256, secret);
+
+        var w = if (in_place) conn.writerInPlace() else conn.writer(&.{});
+        try w.interface.writeAll("hello");
+        try testing.expectError(error.WriteFailed, w.interface.flush());
+        try testing.expectEqual(error.WriteFailed, w.err.?);
+        try testing.expectError(error.WriteFailed, conn.requestKeyUpdate());
+        try testing.expectError(error.WriteFailed, conn.close());
+        try testing.expectError(error.WriteFailed, conn.close());
+        // As under cancel protection in a defer, once the transport works.
+        sink.failing = false;
+        try conn.close();
+        try conn.close();
+        w.interface.writeAll("late") catch {};
+        try testing.expectError(error.WriteFailed, w.interface.flush());
+        try testing.expectEqual(error.TlsConnectionFailed, w.err.?);
+
+        const got = try sink.received(secret);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("hello", got);
     }
+}
+
+test "an in-place write that fills a record counts it as written when the flush after it fails" {
+    const ks = key_schedule.KeySchedule.init(cipher.suiteHash(.aes_128_gcm_sha256).?);
+    const secret = ks.trafficSecret(.client_application, "retry");
+    var input_buffer: [input_buffer_len]u8 = undefined;
+    var input: Io.Reader = .fixed(&input_buffer);
+    input.end = 0;
+    var output_buffer: [output_buffer_len]u8 = undefined;
+    var sink: TestSink = .init(&output_buffer);
+    var conn = Connection.init(&input, &sink.writer, .client);
+    defer conn.deinit();
+    conn.write.keys = try cipher.Keys.init(.aes_128_gcm_sha256, secret);
+
+    var data: [cipher.max_plaintext_len + 10]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    var w = conn.writerInPlace();
+    var sent: usize = 0;
+    while (sent < data.len) {
+        sent += w.interface.write(data[sent..]) catch {
+            // The app retries what was not written, once the transport works.
+            try testing.expect(sink.failing);
+            sink.failing = false;
+            continue;
+        };
+    }
+    try w.interface.flush();
+    try conn.close();
+
+    const got = try sink.received(secret);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &data, got);
 }
 
 test "post-handshake messages split across records and sharing them" {
