@@ -194,11 +194,7 @@ tests=(
         -e 'tolerance 32715 methods with sig_alg_cert'"
         # BUG: 213 and 2353 put rsa_pss_rsae_sha256 last; only the first
         # 64 signature_algorithms are read. The bigger ones are limit.
-    "test-tls13-legacy-version.py
-        -e 'version (3, 0)' -e 'version (0, 0)' -e 'version (2, 0)' -e 'version (0, 2)'
-        -e 'version (1, 0)' -e 'version (1, 3)' -e 'version (1, 2)' -e 'version (0, 1)'"
-        # BUG: a ClientHello.legacy_version of 0x0300 or less is accepted;
-        # RFC 8446 D.5 says abort with protocol_version.
+    "test-tls13-legacy-version.py"
     "test-tls13-version-negotiation.py
         sanity
         'tls 1.8 only'
