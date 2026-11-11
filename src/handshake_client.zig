@@ -20,6 +20,7 @@ pub fn run(conn: *Connection, options: config.Client) Error!void {
     var opt = options;
     opt.cipher_suites = offeredSuites(opt.cipher_suites, crypto.aead.hasAesHardware());
     var h = Handshake.init(conn, options.gpa, options.max_handshake_message_len);
+    h.keep_peer_certificates = options.keep_peer_certificates;
     defer h.deinit();
     handshakeInner(&h, opt) catch |err| {
         h.sendAlert(err);

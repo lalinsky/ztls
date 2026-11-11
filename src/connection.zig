@@ -108,9 +108,10 @@ pub const Connection = struct {
     /// The scheme the peer signed its CertificateVerify with.
     peer_signature_scheme: ?proto.SignatureScheme = null,
     /// The peer's certificate chain as it sent it, leaf first, in DER;
-    /// copies owned by `allocator`. Empty when it sent none.
+    /// copies owned by `gpa`. Empty unless the options'
+    /// `keep_peer_certificates` was set and the peer sent one.
     peer_certificates: []const []const u8 = &.{},
-    allocator: ?std.mem.Allocator = null,
+    gpa: ?std.mem.Allocator = null,
     server_name_buf: [255]u8 = undefined,
     server_name_len: u8 = 0,
     /// Treat a transport that ends between records without close_notify as
@@ -202,7 +203,7 @@ pub const Connection = struct {
     pub fn deinit(c: *Connection) void {
         if (c.read.keys) |*keys| keys.deinit();
         if (c.write.keys) |*keys| keys.deinit();
-        if (c.allocator) |gpa| {
+        if (c.gpa) |gpa| {
             for (c.peer_certificates) |der| gpa.free(der);
             gpa.free(c.peer_certificates);
         }

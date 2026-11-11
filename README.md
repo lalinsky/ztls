@@ -127,9 +127,11 @@ write.
 
 The handshake keeps about 16 KiB on the stack of the task that runs it, plus
 AWS-LC's ML-KEM working memory, so give that task at least 64 KiB of stack.
-The peer's handshake messages are reassembled through `gpa` in the options,
-up to `max_handshake_message_len`. It also owns the retained peer certificates
-and must remain valid until `conn.deinit()`.
+`gpa` in the options is the handshake's working memory, for example for the
+peer's messages while they are reassembled, up to `max_handshake_message_len`.
+Nothing allocated through it is kept after the handshake. The exception is `keep_peer_certificates`: the peer's chain is then
+copied into `conn.peer_certificates`, and `gpa` must stay valid until
+`conn.deinit()`.
 
 ### Errors
 
