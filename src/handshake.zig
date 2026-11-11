@@ -408,6 +408,7 @@ pub const Handshake = struct {
                 return record;
             }
             if (record.payload.len != 2) return error.TlsDecodeError;
+            if (record.payload[0] != 1 and record.payload[0] != 2) return error.TlsIllegalParameter;
             const alert = proto.Alert.decode(record.payload[0..2]);
             if (h.tolerate_warnings and record.payload[0] == @intFromEnum(proto.Alert.Level.warning) and alert != .close_notify) {
                 h.warning_alerts += 1;
@@ -1169,6 +1170,37 @@ test "a handshake message that spans a key change is refused" {
     try h.expect(msg, .server_hello);
     const secrets = h.deriveHandshakeSecrets("shared");
     try testing.expectError(error.TlsUnexpectedMessage, h.installReadKeys(secrets.server));
+}
+
+test "handshake alerts by level" {
+    const cases = [_]struct { level: u8, tls12: bool, err: Error }{
+        .{ .level = 0, .tls12 = true, .err = error.TlsIllegalParameter },
+        .{ .level = 3, .tls12 = false, .err = error.TlsIllegalParameter },
+        // A fatal user_canceled ends a TLS 1.2 handshake.
+        .{ .level = 2, .tls12 = true, .err = error.TlsAlertUserCanceled },
+        // A warning is skipped, and the end of input comes next.
+        .{ .level = 1, .tls12 = true, .err = error.EndOfStream },
+    };
+    for (cases) |case| {
+        var record: [16]u8 = undefined;
+        var w = codec.Writer.init(&record);
+        try w.enumValue(proto.ContentType.alert);
+        try w.enumValue(proto.Version.tls_1_2);
+        try w.int(u16, 2);
+        try w.int(u8, case.level);
+        try w.enumValue(proto.Alert.user_canceled);
+
+        var input: Io.Reader = .fixed(w.written());
+        var input_buffer: [@import("connection.zig").input_buffer_len]u8 = undefined;
+        var limited = input.limited(.unlimited, &input_buffer);
+        var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
+        var output: Io.Writer = .fixed(&output_buffer);
+        var conn = Connection.init(&limited.interface, &output, .client);
+        var h = Handshake.init(&conn, testing.allocator, 1024);
+        defer h.deinit();
+        h.tolerate_warnings = case.tls12;
+        try testing.expectError(case.err, h.nextMessage());
+    }
 }
 
 test "an empty certificate and the request context" {
