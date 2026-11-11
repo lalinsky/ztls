@@ -34,7 +34,7 @@ Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system.
 ## Using it
 
 ```sh
-zig fetch --save "git+https://github.com/lalinsky/ztls"
+zig fetch --save "git+https://github.com/lalinsky/ztls#v0.1.0"
 ```
 
 ```zig
