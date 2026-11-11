@@ -154,6 +154,32 @@ A server may hold several certificates, chosen by the
 client's server name and signature algorithms, or by a `select_certificate`
 callback.
 
+## Testing
+
+Besides the unit tests, ztls is tested with:
+
+- Client-server tests over a loopback socket, and interoperability with
+  OpenSSL's `s_server` and `s_client` and with Go's `crypto/tls`, both as
+  client and server.
+- [BoGo](https://boringssl.googlesource.com/boringssl/+/HEAD/ssl/test/),
+  BoringSSL's test runner, against both the client and the server. Tests
+  for what ztls doesn't do, such as session resumption or 0-RTT, are
+  turned off in `tests/bogo/config.json`, each with its reason.
+- [tlsfuzzer](https://github.com/tlsfuzzer/tlsfuzzer)'s TLS 1.3 scripts
+  against the server. The probes left out are listed in
+  `tests/tlsfuzzer/run.sh`, again with reasons.
+- [TLS-Anvil](https://github.com/tls-attacker/TLS-Anvil) against the
+  server.
+- A survey of real servers, `tools/survey/run.sh`, which connects the
+  client to sites from the
+  [Chrome UX Report](https://github.com/zakird/crux-top-lists)'s top
+  million over TLS 1.3 and 1.2, side by side with OpenSSL. It has been run
+  on the top 10,000 and on 5,000 drawn at random from the whole list.
+  About 10% of the servers that answer speak only TLS 1.2, which is why
+  the client does too. With it, ztls reaches about 99% of the servers
+  that answer; the rest need CBC suites or RSA key exchange, which ztls
+  leaves out.
+
 ## Development
 
 ```sh
@@ -162,13 +188,11 @@ zig build test -fwine -Dtarget=x86_64-windows-gnu   # networking tests skip unde
 zig build test -fqemu -Dtarget=aarch64-linux-musl
 ```
 
-The tests include client-server tests over a loopback socket and interoperability
-with `openssl s_server` and `s_client` when OpenSSL 1.1.1 or newer is on the
-PATH. `tests/bogo/run.sh` runs BoringSSL's test runner against the library;
-it needs Go. `tests/tlsfuzzer/run.sh` runs
-[tlsfuzzer](https://github.com/tlsfuzzer/tlsfuzzer)'s TLS 1.3 scripts
-against the server; it needs Python 3. Format with Zig 0.16's `zig fmt`:
-0.17's rewrites builtins that 0.16 does not accept.
+The OpenSSL and Go tests run when OpenSSL 1.1.1 or newer and Go are on the
+PATH.
+`tests/bogo/run.sh` runs BoGo and needs Go; `tests/tlsfuzzer/run.sh` runs
+tlsfuzzer and needs Python 3. Format with Zig 0.16's `zig fmt`: 0.17's
+rewrites builtins that 0.16 does not accept.
 
 `-Dasm=false` builds AWS-LC's portable C code instead of its assembly,
 which is quicker to build the first time and on x86_64 Windows does
