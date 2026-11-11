@@ -19,7 +19,8 @@ pub fn run(conn: *Connection, options: config.Client) Error!void {
     try checkOptions(options);
     var opt = options;
     opt.cipher_suites = offeredSuites(opt.cipher_suites, crypto.aead.hasAesHardware());
-    var h = Handshake.init(conn, options.allocator, options.max_handshake_message_len);
+    var h = Handshake.init(conn, options.gpa, options.max_handshake_message_len);
+    h.keep_peer_certificates = options.keep_peer_certificates;
     defer h.deinit();
     handshakeInner(&h, opt) catch |err| {
         h.sendAlert(err);
@@ -609,7 +610,7 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair, s
 const testing = std.testing;
 
 test "a ServerHello must echo the session id and name TLS 1.3" {
-    const opt: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
+    const opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
     var session_id: [32]u8 = @splat(7);
     var buf: [256]u8 = undefined;
     var w = codec.Writer.init(&buf);
@@ -660,8 +661,8 @@ fn testServerHello(buf: []u8, version: proto.Version, random: *const [32]u8, ses
 test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
     if (!proto.tls12_enabled) return error.SkipZigTest;
     const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
-    const opt: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
-    const only13: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
+    const opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
+    const only13: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
     const ours: [32]u8 = @splat(7);
     const theirs: [32]u8 = @splat(9);
     var random: [32]u8 = @splat(0x5a);
@@ -693,7 +694,7 @@ test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
 
     // The downgrade sentinels, since we offered TLS 1.3 too, but not when
     // we offered TLS 1.2 alone.
-    const tls12_only: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &proto.CipherSuite.tls12 };
+    const tls12_only: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &proto.CipherSuite.tls12 };
     for ([_]*const [8]u8{ downgrade_tls12, downgrade_tls11 }) |sentinel| {
         random[24..].* = sentinel.*;
         try testing.expectError(error.TlsIllegalParameter, parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, null), opt, &ours));
@@ -738,18 +739,18 @@ test "a CertificateRequest needs a non-empty signature_algorithms" {
 
 test "a host longer than 255 bytes is a misconfiguration" {
     const long: [256]u8 = @splat('a');
-    try checkOptions(.{ .allocator = testing.allocator, .host = long[0..255], .insecure_skip_verify = true, .now = undefined });
-    try testing.expectError(error.TlsInternalError, checkOptions(.{ .allocator = testing.allocator, .host = &long, .insecure_skip_verify = true, .now = undefined }));
+    try checkOptions(.{ .gpa = testing.allocator, .host = long[0..255], .insecure_skip_verify = true, .now = undefined });
+    try testing.expectError(error.TlsInternalError, checkOptions(.{ .gpa = testing.allocator, .host = &long, .insecure_skip_verify = true, .now = undefined }));
 }
 
 test "TLS 1.2 suites are refused in a build without TLS 1.2" {
     const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
-    const opt: config.Client = .{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
+    const opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
     if (proto.tls12_enabled) {
         try checkOptions(opt);
     } else {
         try testing.expectError(error.TlsInternalError, checkOptions(opt));
-        try checkOptions(.{ .allocator = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined });
+        try checkOptions(.{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined });
     }
 }
 

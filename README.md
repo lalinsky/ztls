@@ -55,7 +55,7 @@ var input = stream.reader(io, &input_buffer);
 var output = stream.writer(io, &output_buffer);
 
 var conn = try ztls.server(&input.interface, &output.interface, .{
-    .allocator = gpa,
+    .gpa = gpa,
     .auth = &pair,
     .alpn_protocols = &.{ "h2", "http/1.1" },
     .now = std.Io.Clock.real.now(io),
@@ -81,7 +81,7 @@ defer trust.deinit();
 try trust.addSystemBundle(gpa, io); // or addPem(gpa, ca_pem)
 
 var conn = try ztls.client(&input.interface, &output.interface, .{
-    .allocator = gpa,
+    .gpa = gpa,
     .host = "example.com", // SNI and the name the certificate must carry
     .root_ca = &trust,
     .now = std.Io.Clock.real.now(io),
@@ -127,8 +127,11 @@ write.
 
 The handshake keeps about 16 KiB on the stack of the task that runs it, plus
 AWS-LC's ML-KEM working memory, so give that task at least 64 KiB of stack.
-The peer's handshake messages are reassembled through the `allocator` in the
-options, up to `max_handshake_message_len`.
+`gpa` in the options is the handshake's working memory, for example for the
+peer's messages while they are reassembled, up to `max_handshake_message_len`.
+Nothing allocated through it is kept after the handshake. The exception is `keep_peer_certificates`: the peer's chain is then
+copied into `conn.peer_certificates`, and `gpa` must stay valid until
+`conn.deinit()`.
 
 ### Errors
 

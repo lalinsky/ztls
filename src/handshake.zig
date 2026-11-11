@@ -257,7 +257,7 @@ pub const max_small_message_len = 16 * 1024;
 
 pub const Handshake = struct {
     conn: *Connection,
-    allocator: Allocator,
+    gpa: Allocator,
     max_message_len: usize,
     transcript: key_schedule.Transcript,
     schedule: ?key_schedule.KeySchedule = null,
@@ -287,18 +287,20 @@ pub const Handshake = struct {
     /// first ClientHello says TLS 1.0, as every major stack's does and
     /// RFC 9846 §5.1 allows, for servers that choke on anything newer.
     record_version: proto.Version = .tls_1_2,
+    /// Copy the peer's chain into `conn.peer_certificates`.
+    keep_peer_certificates: bool = false,
 
-    pub fn init(conn: *Connection, allocator: Allocator, max_message_len: usize) Handshake {
+    pub fn init(conn: *Connection, gpa: Allocator, max_message_len: usize) Handshake {
         return .{
             .conn = conn,
-            .allocator = allocator,
+            .gpa = gpa,
             .max_message_len = max_message_len,
             .transcript = .init(),
         };
     }
 
     pub fn deinit(h: *Handshake) void {
-        h.inbox.deinit(h.allocator);
+        h.inbox.deinit(h.gpa);
         h.dropRawTranscript();
         if (h.schedule) |*s| s.deinit();
         h.* = undefined;
@@ -360,7 +362,7 @@ pub const Handshake = struct {
         }
         // The inbox holds less than one message, which `nextMessage` caps
         // at `max_message_len`, so it stays bounded.
-        try h.inbox.appendSlice(h.allocator, record.payload);
+        try h.inbox.appendSlice(h.gpa, record.payload);
         h.pending = h.inbox.items;
     }
 
@@ -382,7 +384,7 @@ pub const Handshake = struct {
         }
         // Doubling, so a message in small records is not reallocated for
         // every one of them.
-        if (h.inbox.capacity < want) try h.inbox.ensureTotalCapacityPrecise(h.allocator, @min(total, @max(want, 2 * h.inbox.capacity)));
+        if (h.inbox.capacity < want) try h.inbox.ensureTotalCapacityPrecise(h.gpa, @min(total, @max(want, 2 * h.inbox.capacity)));
         if (h.inbox.items.len == 0) h.inbox.appendSliceAssumeCapacity(h.pending);
         h.pending = h.inbox.items;
     }
@@ -444,7 +446,7 @@ pub const Handshake = struct {
     fn addTranscript(h: *Handshake, bytes: []const u8) Error!void {
         h.transcript.update(bytes);
         if (!proto.tls12_enabled) return;
-        if (h.raw_transcript) |*raw| try raw.appendSlice(h.allocator, bytes);
+        if (h.raw_transcript) |*raw| try raw.appendSlice(h.gpa, bytes);
     }
 
     /// Starts keeping the handshake messages themselves, for a TLS 1.2
@@ -456,7 +458,7 @@ pub const Handshake = struct {
     }
 
     pub fn dropRawTranscript(h: *Handshake) void {
-        if (h.raw_transcript) |*raw| raw.deinit(h.allocator);
+        if (h.raw_transcript) |*raw| raw.deinit(h.gpa);
         h.raw_transcript = null;
     }
 
@@ -731,8 +733,8 @@ pub const Handshake = struct {
     }
 
     /// Parses a Certificate message. Null for an empty chain, which a
-    /// client may send when it has none. The chain's DER is kept on the
-    /// connection for the application.
+    /// client may send when it has none. With `keep_peer_certificates`,
+    /// the chain's DER is kept on the connection for the application.
     pub fn parseCertificate(h: *Handshake, body: []const u8, expected_context: []const u8) Error!?PeerCertificate {
         var d = codec.Decoder.init(body);
         const context = try d.vectorBytes(u8);
@@ -763,8 +765,8 @@ pub const Handshake = struct {
         errdefer for (peer.chain[0..peer.len]) |*cert| cert.deinit();
         var copies: std.ArrayList([]const u8) = .empty;
         errdefer {
-            for (copies.items) |der| h.allocator.free(der);
-            copies.deinit(h.allocator);
+            for (copies.items) |der| h.gpa.free(der);
+            copies.deinit(h.gpa);
         }
         while (!list.eof()) {
             if (peer.len == peer.chain.len) return error.TlsBadCertificate;
@@ -778,16 +780,20 @@ pub const Handshake = struct {
             }
             peer.chain[peer.len] = x509.Certificate.parseDer(der) catch return error.TlsDecodeError;
             peer.len += 1;
-            try copies.ensureUnusedCapacity(h.allocator, 1);
-            copies.appendAssumeCapacity(try h.allocator.dupe(u8, der));
+            if (h.keep_peer_certificates) {
+                try copies.ensureUnusedCapacity(h.gpa, 1);
+                copies.appendAssumeCapacity(try h.gpa.dupe(u8, der));
+            }
         }
         peer.public_key = peer.chain[0].publicKey() catch |err| switch (err) {
             error.UnsupportedKey => return error.TlsUnsupportedCertificate,
             error.CryptoFailed => return error.TlsInternalError,
         };
         errdefer peer.public_key.deinit();
-        h.conn.peer_certificates = try copies.toOwnedSlice(h.allocator);
-        h.conn.allocator = h.allocator;
+        if (h.keep_peer_certificates) {
+            h.conn.peer_certificates = try copies.toOwnedSlice(h.gpa);
+            h.conn.gpa = h.gpa;
+        }
         return peer;
     }
 
@@ -1170,6 +1176,34 @@ test "an empty certificate and the request context" {
     try testing.expectEqualSlices(u8, &.{ 22, 3, 3, 0, 11, 11, 0, 0, 7, 3, 'c', 't', 'x', 0, 0, 0 }, output.buffered());
     try testing.expectEqual(null, try h.parseCertificate(output.buffered()[9..], "ctx"));
     try testing.expectError(error.TlsIllegalParameter, h.parseCertificate(output.buffered()[9..], ""));
+}
+
+test "the peer's chain is kept only when asked for" {
+    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-chain.pem"), @embedFile("testdata/pki/server-chain.key"));
+    defer pair.deinit(testing.allocator);
+    for ([_]bool{ false, true }) |keep| {
+        var counting: testu.CountingAllocator = .init(testing.allocator);
+        var wire: [@import("connection.zig").output_buffer_len]u8 = undefined;
+        var output: Io.Writer = .fixed(&wire);
+        var unused_input: [@import("connection.zig").input_buffer_len]u8 = undefined;
+        var input: Io.Reader = .fixed(&unused_input);
+        var conn = Connection.init(&input, &output, .client);
+        defer conn.deinit();
+        var h = Handshake.init(&conn, counting.allocator(), 64 * 1024);
+        defer h.deinit();
+        h.keep_peer_certificates = keep;
+        h.setSuite(.aes_128_gcm_sha256);
+        try h.writeCertificate("", &pair);
+        var peer = (try h.parseCertificate(output.buffered()[9..], "")).?;
+        defer peer.deinit();
+        if (keep) {
+            try testing.expectEqual(pair.chain.len, conn.peer_certificates.len);
+            for (pair.chain, conn.peer_certificates) |sent, kept| try testing.expectEqualSlices(u8, sent, kept);
+        } else {
+            try testing.expectEqual(0, conn.peer_certificates.len);
+            try testing.expectEqual(0, counting.allocs);
+        }
+    }
 }
 
 /// Plaintext handshake records of at most `fragment` bytes each, carrying

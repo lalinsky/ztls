@@ -287,7 +287,7 @@ test "our client against openssl s_server" {
         defer t.stream.close(io);
         t.setUp();
         var conn = try ztls.client(&t.input.interface, &t.output.interface, .{
-            .allocator = testing.allocator,
+            .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &trust,
             .now = valid_now,
@@ -413,7 +413,7 @@ test "openssl s_client against our server" {
         defer loopback.deinit();
         var outcome: Outcome = .{};
         var options: config.Server = .{
-            .allocator = testing.allocator,
+            .gpa = testing.allocator,
             .auth = case.cert,
             .now = valid_now,
             .alpn_protocols = case.server_alpn,
@@ -536,7 +536,7 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
         defer t.stream.close(io);
         t.setUp();
         var conn = try ztls.client(&t.input.interface, &t.output.interface, .{
-            .allocator = testing.allocator,
+            .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &trust,
             .now = valid_now,
@@ -591,7 +591,7 @@ test "Go's crypto/tls against our server, with X25519MLKEM768" {
         defer loopback.deinit();
         var outcome: Outcome = .{};
         const options: config.Server = .{
-            .allocator = testing.allocator,
+            .gpa = testing.allocator,
             .auth = &ec,
             .now = valid_now,
             .alpn_protocols = &.{"h2"},

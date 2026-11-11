@@ -238,9 +238,11 @@ pub const default_signature_schemes = [_]proto.SignatureScheme{
 };
 
 pub const Client = struct {
-    /// For the handshake's working memory: the peer's messages are
-    /// reassembled in it. Nothing is kept after the handshake.
-    allocator: Allocator,
+    /// For the handshake's working memory, such as the peer's messages
+    /// while they are reassembled. Nothing is kept after the handshake unless
+    /// `keep_peer_certificates` is set; then it must stay valid until
+    /// `Connection.deinit()`.
+    gpa: Allocator,
     /// The server's name, sent as SNI and checked against its
     /// certificate. An IP literal is checked against the certificate's IP
     /// addresses instead and sent as no SNI. At most 255 bytes, and empty
@@ -287,11 +289,17 @@ pub const Client = struct {
     /// from the peer. Other handshake messages are held to 16 KiB, or to
     /// this if it is less.
     max_handshake_message_len: usize = 64 * 1024,
+    /// Keep a copy of the server's certificate chain in
+    /// `Connection.peer_certificates`, allocated through `gpa`.
+    keep_peer_certificates: bool = false,
 };
 
 pub const Server = struct {
-    /// For the handshake's working memory; nothing is kept afterwards.
-    allocator: Allocator,
+    /// For the handshake's working memory, such as the peer's messages
+    /// while they are reassembled. Nothing is kept after the handshake unless
+    /// `keep_peer_certificates` is set; then it must stay valid until
+    /// `Connection.deinit()`.
+    gpa: Allocator,
     /// What the server presents when nothing in `certificates` or from
     /// `select_certificate` fits. Null for a server with no certificate,
     /// which no client accepts in v1.
@@ -334,6 +342,9 @@ pub const Server = struct {
     /// messages, and all of them without `client_auth`, are held to
     /// 16 KiB, or to this if it is less.
     max_handshake_message_len: usize = 64 * 1024,
+    /// Keep a copy of the client's certificate chain, if it sent one, in
+    /// `Connection.peer_certificates`, allocated through `gpa`.
+    keep_peer_certificates: bool = false,
 };
 
 const testing = std.testing;

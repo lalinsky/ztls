@@ -403,11 +403,12 @@ pub fn main(init: std.process.Init) !void {
     var conn = (if (o.server) blk: {
         const auth = if (pair) |*p| p else fail("a server needs -cert-file and -key-file", .{});
         var options: ztls.config.Server = .{
-            .allocator = gpa,
+            .gpa = gpa,
             .auth = auth,
             .alpn_protocols = alpn_protocols,
             .now = now,
             .max_handshake_message_len = 1 << 20,
+            .keep_peer_certificates = true,
         };
         if (suites.items.len > 0) options.cipher_suites = suites.items;
         if (named_groups.items.len > 0) options.named_groups = named_groups.items;
@@ -419,7 +420,8 @@ pub fn main(init: std.process.Init) !void {
         break :blk ztls.server(&tcp_reader.interface, &tcp_writer.interface, options);
     } else blk: {
         var options: ztls.config.Client = .{
-            .allocator = gpa,
+            .gpa = gpa,
+            .keep_peer_certificates = true,
             // No -host-name means no SNI, which an IP literal gives us.
             .host = o.host_name orelse "127.0.0.1",
             .root_ca = &trust,
