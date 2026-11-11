@@ -36,8 +36,11 @@ const ClientHello = struct {
     session_id: []const u8,
     /// The cipher_suites vector, raw.
     suites: []const u8,
-    key_shares: [max_key_shares]KeyShare = undefined,
+    /// Only those for groups we support, and the number of all of them.
+    key_shares: [max_groups]KeyShare = undefined,
     key_shares_len: usize = 0,
+    key_shares_offered: usize = 0,
+    /// Only those we support, and only once each; so for the schemes.
     groups: [max_groups]proto.NamedGroup = undefined,
     groups_len: usize = 0,
     schemes: [max_schemes]proto.SignatureScheme = undefined,
@@ -47,11 +50,14 @@ const ClientHello = struct {
     alpn: ?[]const u8 = null,
     has_cookie: bool = false,
 
-    // Comfortably above what any client sends (one to three shares, a
-    // dozen groups and schemes); extras are dropped.
-    const max_key_shares = 8;
-    const max_groups = 32;
-    const max_schemes = 64;
+    const max_groups = blk: {
+        var n = 0;
+        for (std.enums.values(proto.NamedGroup)) |group| {
+            if (handshake.groupSupported(group)) n += 1;
+        }
+        break :blk n;
+    };
+    const max_schemes = config.default_signature_schemes.len;
 
     const KeyShare = struct {
         group: proto.NamedGroup,
@@ -145,7 +151,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
         // session id and server name the rest is not compared.
         if (!std.mem.eql(u8, hello.session_id, session_id) or hello.has_cookie) return error.TlsIllegalParameter;
         if (!std.mem.eql(u8, hello.server_name orelse "", server_name_buf[0..server_name_len])) return error.TlsIllegalParameter;
-        if (hello.key_shares_len != 1 or hello.shareFor(choices.group) == null) return error.TlsIllegalParameter;
+        if (hello.key_shares_offered != 1 or hello.shareFor(choices.group) == null) return error.TlsIllegalParameter;
         try h.hashMessage(msg);
     }
 
@@ -325,11 +331,11 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                 while (!list.eof()) {
                     const group = try list.decode(proto.NamedGroup);
                     const share = try list.vectorBytes(u16);
+                    hello.key_shares_offered += 1;
+                    if (!handshake.groupSupported(group)) continue;
                     if (hello.shareFor(group) != null) return error.TlsIllegalParameter;
-                    if (hello.key_shares_len < hello.key_shares.len) {
-                        hello.key_shares[hello.key_shares_len] = .{ .group = group, .share = share };
-                        hello.key_shares_len += 1;
-                    }
+                    hello.key_shares[hello.key_shares_len] = .{ .group = group, .share = share };
+                    hello.key_shares_len += 1;
                 }
             },
             .supported_groups => {
@@ -338,10 +344,9 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                 if (list.eof()) return error.TlsDecodeError;
                 while (!list.eof()) {
                     const group = try list.decode(proto.NamedGroup);
-                    if (hello.groups_len < hello.groups.len) {
-                        hello.groups[hello.groups_len] = group;
-                        hello.groups_len += 1;
-                    }
+                    if (!handshake.groupSupported(group) or hello.supportsGroup(group)) continue;
+                    hello.groups[hello.groups_len] = group;
+                    hello.groups_len += 1;
                 }
             },
             .signature_algorithms => {
@@ -350,10 +355,10 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                 var n: usize = 0;
                 while (!list.eof()) {
                     const scheme = try list.decode(proto.SignatureScheme);
-                    if (n < hello.schemes.len) {
-                        hello.schemes[n] = scheme;
-                        n += 1;
-                    }
+                    if (std.mem.indexOfScalar(proto.SignatureScheme, &config.default_signature_schemes, scheme) == null) continue;
+                    if (std.mem.indexOfScalar(proto.SignatureScheme, hello.schemes[0..n], scheme) != null) continue;
+                    hello.schemes[n] = scheme;
+                    n += 1;
                 }
                 hello.schemes_len = n;
             },
@@ -409,6 +414,7 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
     // second ClientHello meets them too.
     if (!has_key_share or !has_groups or hello.schemes_len == null) return error.TlsMissingExtension;
     // A share may only be offered for a group in supported_groups (§4.3.8).
+    // Checked for the shares we could use; like Go, the others are ignored.
     for (hello.key_shares[0..hello.key_shares_len]) |ks| {
         if (!hello.supportsGroup(ks.group)) return error.TlsIllegalParameter;
     }

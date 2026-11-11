@@ -43,6 +43,19 @@ pki=$root/src/testdata/pki
 # What the server takes in a client's CertificateVerify.
 sigalgs='ecdsa_secp256r1_sha256 ecdsa_secp384r1_sha384 ecdsa_secp521r1_sha512 ed25519 rsa_pss_rsae_sha256 rsa_pss_rsae_sha384 rsa_pss_rsae_sha512 rsa_pkcs1_sha256 rsa_pkcs1_sha384 rsa_pkcs1_sha512'
 
+# Every probe of test-tls13-obsolete-curves.py with a key share for an
+# obsolete group that supported_groups does not list.
+inconsistent_share_probes() {
+    local group
+    for group in brainpoolP256r1 brainpoolP384r1 brainpoolP512r1 \
+        secp160k1 secp160r1 secp160r2 secp192k1 secp192r1 secp224k1 secp224r1 secp256k1 \
+        sect163k1 sect163r1 sect163r2 sect193r1 sect193r2 sect233k1 sect233r1 sect239k1 \
+        sect283k1 sect283r1 sect409k1 sect409r1 sect571k1 sect571r1 \
+        'unknown (65281)' 'unknown (65282)'; do
+        printf " -e '%s in key_share and secp256r1 in supported_groups (inconsistent extensions)'" "$group"
+    done
+}
+
 # Every probe of test-tls13-symetric-ciphers.py for a CCM suite.
 ccm_probes() {
     local suite n val pos what
@@ -133,18 +146,18 @@ tests=(
     "test-tls13-obsolete-curves.py
         --relaxed -a handshake_failure
         -e 'secp521r1 in supported_groups and key_share'
-        -e 'x448 in supported_groups and key_share'"
+        -e 'x448 in supported_groups and key_share'
+        $(inconsistent_share_probes)"
         # --relaxed: obsolete groups next to a supported one are ignored,
         # not refused, which RFC 9846 does not ask for. -a: with nothing
         # else, no common group is handshake_failure. unsupported: secp521r1, x448.
+        # A share for a group we do not support is ignored, as Go does,
+        # even if supported_groups does not list it (§4.2.8 allows it).
     "test-tls13-mlkem.py --kems x25519mlkem768"     # the hybrid ztls has
     "test-tls13-no-unknown-groups.py
-        --groups x25519mlkem768,x25519,secp256r1,secp384r1
-        -e 'long list of unknown (between 1 and 259) plus a recognised group'"
+        --groups x25519mlkem768,x25519,secp256r1,secp384r1"
         # --groups: ours, in our order, as the retry picks our favourite.
-        # BUG: only the first 32 supported_groups are read; the known group is 260th.
     "test-tls13-unrecognised-groups.py
-        -e 'known group secp256r1 and unknown groups from EC range, key_share of size 64'
         -e 'known group secp256r1 and unknown groups from EC range, key_share of size 128'
         -e 'known group secp256r1 and unknown groups from EC range, key_share of size 256'
         -e 'known group secp256r1 and unknown groups from FFDHE range, key_share of size 64'
@@ -172,16 +185,8 @@ tests=(
         -e 'only unknown supported_groups from FFDHE range, key_share of size 64'
         -e 'only unknown supported_groups from FFDHE range, key_share of size 128'
         -e 'only unknown supported_groups from FFDHE range, key_share of size 256'"
-        # BUG: the first one is a 15.7 KiB ClientHello listing secp256r1
-        # after 221 unknown groups; only the first 32 are read. The ffdhe2048
-        # ones are unsupported; the rest are limit (over 16 KiB).
+        # The ffdhe2048 ones are unsupported; the rest are limit (over 16 KiB).
     "test-tls13-signature-algorithms.py
-        -e '213 invalid schemes'
-        -e 'duplicated 213 non-rsa schemes'
-        -e 'tolerance 213 methods'
-        -e '2353 invalid schemes'
-        -e 'duplicated 2353 non-rsa schemes'
-        -e 'tolerance 2353 methods'
         -e '8130 invalid schemes'
         -e 'duplicated 8130 non-rsa schemes'
         -e 'tolerance 8130 methods'
@@ -192,8 +197,7 @@ tests=(
         -e 'duplicated 32715 non-rsa schemes'
         -e 'tolerance 32715 methods'
         -e 'tolerance 32715 methods with sig_alg_cert'"
-        # BUG: 213 and 2353 put rsa_pss_rsae_sha256 last; only the first
-        # 64 signature_algorithms are read. The bigger ones are limit.
+        # limit: the bigger lists make the ClientHello over 16 KiB.
     "test-tls13-legacy-version.py"
     "test-tls13-version-negotiation.py
         sanity
