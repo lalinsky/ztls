@@ -391,7 +391,10 @@ pub const Handshake = struct {
             if (alert.toError()) |err| return err;
             // close_notify during the handshake: the peer gave up.
             if (alert == .close_notify) return error.EndOfStream;
-            // user_canceled, with close_notify to follow
+            // user_canceled, with close_notify to follow, within the cap
+            // on warnings.
+            h.warning_alerts += 1;
+            if (h.warning_alerts > connection.max_warning_alerts) return error.TlsUnexpectedMessage;
         }
     }
 
@@ -766,11 +769,14 @@ pub const Handshake = struct {
     pub fn verifyChain(h: *Handshake, peer: *const PeerCertificate, store: *const x509.TrustStore, purpose: x509.Purpose, host: ?[]const u8, now: i64) Error!void {
         _ = h;
         var options: x509.VerifyOptions = .{ .now = now, .purpose = purpose };
+        // `options.ip` points into this.
+        var address: std.Io.net.IpAddress = undefined;
         if (host) |name| {
-            if (std.Io.net.IpAddress.parse(name, 0)) |address| {
+            if (std.Io.net.IpAddress.parse(name, 0)) |parsed| {
+                address = parsed;
                 options.ip = switch (address) {
-                    .ip4 => |a| &a.bytes,
-                    .ip6 => |a| &a.bytes,
+                    .ip4 => |*a| &a.bytes,
+                    .ip6 => |*a| &a.bytes,
                 };
             } else |_| {
                 options.host = name;
