@@ -142,7 +142,11 @@ an alert the peer sent (`TlsAlert...`), a record layer error
 certificate under std's names (`CertificateIssuerNotFound`,
 `CertificateExpired`, ...), or `ReadFailed` or `WriteFailed` when the
 transport itself failed. A transport `ReadFailed`, such as a cancelled read,
-does not end the connection and the read may be retried.
+does not end the connection and the read may be retried. Nor does a
+transport `WriteFailed`: what was already encrypted stays in the transport
+writer's buffer and goes out with the next flush. A task whose write was
+cancelled can still close cleanly by calling `close`, from a `defer` under
+cancel protection.
 
 A transport that ends between records without close_notify is a clean end
 of stream; the `strict_close_notify` option makes it an error.
