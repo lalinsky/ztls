@@ -15,7 +15,10 @@ const Connection = @import("connection.zig").Connection;
 
 pub fn run(conn: *Connection, options: config.Server) Error!void {
     try checkOptions(options);
-    var h = Handshake.init(conn, options.allocator, options.max_handshake_message_len);
+    // No Certificate is taken from a client that is not asked for one, so
+    // nothing needs more than the small limit.
+    const max_message_len = if (options.client_auth == null) @min(options.max_handshake_message_len, handshake.max_small_message_len) else options.max_handshake_message_len;
+    var h = Handshake.init(conn, options.allocator, max_message_len);
     defer h.deinit();
     handshakeInner(&h, options) catch |err| {
         h.sendAlert(err);
