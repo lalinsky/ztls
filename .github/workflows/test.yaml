@@ -12,6 +12,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         zig: [0.16.0, 0.17.0]
+        # Zig 0.16 keeps failing to fetch the nasm package there; see #45.
+        exclude:
+          - os: windows-latest
+            zig: 0.16.0
         # The other targets AWS-LC's assembly is built for.
         include:
           - os: macos-15-intel
