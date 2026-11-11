@@ -282,9 +282,10 @@ fn selectAlpn(ours: []const []const u8, offered: ?[]const u8) Error!?[]const u8 
 fn parseClientHello(body: []const u8) Error!ClientHello {
     @setRuntimeSafety(true);
     var d = codec.Decoder.init(body);
+    // SSL 3.0 and older are refused (Appendix D.5). Otherwise
     // legacy_version plays no part once supported_versions is there
     // (§4.3.1), and that extension is required below.
-    _ = try d.decode(proto.Version);
+    if (@intFromEnum(try d.decode(proto.Version)) <= 0x0300) return error.TlsProtocolVersion;
     _ = try d.array(32); // random
     const session_id = try d.vectorBytes(u8);
     if (session_id.len > 32) return error.TlsDecodeError;
@@ -564,9 +565,10 @@ test "server names: a trailing dot is dropped, IP literals and NULs are refused"
     try testing.expectError(error.TlsIllegalParameter, parseClientHello(try testClientHello(&buf, .{ .name = "." })));
 }
 
-test "legacy_version is ignored, early_data is refused, signature_algorithms is required" {
+test "legacy_version above SSL 3.0 is ignored, early_data is refused, signature_algorithms is required" {
     var buf: [512]u8 = undefined;
     try testing.expectError(error.TlsMissingExtension, parseClientHello(try testClientHello(&buf, .{ .schemes = false })));
+    try testing.expectError(error.TlsProtocolVersion, parseClientHello(try testClientHello(&buf, .{ .version = @enumFromInt(0x0300) })));
     _ = try parseClientHello(try testClientHello(&buf, .{ .version = @enumFromInt(0x0301) }));
     _ = try parseClientHello(try testClientHello(&buf, .{ .version = .tls_1_3 }));
     try testing.expectError(error.TlsUnsupportedExtension, parseClientHello(try testClientHello(&buf, .{ .early_data = true })));
