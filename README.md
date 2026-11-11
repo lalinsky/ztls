@@ -116,9 +116,8 @@ so a larger buffer gains nothing.
 `writerInPlace` saves that copy: it has no buffer of its own, and its buffer
 is the plaintext of the next record, inside the transport buffer. That puts
 rules on the application. The writer's buffer moves with every record and
-must not be replaced. `requestKeyUpdate` and `close` write to the transport
-buffer too, so the writer is flushed before either, and once either has
-failed it is not written to again. And the transport writer
+must not be replaced. `close` writes to the transport buffer too, so the
+writer is flushed before it. And the transport writer
 must leave its unused capacity alone while it drains, as std's and zio's
 socket writers do.
 

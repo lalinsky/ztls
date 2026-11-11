@@ -747,13 +747,8 @@ pub const Connection = struct {
         try c.advanceWriteKeys(tls13);
     }
 
-    /// Asks the peer to update its keys, updating ours first (§4.7.3).
-    /// For the writing task. While an earlier request is still unanswered
-    /// only our keys are updated: §4.7.3 allows one request at a time.
-    /// Does nothing past `max_key_updates`, nor in TLS 1.2, which has no
-    /// KeyUpdate. After a transport failure the update has happened and
-    /// only the flush is left; calling this again makes another one.
-    pub fn requestKeyUpdate(c: *Connection) WriteError!void {
+    /// See `Writer.requestKeyUpdate`.
+    fn requestKeyUpdate(c: *Connection) WriteError!void {
         try c.checkWritable();
         const tls13 = switch (c.write.keys.?.version) {
             .tls13 => |*tls13| tls13,
@@ -1052,6 +1047,21 @@ pub const Connection = struct {
             self.interface.buffer = try self.window();
         }
 
+        /// Sends what is buffered, then asks the peer to update its keys,
+        /// updating ours first (§4.7.3). While an earlier request is still
+        /// unanswered only our keys are updated: §4.7.3 allows one request
+        /// at a time. Does nothing past `max_key_updates`, nor in TLS 1.2,
+        /// which has no KeyUpdate. After a transport failure the update
+        /// may have happened with only the flush left, and the writer may
+        /// still be used; calling this again makes another update.
+        pub fn requestKeyUpdate(self: *Writer) WriteError!void {
+            self.interface.flush() catch return self.err.?;
+            self.conn.requestKeyUpdate() catch |err| {
+                self.fail(err) catch {};
+                return err;
+            };
+        }
+
         /// Seals what is buffered and sends everything sealed.
         fn flush(w: *Io.Writer) Io.Writer.Error!void {
             const self: *Writer = @fieldParentPtr("interface", w);
@@ -1077,8 +1087,8 @@ pub const Connection = struct {
 
     /// A cleartext writer whose buffer is the next record's plaintext in
     /// `output`, so what is written is copied once, to where it is sealed.
-    /// While it is in use nothing else may write to `output`, and
-    /// `requestKeyUpdate` and `close`, which do, come after a flush of it.
+    /// While it is in use nothing else may write to `output`, and `close`,
+    /// which does, comes after a flush of it.
     /// The transport writer must leave `output`'s unused capacity alone
     /// while draining (std's and zio's socket writers do). Its buffer moves
     /// with each record and must not be replaced. One per connection, for
@@ -1349,7 +1359,7 @@ test "key updates from both sides" {
                 try w.interface.writeByte('\n');
                 try w.interface.flush();
                 count += 1;
-                if (count == 2) try end.conn.requestKeyUpdate();
+                if (count == 2) try w.requestKeyUpdate();
             }
             try end.conn.close();
         }
@@ -1366,7 +1376,7 @@ test "key updates from both sides" {
     const write_gen0 = end.conn.write.keys.?.version.tls13.secret;
     const read_gen0 = end.conn.read.keys.?.version.tls13.secret;
     for (0..6) |i| {
-        if (i == 4) try end.conn.requestKeyUpdate();
+        if (i == 4) try w.requestKeyUpdate();
         try w.interface.print("message {d}\n", .{i});
         try w.interface.flush();
         var expected: [32]u8 = undefined;
@@ -1397,7 +1407,7 @@ test "past the key update cap a sender ignores requests and keeps its keys" {
             var rbuf: [256]u8 = undefined;
             var r = end.conn.reader(&rbuf);
             var w = end.conn.writer(&.{});
-            try end.conn.requestKeyUpdate();
+            try w.requestKeyUpdate();
             try w.interface.writeAll("ping\n");
             try w.interface.flush();
             try testing.expectEqualStrings("pong", (try r.interface.takeDelimiter('\n')).?);
@@ -1416,7 +1426,7 @@ test "past the key update cap a sender ignores requests and keeps its keys" {
     var r = end.conn.reader(&rbuf);
     var w = end.conn.writerInPlace();
     try testing.expectEqualStrings("ping", (try r.interface.takeDelimiter('\n')).?);
-    try end.conn.requestKeyUpdate(); // nothing happens at the cap
+    try w.requestKeyUpdate(); // nothing happens at the cap
     try w.interface.writeAll("pong\n");
     try w.interface.flush();
     try testing.expectEqualSlices(u8, before.slice(), end.conn.write.keys.?.version.tls13.secret.slice());
@@ -1527,11 +1537,22 @@ test "after a transport failure, what was sealed goes out with the next flush" {
         defer conn.deinit();
         conn.write.keys = try cipher.Keys.init(.aes_128_gcm_sha256, secret);
 
-        var w = if (in_place) conn.writerInPlace() else conn.writer(&.{});
+        var wbuf: [64]u8 = undefined;
+        var w = if (in_place) conn.writerInPlace() else conn.writer(&wbuf);
         try w.interface.writeAll("hello");
         try testing.expectError(error.WriteFailed, w.interface.flush());
         try testing.expectEqual(error.WriteFailed, w.err.?);
-        try testing.expectError(error.WriteFailed, conn.requestKeyUpdate());
+        sink.failing = false;
+        try w.interface.flush();
+        // The KeyUpdate is sealed and only its flush fails; the writer
+        // goes on after it, its next record under the new keys.
+        sink.failing = true;
+        try testing.expectError(error.WriteFailed, w.requestKeyUpdate());
+        try w.interface.writeAll(" world");
+        try testing.expectError(error.WriteFailed, w.interface.flush());
+        sink.failing = false;
+        try w.interface.flush();
+        sink.failing = true;
         try testing.expectError(error.WriteFailed, conn.close());
         try testing.expectError(error.WriteFailed, conn.close());
         // As under cancel protection in a defer, once the transport works.
@@ -1544,7 +1565,7 @@ test "after a transport failure, what was sealed goes out with the next flush" {
 
         const got = try sink.received(secret);
         defer testing.allocator.free(got);
-        try testing.expectEqualStrings("hello", got);
+        try testing.expectEqualStrings("hello world", got);
     }
 }
 
@@ -1931,7 +1952,7 @@ test "TLS 1.2: warning alerts are ignored, KeyUpdate is not" {
     }
     // No KeyUpdate in TLS 1.2: asking for one does nothing.
     const seq = end.conn.write.keys.?.seq;
-    try end.conn.requestKeyUpdate();
+    try w.requestKeyUpdate();
     try testing.expectEqual(seq, end.conn.write.keys.?.seq);
     try w.interface.writeAll("ack\n");
     try w.interface.flush();

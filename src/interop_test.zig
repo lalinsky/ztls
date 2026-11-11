@@ -310,7 +310,7 @@ test "our client against openssl s_server" {
             // We update and ask; OpenSSL must answer with its own update
             // before its next record, which the reply below is.
             const read_secret = conn.read.keys.?.version.tls13.secret;
-            try conn.requestKeyUpdate();
+            try w.requestKeyUpdate();
             try w.interface.writeAll("after update\n");
             try w.interface.flush();
             try testing.expectEqualStrings("etadpu retfa", (try r.interface.takeDelimiter('\n')).?);

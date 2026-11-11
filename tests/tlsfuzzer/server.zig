@@ -143,9 +143,9 @@ fn http(conn: *ztls.Connection) !void {
         }
         r.interface.toss(chunk.len);
     }
-    if (key_update) try conn.requestKeyUpdate();
     var write_buffer: [1024]u8 = undefined;
     var w = conn.writer(&write_buffer);
+    if (key_update) try w.requestKeyUpdate();
     w.interface.writeAll(http_ok) catch return w.err.?;
     w.interface.flush() catch return w.err.?;
 }
