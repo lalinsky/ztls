@@ -46,10 +46,11 @@ openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -set_serial 4 -days $d
 openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out selfsigned.key
 openssl req -x509 -new -key selfsigned.key -days $days -subj "/CN=localhost" -addext "subjectAltName=$san" -out selfsigned.pem
 
-# SHA-1 signatures: on a leaf, which is refused, and on a root, the same
-# CA as above, whose own signature nobody checks.
+# SHA-1 signatures: on a leaf and on the intermediate, which are refused,
+# and on a root, the same CA as above, whose own signature nobody checks.
 openssl req -new -key server-ec.key -subj "/CN=localhost" -out server-sha1.csr
 openssl x509 -req -in server-sha1.csr -CA ca.pem -CAkey ca.key -set_serial 5 -days $days -sha1 -extfile server.ext -out server-sha1.pem
+openssl x509 -req -in intermediate.csr -CA ca.pem -CAkey ca.key -set_serial 7 -days $days -sha1 -extfile intermediate.ext -out intermediate-sha1.pem
 openssl req -x509 -new -key ca.key -sha1 -days $days -subj "/CN=ztls test CA" \
   -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -out ca-sha1.pem
 

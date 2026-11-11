@@ -537,6 +537,7 @@ const pki = struct {
     const selfsigned = @embedFile("../testdata/pki/selfsigned.pem");
     const server_sha1 = @embedFile("../testdata/pki/server-sha1.pem");
     const ca_sha1 = @embedFile("../testdata/pki/ca-sha1.pem");
+    const intermediate_sha1 = @embedFile("../testdata/pki/intermediate-sha1.pem");
     const ca_rsa = @embedFile("../testdata/pki/ca-rsa.pem");
     const server_pss_sha1 = @embedFile("../testdata/pki/server-pss-sha1.pem");
     const server_pss_sha256 = @embedFile("../testdata/pki/server-pss-sha256.pem");
@@ -724,7 +725,21 @@ test "SHA-1 signatures are refused, except on the trust anchor" {
     defer store.deinit();
     var sha1_leaf = try Certificate.parsePem(testing.allocator, pki.server_sha1);
     defer sha1_leaf.deinit();
+    try testing.expectEqual(c.NID_sha1, signatureDigest(sha1_leaf.x509));
     try testing.expectError(error.BadCertificate, verify(&store, &.{sha1_leaf}, .{ .now = valid_now, .purpose = .server, .host = "localhost" }));
+
+    // The intermediate of "a chain through an intermediate", re-signed with
+    // SHA-1: refused below the root, fine as the trust anchor itself.
+    var chain_leaf = try Certificate.parsePem(testing.allocator, pki.server_chain);
+    defer chain_leaf.deinit();
+    var sha1_intermediate = try Certificate.parsePem(testing.allocator, pki.intermediate_sha1);
+    defer sha1_intermediate.deinit();
+    try testing.expectEqual(c.NID_sha1, signatureDigest(sha1_intermediate.x509));
+    try testing.expectError(error.BadCertificate, verify(&store, &.{ chain_leaf, sha1_intermediate }, .{ .now = valid_now, .purpose = .server, .host = "localhost" }));
+    var sha1_anchor = try TrustStore.init();
+    defer sha1_anchor.deinit();
+    try sha1_anchor.addPem(testing.allocator, pki.intermediate_sha1);
+    try verify(&sha1_anchor, &.{chain_leaf}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
 
     // The same CA, self-signed with SHA-1.
     var sha1_root = try TrustStore.init();
@@ -740,9 +755,11 @@ test "SHA-1 signatures are refused, except on the trust anchor" {
     try rsa_ca.addPem(testing.allocator, pki.ca_rsa);
     var pss_sha1 = try Certificate.parsePem(testing.allocator, pki.server_pss_sha1);
     defer pss_sha1.deinit();
+    try testing.expectEqual(c.NID_sha1, signatureDigest(pss_sha1.x509));
     try testing.expectError(error.BadCertificate, verify(&rsa_ca, &.{pss_sha1}, .{ .now = valid_now, .purpose = .server, .host = "localhost" }));
     var pss_sha256 = try Certificate.parsePem(testing.allocator, pki.server_pss_sha256);
     defer pss_sha256.deinit();
+    try testing.expectEqual(c.NID_sha256, signatureDigest(pss_sha256.x509));
     try verify(&rsa_ca, &.{pss_sha256}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
 }
 
