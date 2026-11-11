@@ -75,6 +75,8 @@ fn checkOptions(opt: config.Client) error{TlsInternalError}!void {
     if (opt.root_ca == null and !opt.insecure_skip_verify) return error.TlsInternalError;
     if (opt.host.len == 0 and !opt.insecure_skip_verify) return error.TlsInternalError;
     if (opt.host.len > 255) return error.TlsInternalError;
+    // AWS-LC would match any subdomain of a name that starts with a dot.
+    if (opt.host.len > 0 and opt.host[0] == '.') return error.TlsInternalError;
     if (opt.named_groups.len == 0) return error.TlsInternalError;
     if (opt.verify_schemes.len == 0) return error.TlsInternalError;
     if (!handshake.schemesSupported(opt.verify_schemes) or !handshake.schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
@@ -739,10 +741,11 @@ test "a CertificateRequest needs a non-empty signature_algorithms" {
     }
 }
 
-test "a host longer than 255 bytes is a misconfiguration" {
+test "a host longer than 255 bytes, or starting with a dot, is a misconfiguration" {
     const long: [256]u8 = @splat('a');
     try checkOptions(.{ .gpa = testing.allocator, .host = long[0..255], .insecure_skip_verify = true, .now = undefined });
     try testing.expectError(error.TlsInternalError, checkOptions(.{ .gpa = testing.allocator, .host = &long, .insecure_skip_verify = true, .now = undefined }));
+    try testing.expectError(error.TlsInternalError, checkOptions(.{ .gpa = testing.allocator, .host = ".example.com", .insecure_skip_verify = true, .now = undefined }));
 }
 
 test "a key share for a group listed twice is a misconfiguration" {

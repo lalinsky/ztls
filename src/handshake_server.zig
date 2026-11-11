@@ -372,10 +372,13 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                     if (hello.server_name != null) return error.TlsIllegalParameter;
                     // A host name only (RFC 6066 §3): no IP literal, no NUL,
                     // not empty, at most 255 bytes; one trailing dot is
-                    // tolerated, as some clients send a FQDN.
+                    // tolerated, as some clients send a FQDN. A leading
+                    // dot would have AWS-LC match the name against any
+                    // subdomain when picking a certificate.
                     if (name.len > 0 and name[name.len - 1] == '.') name = name[0 .. name.len - 1];
                     if (name.len == 0 or name.len > 255) return error.TlsIllegalParameter;
                     if (std.mem.indexOfScalar(u8, name, 0) != null) return error.TlsIllegalParameter;
+                    if (name[0] == '.' or name[name.len - 1] == '.') return error.TlsIllegalParameter;
                     // RFC 6066 forbids an IP literal here, but clients send
                     // one when told to connect to an address (wrk does), and
                     // every major stack lets it pass. It names no
@@ -562,7 +565,7 @@ fn testClientHello(buf: []u8, o: struct { version: proto.Version = .tls_1_2, nam
     return w.written();
 }
 
-test "server names: a trailing dot is dropped, IP literals and NULs are refused" {
+test "server names: a trailing dot is dropped, IP literals, NULs and other dots at the ends are refused" {
     var buf: [512]u8 = undefined;
     try testing.expectEqualStrings("example.com", (try parseClientHello(try testClientHello(&buf, .{ .name = "example.com." }))).server_name.?);
     try testing.expectEqualStrings("example.com", (try parseClientHello(try testClientHello(&buf, .{ .name = "example.com" }))).server_name.?);
@@ -570,6 +573,8 @@ test "server names: a trailing dot is dropped, IP literals and NULs are refused"
     try testing.expectEqual(null, (try parseClientHello(try testClientHello(&buf, .{ .name = "::1" }))).server_name);
     try testing.expectError(error.TlsIllegalParameter, parseClientHello(try testClientHello(&buf, .{ .name = "exa\x00mple.com" })));
     try testing.expectError(error.TlsIllegalParameter, parseClientHello(try testClientHello(&buf, .{ .name = "." })));
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try testClientHello(&buf, .{ .name = ".example.com" })));
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(try testClientHello(&buf, .{ .name = "example.com.." })));
 }
 
 test "legacy_version above SSL 3.0 is ignored, early_data is refused, signature_algorithms is required" {
