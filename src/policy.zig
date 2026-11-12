@@ -1,0 +1,222 @@
+//! The rules both implementations apply, so that they agree: which
+//! options are refused, which signature schemes a key may sign with, and
+//! how a peer's certificate chain is verified.
+
+const std = @import("std");
+const proto = @import("protocol.zig");
+const config = @import("config.zig");
+const crypto = @import("crypto.zig");
+const api = @import("api.zig");
+const sig = crypto.sig;
+const x509 = crypto.x509;
+
+/// The protocol version a rule is applied for.
+pub const Version = enum { tls13, tls12 };
+
+/// Refuses client options that make no sense, before anything is sent.
+pub fn checkClient(opt: config.Client) error{TlsInternalError}!void {
+    if (opt.root_ca == null and !opt.insecure_skip_verify) return error.TlsInternalError;
+    if (opt.host.len == 0 and !opt.insecure_skip_verify) return error.TlsInternalError;
+    if (opt.host.len > 255) return error.TlsInternalError;
+    // AWS-LC would match any subdomain of a name that starts with a dot.
+    if (opt.host.len > 0 and opt.host[0] == '.') return error.TlsInternalError;
+    if (opt.named_groups.len == 0) return error.TlsInternalError;
+    if (opt.verify_schemes.len == 0) return error.TlsInternalError;
+    if (!schemesSupported(opt.verify_schemes) or !schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
+    if (!proto.tls12_enabled) {
+        for (opt.cipher_suites) |suite| if (suite.version() == .tls_1_2) return error.TlsInternalError;
+    }
+    if (!offers(opt, .tls_1_3) and !offers(opt, .tls_1_2)) return error.TlsInternalError;
+    if (offers(opt, .tls_1_3)) {
+        if (opt.key_shares.len == 0) return error.TlsInternalError;
+        for (opt.key_shares, 0..) |group, i| {
+            if (std.mem.indexOfScalar(proto.NamedGroup, opt.named_groups, group) == null) return error.TlsInternalError;
+            // One share per group (§4.2.8).
+            if (std.mem.indexOfScalar(proto.NamedGroup, opt.key_shares[0..i], group) != null) return error.TlsInternalError;
+        }
+    }
+}
+
+/// Whether `cipher_suites` offers `version`: it does with any of its
+/// suites. Never TLS 1.2 in a build without it, which is known at compile
+/// time, so the code behind it is left out.
+pub fn offers(opt: config.Client, comptime version: proto.Version) bool {
+    if (version == .tls_1_2 and !proto.tls12_enabled) return false;
+    for (opt.cipher_suites) |suite| {
+        if (suite.version() == version) return true;
+    }
+    return false;
+}
+
+/// Whether `host` is an IP literal, which gets no SNI (RFC 6066 §3).
+fn isIpLiteral(host: []const u8) bool {
+    _ = std.Io.net.IpAddress.parse(host, 0) catch return false;
+    return true;
+}
+
+/// Whether `host` goes out as SNI: a non-empty name that is not an
+/// IP literal.
+pub fn sendsSni(host: []const u8) bool {
+    return host.len != 0 and !isIpLiteral(host);
+}
+
+/// Refuses server options that make no sense, before anything is read.
+pub fn checkServer(opt: config.Server) error{TlsInternalError}!void {
+    if (opt.verify_schemes.len == 0 or opt.signing_schemes.len == 0) return error.TlsInternalError;
+    if (!schemesSupported(opt.verify_schemes) or !schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
+}
+
+/// The algorithm a scheme stands for when it signs a handshake in
+/// `version`: a CertificateVerify, or in TLS 1.2 a ServerKeyExchange too.
+/// Null for one that may not: the rsa_pkcs1 ones in TLS 1.3 (§4.2.3), and
+/// any scheme we do not implement.
+pub fn schemeAlgorithm(scheme: proto.SignatureScheme, version: Version) ?sig.Algorithm {
+    return switch (scheme) {
+        .ecdsa_secp256r1_sha256 => .ecdsa_sha256,
+        .ecdsa_secp384r1_sha384 => .ecdsa_sha384,
+        .ecdsa_secp521r1_sha512 => .ecdsa_sha512,
+        .ed25519 => .ed25519,
+        .rsa_pss_rsae_sha256 => .rsa_pss_sha256,
+        .rsa_pss_rsae_sha384 => .rsa_pss_sha384,
+        .rsa_pss_rsae_sha512 => .rsa_pss_sha512,
+        .rsa_pkcs1_sha256 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha256 else null,
+        .rsa_pkcs1_sha384 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha384 else null,
+        .rsa_pkcs1_sha512 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha512 else null,
+        else => null,
+    };
+}
+
+/// Whether a key of `key_type` may sign a handshake under `scheme` in
+/// `version`: the algorithm must suit the kind of key, and in TLS 1.3 an
+/// ECDSA scheme names the key's curve too (§4.2.3). TLS 1.2 schemes name
+/// only the hash (RFC 5246 §7.4.1.4.1); there the leaf's curve is checked
+/// against supported_groups instead.
+pub fn schemeSuits(scheme: proto.SignatureScheme, key_type: sig.KeyType, version: Version) bool {
+    const algorithm = schemeAlgorithm(scheme, version) orelse return false;
+    if (!algorithm.suits(key_type)) return false;
+    if (version == .tls12) return true;
+    const curve: sig.Curve = switch (scheme) {
+        .ecdsa_secp256r1_sha256 => .p256,
+        .ecdsa_secp384r1_sha384 => .p384,
+        .ecdsa_secp521r1_sha512 => .p521,
+        else => return true,
+    };
+    return switch (key_type) {
+        .ecdsa => |key_curve| key_curve == curve,
+        else => false,
+    };
+}
+
+/// Whether `schemes` are all ones we implement, none twice.
+pub fn schemesSupported(schemes: []const proto.SignatureScheme) bool {
+    for (schemes, 0..) |scheme, i| {
+        if (std.mem.indexOfScalar(proto.SignatureScheme, &config.default_signature_schemes, scheme) == null) return false;
+        if (std.mem.indexOfScalar(proto.SignatureScheme, schemes[0..i], scheme) != null) return false;
+    }
+    return true;
+}
+
+/// The scheme to sign with in `version`: the first of `ours` that the
+/// peer offered and that suits the key.
+pub fn selectScheme(ours: []const proto.SignatureScheme, key_type: sig.KeyType, offered: []const proto.SignatureScheme, version: Version) ?proto.SignatureScheme {
+    for (ours) |scheme| {
+        if (!schemeSuits(scheme, key_type, version)) continue;
+        if (std.mem.indexOfScalar(proto.SignatureScheme, offered, scheme) != null) return scheme;
+    }
+    return null;
+}
+
+/// Verifies a peer's chain, leaf first, against `store`, for its role.
+/// `host` is the name or IP literal a server must be certified for.
+pub fn verifyChain(chain: []const x509.Certificate, store: *const x509.TrustStore, purpose: x509.Purpose, host: ?[]const u8, now: i64) api.Error!void {
+    var options: x509.VerifyOptions = .{ .now = now, .purpose = purpose };
+    // `options.ip` points into this.
+    var address: std.Io.net.IpAddress = undefined;
+    if (host) |name| {
+        if (std.Io.net.IpAddress.parse(name, 0)) |parsed| {
+            address = parsed;
+            options.ip = switch (address) {
+                .ip4 => |*a| &a.bytes,
+                .ip6 => |*a| &a.bytes,
+            };
+        } else |_| {
+            options.host = name;
+        }
+    }
+    x509.verify(store, chain, options) catch |err| return switch (err) {
+        error.CertificateExpired => error.CertificateExpired,
+        error.CertificateNotYetValid => error.CertificateNotYetValid,
+        error.UnknownCa => error.CertificateIssuerNotFound,
+        error.HostnameMismatch => error.CertificateHostMismatch,
+        error.BadCertificate => error.TlsBadCertificate,
+        error.CryptoFailed => error.TlsInternalError,
+    };
+}
+
+const testing = std.testing;
+
+test "scheme selection" {
+    try testing.expectEqual(proto.SignatureScheme.ecdsa_secp256r1_sha256, selectScheme(&config.default_signature_schemes, .{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp256r1_sha256 }, .tls13).?);
+    try testing.expectEqual(null, selectScheme(&config.default_signature_schemes, .{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp384r1_sha384 }, .tls13));
+    try testing.expectEqual(proto.SignatureScheme.rsa_pss_rsae_sha384, selectScheme(&config.default_signature_schemes, .{ .rsa = 2048 }, &.{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha384 }, .tls13).?);
+    try testing.expectEqual(null, selectScheme(&config.default_signature_schemes, .{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls13)); // pkcs1 may not sign a CertificateVerify
+    try testing.expectEqual(proto.SignatureScheme.ed25519, selectScheme(&config.default_signature_schemes, .ed25519, &.{.ed25519}, .tls13).?);
+    // Our order, not the peer's; and only what we list.
+    try testing.expectEqual(proto.SignatureScheme.rsa_pss_rsae_sha512, selectScheme(&.{ .rsa_pss_rsae_sha512, .rsa_pss_rsae_sha256 }, .{ .rsa = 2048 }, &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha512 }, .tls13).?);
+    try testing.expectEqual(null, selectScheme(&.{.rsa_pss_rsae_sha384}, .{ .rsa = 2048 }, &.{.rsa_pss_rsae_sha256}, .tls13));
+}
+
+test "TLS 1.3 binds each ECDSA scheme to a curve" {
+    try testing.expect(schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p256 }, .tls13));
+    try testing.expect(!schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p384 }, .tls13));
+    try testing.expect(schemeSuits(.ecdsa_secp384r1_sha384, .{ .ecdsa = .p384 }, .tls13));
+    try testing.expect(!schemeSuits(.ecdsa_secp384r1_sha384, .{ .ecdsa = .p521 }, .tls13));
+    try testing.expect(schemeSuits(.ecdsa_secp521r1_sha512, .{ .ecdsa = .p521 }, .tls13));
+    try testing.expect(!schemeSuits(.ecdsa_secp521r1_sha512, .{ .rsa = 2048 }, .tls13));
+    try testing.expect(schemeSuits(.rsa_pss_rsae_sha256, .{ .rsa = 4096 }, .tls13));
+    try testing.expect(!schemeSuits(.rsa_pkcs1_sha256, .{ .rsa = 2048 }, .tls13));
+    try testing.expect(!schemeSuits(.ed25519, .{ .ecdsa = .p256 }, .tls13));
+}
+
+test "TLS 1.2 schemes name the hash only, and take PKCS#1 v1.5" {
+    if (!proto.tls12_enabled) return error.SkipZigTest;
+    try testing.expect(schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p384 }, .tls12));
+    try testing.expect(schemeSuits(.ecdsa_secp521r1_sha512, .{ .ecdsa = .p256 }, .tls12));
+    try testing.expect(!schemeSuits(.ecdsa_secp256r1_sha256, .{ .rsa = 2048 }, .tls12));
+    try testing.expect(schemeSuits(.rsa_pkcs1_sha256, .{ .rsa = 2048 }, .tls12));
+    try testing.expect(schemeSuits(.rsa_pss_rsae_sha512, .{ .rsa = 2048 }, .tls12));
+    try testing.expect(!schemeSuits(.rsa_pkcs1_sha384, .{ .ecdsa = .p384 }, .tls12));
+    try testing.expect(schemeSuits(.ed25519, .ed25519, .tls12));
+    try testing.expect(!schemeSuits(.rsa_pkcs1_sha1, .{ .rsa = 2048 }, .tls12));
+    try testing.expectEqual(proto.SignatureScheme.rsa_pkcs1_sha256, selectScheme(&config.default_signature_schemes, .{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls12).?);
+}
+
+test "a host longer than 255 bytes, or starting with a dot, is a misconfiguration" {
+    const long: [256]u8 = @splat('a');
+    try checkClient(.{ .gpa = testing.allocator, .host = long[0..255], .insecure_skip_verify = true, .now = undefined });
+    try testing.expectError(error.TlsInternalError, checkClient(.{ .gpa = testing.allocator, .host = &long, .insecure_skip_verify = true, .now = undefined }));
+    try testing.expectError(error.TlsInternalError, checkClient(.{ .gpa = testing.allocator, .host = ".example.com", .insecure_skip_verify = true, .now = undefined }));
+}
+
+test "a key share for a group listed twice is a misconfiguration" {
+    const opt: config.Client = .{
+        .gpa = testing.allocator,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = undefined,
+        .named_groups = &.{.secp256r1},
+        .key_shares = &.{ .secp256r1, .secp256r1 },
+    };
+    try testing.expectError(error.TlsInternalError, checkClient(opt));
+}
+
+test "TLS 1.2 suites are refused in a build without TLS 1.2" {
+    const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
+    const opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
+    if (proto.tls12_enabled) {
+        try checkClient(opt);
+    } else {
+        try testing.expectError(error.TlsInternalError, checkClient(opt));
+        try checkClient(.{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined });
+    }
+}

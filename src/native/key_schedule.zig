@@ -3,10 +3,10 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const crypto = @import("crypto.zig");
+const crypto = @import("../crypto.zig");
 const hash = crypto.hash;
 const hkdf = crypto.hkdf;
-const proto = @import("protocol.zig");
+const proto = @import("../protocol.zig");
 
 /// A secret the size of the hash: a traffic secret, a finished key, a
 /// stage of the schedule.
@@ -174,7 +174,7 @@ pub fn verifyData(algorithm: hash.Algorithm, traffic_secret: *const Secret, tran
 }
 
 const testing = std.testing;
-const data13 = @import("testdata/tls13.zig");
+const data13 = @import("../testdata/tls13.zig");
 
 test "the example connection's key schedule" {
     var transcript = Transcript.init();

@@ -5,11 +5,11 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const crypto = @import("crypto.zig");
+const crypto = @import("../crypto.zig");
 const aead = crypto.aead;
 const hash = crypto.hash;
 const hkdf = crypto.hkdf;
-const proto = @import("protocol.zig");
+const proto = @import("../protocol.zig");
 const key_schedule = @import("key_schedule.zig");
 const Secret = key_schedule.Secret;
 
@@ -43,7 +43,7 @@ pub fn tls12FixedIvLen(algorithm: aead.Algorithm) usize {
     };
 }
 
-pub const Version = enum { tls13, tls12 };
+pub const Version = @import("../policy.zig").Version;
 
 /// What TLS 1.3 keys keep for KeyUpdate: the traffic secret they came
 /// from and its hash.
@@ -373,7 +373,7 @@ pub const Keys = struct {
 };
 
 const testing = std.testing;
-const data13 = @import("testdata/tls13.zig");
+const data13 = @import("../testdata/tls13.zig");
 
 fn exampleKeys(secret_key: []const u8, iv: *const [12]u8) !Keys {
     // The example gives the key and IV rather than the traffic secret, so

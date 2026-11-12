@@ -5,11 +5,12 @@
 //! renegotiation.
 
 const std = @import("std");
-const proto = @import("protocol.zig");
+const proto = @import("../protocol.zig");
 const codec = @import("codec.zig");
 const cipher = @import("cipher.zig");
-const config = @import("config.zig");
-const crypto = @import("crypto.zig");
+const config = @import("../config.zig");
+const policy = @import("../policy.zig");
+const crypto = @import("../crypto.zig");
 const sig = crypto.sig;
 const handshake = @import("handshake.zig");
 const Handshake = handshake.Handshake;
@@ -210,8 +211,8 @@ fn parseServerKeyExchange(body: []const u8, opt: config.Client, public_key: *con
         else => return error.TlsIllegalParameter,
     }
     if (std.mem.indexOfScalar(proto.SignatureScheme, opt.verify_schemes, scheme) == null) return error.TlsIllegalParameter;
-    if (!handshake.schemeSuits(scheme, public_key.key_type, .tls12)) return error.TlsIllegalParameter;
-    const algorithm = handshake.schemeAlgorithm(scheme, .tls12).?;
+    if (!policy.schemeSuits(scheme, public_key.key_type, .tls12)) return error.TlsIllegalParameter;
+    const algorithm = policy.schemeAlgorithm(scheme, .tls12).?;
 
     var content_buf: [32 + 32 + 4 + 255]u8 = undefined;
     var w = codec.Writer.init(&content_buf);
@@ -271,8 +272,8 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair, s
     if (std.mem.indexOfScalar(u8, types, wanted_type) == null) return .{ .scheme = null };
     // A scheme naming our key's curve first, as TLS 1.3 would have it,
     // then any the key can sign under in TLS 1.2.
-    const scheme = handshake.selectScheme(signing, key_type, offered[0..n], .tls13) orelse
-        handshake.selectScheme(signing, key_type, offered[0..n], .tls12);
+    const scheme = policy.selectScheme(signing, key_type, offered[0..n], .tls13) orelse
+        policy.selectScheme(signing, key_type, offered[0..n], .tls12);
     return .{ .scheme = scheme };
 }
 
@@ -379,7 +380,7 @@ fn testServerKeyExchange(buf: []u8, pair: *const config.CertKeyPair, randoms: Ra
     @memcpy(content[64..][0..params_len], w.written());
     var sig_buf: [512]u8 = undefined;
     // A scheme the key cannot sign under gets an ECDSA signature anyway.
-    const algorithm: crypto.sig.Algorithm = if (handshake.schemeSuits(scheme, pair.key.key_type, .tls12)) handshake.schemeAlgorithm(scheme, .tls12).? else .ecdsa_sha256;
+    const algorithm: crypto.sig.Algorithm = if (policy.schemeSuits(scheme, pair.key.key_type, .tls12)) policy.schemeAlgorithm(scheme, .tls12).? else .ecdsa_sha256;
     const signature = try pair.key.sign(algorithm, content[0 .. 64 + params_len], &sig_buf);
     try w.enumValue(scheme);
     try w.vector(u16, signature);
@@ -388,7 +389,7 @@ fn testServerKeyExchange(buf: []u8, pair: *const config.CertKeyPair, randoms: Ra
 
 test "a ServerKeyExchange is signed over both randoms, with a group and scheme we offered" {
     if (!proto.tls12_enabled) return error.SkipZigTest;
-    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
+    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("../testdata/pki/server-ec.pem"), @embedFile("../testdata/pki/server-ec.key"));
     defer pair.deinit(testing.allocator);
     var public = try pair.leaf.publicKey();
     defer public.deinit();
@@ -423,9 +424,9 @@ test "a ServerKeyExchange is signed over both randoms, with a group and scheme w
 
 test "a CertificateRequest picks our key's scheme, curve first, if its types allow the key" {
     if (!proto.tls12_enabled) return error.SkipZigTest;
-    var ec = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/client.pem"), @embedFile("testdata/pki/client.key"));
+    var ec = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("../testdata/pki/client.pem"), @embedFile("../testdata/pki/client.key"));
     defer ec.deinit(testing.allocator);
-    var rsa = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
+    var rsa = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("../testdata/pki/server-rsa.pem"), @embedFile("../testdata/pki/server-rsa.key"));
     defer rsa.deinit(testing.allocator);
     const Scheme = proto.SignatureScheme;
 

@@ -11,21 +11,25 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
-const proto = @import("protocol.zig");
+const proto = @import("../protocol.zig");
+const api = @import("../api.zig");
 const cipher = @import("cipher.zig");
-const crypto = @import("crypto.zig");
+const crypto = @import("../crypto.zig");
 const codec = @import("codec.zig");
 
 const log = std.log.scoped(.ztls);
 
-/// The transport reader's buffer must hold one whole record.
-pub const input_buffer_len: usize = cipher.max_record_len;
-/// The transport writer's buffer must hold one whole sealed record and, in
-/// TLS 1.3, the KeyUpdate that may have to go out ahead of it.
-pub const output_buffer_len: usize = @max(
-    cipher.Keys.sealedLenTls13(cipher.max_plaintext_len) + key_update_record_len,
-    cipher.max_sealed_record_len,
-);
+pub const input_buffer_len = api.input_buffer_len;
+pub const output_buffer_len = api.output_buffer_len;
+
+// The public sizes, worked out from the record layer's own.
+comptime {
+    assert(input_buffer_len == cipher.max_record_len);
+    assert(output_buffer_len == @max(
+        cipher.Keys.sealedLenTls13(cipher.max_plaintext_len) + key_update_record_len,
+        cipher.max_sealed_record_len,
+    ));
+}
 
 const key_update_msg_len = 4 + 1;
 const key_update_record_len = cipher.Keys.sealedLenTls13(key_update_msg_len);
@@ -52,37 +56,13 @@ const max_ticket_len = 4 + 4 + (1 + 255) + (2 + 0xffff) + (2 + 0xffff);
 /// peers send others (unrecognized_name, say), each ignored.
 pub const max_warning_alerts = 4;
 
-/// What a read or write can fail with: the transport's own failure,
-/// something the record layer found, or an alert the peer sent.
-pub const Failure = error{
-    TlsConnectionTruncated,
-    TlsConnectionFailed,
-    TlsRecordOverflow,
-    TlsBadRecordMac,
-    TlsDecodeError,
-    TlsUnexpectedMessage,
-    TlsIllegalParameter,
-    TlsInternalError,
-    TlsNoRenegotiation,
-    TlsProtocolVersion,
-} || proto.Alert.Error;
-/// What a read can fail with: the transport reader's failure, which does
-/// not end the connection, or a `Failure`, which does.
-pub const ReadError = error{ReadFailed} || Failure;
-/// What a write can fail with: the transport writer's failure or a
-/// `Failure`, the read side's included, since that is where its alert
-/// goes out.
-pub const WriteError = error{WriteFailed} || Failure;
+pub const Failure = api.Failure;
+pub const ReadError = api.ReadError;
+pub const WriteError = api.WriteError;
 pub const Error = ReadError || WriteError;
-
-pub const State = enum(u8) {
-    open,
-    /// close_notify went this way, or the transport ended cleanly.
-    closed,
-    /// A failure ended this direction; `Shared.read_error` or the writer's
-    /// `err` says which.
-    failed,
-};
+/// A direction's state; a failed one's error is in `Shared.read_error` or
+/// the writer's `err`.
+pub const State = api.State;
 
 pub const Connection = struct {
     /// Ciphertext from the transport. Its buffer holds a whole record.
@@ -1123,7 +1103,7 @@ pub const Connection = struct {
 };
 
 const testing = std.testing;
-const testu = @import("testu.zig");
+const testu = @import("../testu.zig");
 const key_schedule = @import("key_schedule.zig");
 
 /// The record protection a self-talk runs under.

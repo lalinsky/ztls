@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const impl = b.option(Impl, "impl", "native: the protocol in Zig on AWS-LC's libcrypto; libssl: AWS-LC's libssl, which is C++ (default: native)") orelse .native;
     const options = b.addOptions();
     options.addOption(bool, "tls12", tls12);
+    options.addOption(bool, "libssl", impl == .libssl);
 
     // libcrypto is built optimized even in Debug builds: a debug AWS-LC makes
     // handshakes and tests needlessly slow and adds nothing to debugging ztls.

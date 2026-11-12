@@ -3,10 +3,11 @@
 //! then the client's Finished (and certificate, if we asked).
 
 const std = @import("std");
-const proto = @import("protocol.zig");
+const proto = @import("../protocol.zig");
 const codec = @import("codec.zig");
-const config = @import("config.zig");
-const crypto = @import("crypto.zig");
+const config = @import("../config.zig");
+const policy = @import("../policy.zig");
+const crypto = @import("../crypto.zig");
 const handshake = @import("handshake.zig");
 const Handshake = handshake.Handshake;
 const KeyShares = handshake.KeyShares;
@@ -14,7 +15,7 @@ const Error = handshake.Error;
 const Connection = @import("connection.zig").Connection;
 
 pub fn run(conn: *Connection, options: config.Server) Error!void {
-    try checkOptions(options);
+    try policy.checkServer(options);
     // No Certificate is taken from a client that is not asked for one, so
     // nothing needs more than the small limit.
     const max_message_len = if (options.client_auth == null) @min(options.max_handshake_message_len, handshake.max_small_message_len) else options.max_handshake_message_len;
@@ -25,11 +26,6 @@ pub fn run(conn: *Connection, options: config.Server) Error!void {
         h.sendAlert(err);
         return err;
     };
-}
-
-fn checkOptions(opt: config.Server) error{TlsInternalError}!void {
-    if (opt.verify_schemes.len == 0 or opt.signing_schemes.len == 0) return error.TlsInternalError;
-    if (!handshake.schemesSupported(opt.verify_schemes) or !handshake.schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
 }
 
 /// What a ClientHello offers. Slices point into the message.
@@ -224,7 +220,7 @@ fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const
         if (select.callback(select.context, info)) |pair| return pair;
     }
     for (opt.certificates) |pair| {
-        if (handshake.selectScheme(opt.signing_schemes, pair.key.key_type, schemes, .tls13) == null) continue;
+        if (policy.selectScheme(opt.signing_schemes, pair.key.key_type, schemes, .tls13) == null) continue;
         if (hello.server_name) |name| {
             if (!pair.leaf.matchesHost(name)) continue;
         }
@@ -234,7 +230,7 @@ fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const
 }
 
 fn acceptsKey(hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
-    return handshake.selectScheme(hello.signing_schemes, key_type, hello.schemes, .tls13) != null;
+    return policy.selectScheme(hello.signing_schemes, key_type, hello.schemes, .tls13) != null;
 }
 
 /// Picks the suite, group, signature scheme and ALPN protocol, or says
@@ -255,7 +251,7 @@ fn choose(hello: *const ClientHello, opt: config.Server, auth: *const config.Cer
     } else return error.TlsHandshakeFailure;
 
     const schemes = hello.schemes[0..hello.schemes_len.?];
-    const scheme = handshake.selectScheme(opt.signing_schemes, auth.key.key_type, schemes, .tls13) orelse return error.TlsHandshakeFailure;
+    const scheme = policy.selectScheme(opt.signing_schemes, auth.key.key_type, schemes, .tls13) orelse return error.TlsHandshakeFailure;
 
     return .{ .suite = suite, .group = group, .scheme = scheme, .alpn = try selectAlpn(opt.alpn_protocols, hello.alpn) };
 }
@@ -509,7 +505,7 @@ fn buildCertificateRequest(w: *codec.Writer, verify_schemes: []const proto.Signa
 }
 
 const testing = std.testing;
-const data13 = @import("testdata/tls13.zig");
+const data13 = @import("../testdata/tls13.zig");
 
 test "parsing the example ClientHello" {
     const hello = try parseClientHello(data13.client_hello[9..]);

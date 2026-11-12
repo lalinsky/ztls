@@ -174,8 +174,8 @@ fn isExhaustive(info: anytype) bool {
 }
 
 const testing = std.testing;
-const proto = @import("protocol.zig");
-const data13 = @import("testdata/tls13.zig");
+const proto = @import("../protocol.zig");
+const data13 = @import("../testdata/tls13.zig");
 
 test "decoding the example ServerHello" {
     const record = data13.server_hello;
