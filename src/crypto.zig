@@ -7,7 +7,7 @@
 //! anything that could move the fiber.
 //!
 //! The declarations come from AWS-LC's headers through the build's
-//! translate-c step (`src/c.h`), so struct layouts are the library's own.
+//! translate-c step (`src/c_libcrypto.h`), so struct layouts are the library's own.
 
 const std = @import("std");
 

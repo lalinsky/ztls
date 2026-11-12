@@ -207,8 +207,7 @@ which is quicker to build the first time and on x86_64 Windows does
 without NASM.
 
 `vendor/aws-lc` builds libcrypto; `gen_sources.py` there regenerates the
-file lists from upstream's CMake build after an upgrade. AWS-LC's headers
-reach Zig through translate-c from `src/c.h`.
+file lists from upstream's CMake build after an upgrade.
 
 ## License
 

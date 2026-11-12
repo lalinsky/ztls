@@ -52,25 +52,8 @@ pub fn build(b: *std.Build) void {
         "OPENSSL_NO_ASM",
         "DISABLE_CPU_JITTER_ENTROPY",
     };
-    for (defines) |d| {
-        if (std.mem.indexOfScalar(u8, d, '=')) |eq| {
-            mod.addCMacro(d[0..eq], d[eq + 1 ..]);
-        } else {
-            mod.addCMacro(d, "1");
-        }
-    }
-    if (t.os.tag == .windows) {
-        // As upstream's CMakeLists.txt; WIN32_LEAN_AND_MEAN also keeps
-        // wincrypt.h's X509_NAME macro out of the X.509 code.
-        mod.addCMacro("WIN32_LEAN_AND_MEAN", "1");
-        mod.addCMacro("NOMINMAX", "1");
-        mod.addCMacro("_CRT_SECURE_NO_WARNINGS", "1");
-        mod.linkSystemLibrary("ws2_32", .{});
-    }
-    // Upstream sets this on the FIPS module and the assembly only; it just
-    // keeps s2n-bignum's symbols hidden, which is right for everything.
-    mod.addCMacro("S2N_BN_HIDE_SYMBOLS", "1");
-
+    addDefines(mod, defines);
+    if (t.os.tag == .windows) mod.linkSystemLibrary("ws2_32", .{});
     mod.addIncludePath(upstream.path("include"));
     mod.addIncludePath(upstream.path("third_party/s2n-bignum/s2n-bignum-imported/include"));
 
@@ -121,4 +104,58 @@ pub fn build(b: *std.Build) void {
     });
     lib.installHeadersDirectory(upstream.path("include"), "", .{});
     b.installArtifact(lib);
+
+    // libssl, for ztls's libssl mode: C++, built as upstream does without
+    // exceptions or RTTI, against Zig's own libc++. The files that do I/O
+    // by themselves are left out (gen_sources.py, SKIP_SSL). A dependent
+    // that never asks for the artifact never builds it.
+    const ssl_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+        .sanitize_c = .off,
+    });
+    addDefines(ssl_mod, defines);
+    ssl_mod.addIncludePath(upstream.path("include"));
+    ssl_mod.addCSourceFiles(.{
+        .root = upstream.path(""),
+        .files = sources.ssl,
+        .flags = &.{
+            "-std=gnu++11",
+            "-fno-common",
+            "-fvisibility=hidden",
+            "-fno-exceptions",
+            "-fno-rtti",
+            "-Wno-unused-parameter",
+        },
+    });
+    ssl_mod.linkLibrary(lib);
+
+    const ssl_lib = b.addLibrary(.{
+        .name = "ssl",
+        .linkage = .static,
+        .root_module = ssl_mod,
+    });
+    b.installArtifact(ssl_lib);
+}
+
+fn addDefines(mod: *std.Build.Module, defines: []const []const u8) void {
+    for (defines) |d| {
+        if (std.mem.indexOfScalar(u8, d, '=')) |eq| {
+            mod.addCMacro(d[0..eq], d[eq + 1 ..]);
+        } else {
+            mod.addCMacro(d, "1");
+        }
+    }
+    if (mod.resolved_target.?.result.os.tag == .windows) {
+        // As upstream's CMakeLists.txt; WIN32_LEAN_AND_MEAN also keeps
+        // wincrypt.h's X509_NAME macro out of the X.509 code.
+        mod.addCMacro("WIN32_LEAN_AND_MEAN", "1");
+        mod.addCMacro("NOMINMAX", "1");
+        mod.addCMacro("_CRT_SECURE_NO_WARNINGS", "1");
+    }
+    // Upstream sets this on the FIPS module and the assembly only; it just
+    // keeps s2n-bignum's symbols hidden, which is right for everything.
+    mod.addCMacro("S2N_BN_HIDE_SYMBOLS", "1");
 }

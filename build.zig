@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const tls12 = b.option(bool, "tls12", "Build the TLS 1.2 client in (default: true)") orelse true;
     const use_asm = b.option(bool, "asm", "Build AWS-LC's assembly; false builds its portable C code, without NASM on x86_64 Windows (default: true)") orelse true;
+    const impl = b.option(Impl, "impl", "native: the protocol in Zig on AWS-LC's libcrypto; libssl: AWS-LC's libssl, which is C++ (default: native)") orelse .native;
     const options = b.addOptions();
     options.addOption(bool, "tls12", tls12);
 
@@ -19,25 +20,35 @@ pub fn build(b: *std.Build) void {
 
     // AWS-LC's API as a Zig module, so struct layouts come from the headers.
     const translate_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/c.h"),
+        .root_source_file = switch (impl) {
+            .native => b.path("src/c_libcrypto.h"),
+            .libssl => b.path("src/c_libssl.h"),
+        },
         .target = target,
         .optimize = optimize,
     });
     translate_c.addIncludePath(libcrypto.getEmittedIncludeTree());
 
     const mod = b.addModule("ztls", .{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = switch (impl) {
+            .native => b.path("src/root_native.zig"),
+            .libssl => b.path("src/root_libssl.zig"),
+        },
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{.{ .name = "c", .module = translate_c.createModule() }},
     });
+    if (impl == .libssl) mod.linkLibrary(aws_lc.artifact("ssl"));
     mod.linkLibrary(libcrypto);
     mod.addOptions("build_options", options);
 
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
+
+    // The test tools below drive the native implementation only, for now.
+    if (impl == .libssl) return;
 
     // The shim BoringSSL's test runner drives; see tests/bogo/run.sh.
     const shim = b.addExecutable(.{
@@ -75,3 +86,5 @@ pub fn build(b: *std.Build) void {
     });
     b.step("survey-probe", "Build the survey probe").dependOn(&b.addInstallArtifact(probe, .{}).step);
 }
+
+const Impl = enum { native, libssl };
