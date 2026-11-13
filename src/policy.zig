@@ -179,6 +179,12 @@ pub fn selectScheme(ours: []const proto.SignatureScheme, key_type: sig.KeyType, 
     return null;
 }
 
+/// The time a peer's certificate is checked at, in seconds: `now` if
+/// set, otherwise the real clock.
+pub fn verifyTime(io: std.Io, now: ?std.Io.Timestamp) i64 {
+    return (now orelse std.Io.Clock.real.now(io)).toSeconds();
+}
+
 /// Verifies a peer's chain, leaf first, against `store`, for its role.
 /// `host` is the name or IP literal a server must be certified for.
 pub fn verifyChain(chain: []const x509.Certificate, store: *const x509.TrustStore, purpose: x509.Purpose, host: ?[]const u8, now: i64) api.Error!void {
@@ -245,9 +251,9 @@ test "TLS 1.2 schemes name the hash only, and take PKCS#1 v1.5" {
 
 test "a host longer than 255 bytes, or starting with a dot, is a misconfiguration" {
     const long: [256]u8 = @splat('a');
-    try checkClient(.{ .io = testing.io, .gpa = testing.allocator, .host = long[0..255], .insecure_skip_verify = true, .now = undefined });
-    try testing.expectError(error.TlsInternalError, checkClient(.{ .io = testing.io, .gpa = testing.allocator, .host = &long, .insecure_skip_verify = true, .now = undefined }));
-    try testing.expectError(error.TlsInternalError, checkClient(.{ .io = testing.io, .gpa = testing.allocator, .host = ".example.com", .insecure_skip_verify = true, .now = undefined }));
+    try checkClient(.{ .io = testing.io, .gpa = testing.allocator, .host = long[0..255], .insecure_skip_verify = true });
+    try testing.expectError(error.TlsInternalError, checkClient(.{ .io = testing.io, .gpa = testing.allocator, .host = &long, .insecure_skip_verify = true }));
+    try testing.expectError(error.TlsInternalError, checkClient(.{ .io = testing.io, .gpa = testing.allocator, .host = ".example.com", .insecure_skip_verify = true }));
 }
 
 test "a key share for a group listed twice is a misconfiguration" {
@@ -256,7 +262,6 @@ test "a key share for a group listed twice is a misconfiguration" {
         .gpa = testing.allocator,
         .host = "localhost",
         .insecure_skip_verify = true,
-        .now = undefined,
         .named_groups = &.{.secp256r1},
         .key_shares = &.{ .secp256r1, .secp256r1 },
     };

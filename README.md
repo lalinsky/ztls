@@ -80,7 +80,6 @@ var conn = try ztls.server(&input.interface, &output.interface, .{
     .gpa = gpa,
     .auth = &pair,
     .alpn_protocols = &.{ "h2", "http/1.1" },
-    .now = std.Io.Clock.real.now(io),
 });
 defer conn.deinit(); // after both tasks are done
 
@@ -108,7 +107,6 @@ var conn = try ztls.client(&input.interface, &output.interface, .{
     .gpa = gpa,
     .host = "example.com", // sent as SNI, and checked against the certificate
     .root_ca = &trust,
-    .now = std.Io.Clock.real.now(io),
 });
 ```
 
@@ -165,10 +163,9 @@ error.
 
 `CertKeyPair` loads a PEM certificate chain (leaf first) and a PEM private
 key, from files or memory. `TrustStore` loads trusted certificates from
-PEM or DER files, directories, or the system store. `now` is the time used
-to check certificates. A server can have several certificates, and picks
-one by the client's server name and signature algorithms, or with a
-`select_certificate` callback.
+PEM or DER files, directories, or the system store. A server can have
+several certificates, and picks one by the client's server name and
+signature algorithms, or with a `select_certificate` callback.
 
 ## Testing
 

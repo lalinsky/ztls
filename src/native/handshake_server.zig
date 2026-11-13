@@ -161,7 +161,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
         if (maybe_peer) |*peer| {
             defer peer.deinit();
             h.conn.peer_key_type = peer.public_key.key_type;
-            try h.verifyChain(peer, client_auth.root_ca, .client, null, opt.now.toSeconds());
+            try h.verifyChain(peer, client_auth.root_ca, .client, null, policy.verifyTime(opt.io, opt.now));
             try h.hashMessage(msg);
             msg = try h.nextMessage();
             try h.expect(msg, .certificate_verify);

@@ -399,7 +399,6 @@ pub fn main(init: std.process.Init) !void {
     try tcp_writer.interface.writeAll(&id);
     try tcp_writer.interface.flush();
 
-    const now = std.Io.Clock.real.now(io);
     var conn = (if (o.server) blk: {
         const auth = if (pair) |*p| p else fail("a server needs -cert-file and -key-file", .{});
         var options: ztls.config.Server = .{
@@ -407,7 +406,6 @@ pub fn main(init: std.process.Init) !void {
             .gpa = gpa,
             .auth = auth,
             .alpn_protocols = alpn_protocols,
-            .now = now,
             .max_handshake_message_len = 1 << 20,
             .keep_peer_certificates = true,
         };
@@ -430,7 +428,6 @@ pub fn main(init: std.process.Init) !void {
             .insecure_skip_verify = !(o.verify_peer or o.verify_fail),
             .auth = if (pair) |*p| p else null,
             .alpn_protocols = alpn_protocols,
-            .now = now,
             .max_handshake_message_len = 1 << 20,
             // BoringSSL's default list, which the runner's tests assume:
             // ztls's own default leaves P-384 out.

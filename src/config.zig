@@ -294,8 +294,9 @@ pub const Client = struct {
     signing_schemes: []const proto.SignatureScheme = &default_signature_schemes,
     /// Offered through ALPN, in preference order. Empty sends no ALPN.
     alpn_protocols: []const []const u8 = &.{},
-    /// For certificate validity.
-    now: std.Io.Timestamp,
+    /// The time the server's certificate must be valid at. Null reads
+    /// the real clock through `io` when the certificate is checked.
+    now: ?std.Io.Timestamp = null,
     /// Treat a transport that ends without close_notify as truncated even
     /// between records.
     strict_close_notify: bool = false,
@@ -366,8 +367,9 @@ pub const Server = struct {
     /// is refused with no_application_protocol; one that offers none
     /// gets none. Empty disables ALPN.
     alpn_protocols: []const []const u8 = &.{},
-    /// For client certificate validity.
-    now: std.Io.Timestamp,
+    /// The time a client certificate must be valid at. Null reads the
+    /// real clock through `io` when the certificate is checked.
+    now: ?std.Io.Timestamp = null,
     strict_close_notify: bool = false,
     /// The longest client Certificate message accepted. Other handshake
     /// messages, and all of them without `client_auth`, are held to
