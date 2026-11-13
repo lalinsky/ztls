@@ -259,10 +259,14 @@ pub const Client = struct {
     /// instructions (`default_cipher_suites_chacha_first`), as does a list
     /// equal to it; any other list is offered as given.
     cipher_suites: []const proto.CipherSuite = &default_cipher_suites,
-    /// In preference order, with at least one group ztls knows.
+    /// In preference order, with at least one group ztls knows. Groups
+    /// the implementation has no key exchange for are not offered: the
+    /// native one has none for secp521r1, and refuses a list with nothing
+    /// else. In TLS 1.2 this also limits the curve of the server's ECDSA
+    /// certificate.
     named_groups: []const proto.NamedGroup = &default_named_groups,
     /// Groups to send key shares for; each must be in `named_groups`, and
-    /// listed once.
+    /// listed once. The native implementation refuses secp521r1 here too.
     ///
     /// Not used under `-Dimpl=libssl`, where AWS-LC picks the shares: one
     /// for the first of `named_groups`, and one for the first group after

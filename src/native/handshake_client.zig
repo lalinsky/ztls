@@ -20,6 +20,8 @@ pub fn run(conn: *Connection, options: config.Client) Error!void {
     try policy.checkClient(options);
     var opt = options;
     opt.cipher_suites = offeredSuites(opt.cipher_suites, crypto.aead.hasAesHardware());
+    var groups_buf: [max_groups]proto.NamedGroup = undefined;
+    if (offeredGroups(opt, &groups_buf).len == 0) return error.TlsInternalError;
     var h = Handshake.init(conn, options.gpa, options.max_handshake_message_len);
     h.keep_peer_certificates = options.keep_peer_certificates;
     defer h.deinit();
@@ -35,6 +37,32 @@ pub fn run(conn: *Connection, options: config.Client) Error!void {
 fn offeredSuites(suites: []const proto.CipherSuite, aes_hardware: bool) []const proto.CipherSuite {
     if (aes_hardware or !std.mem.eql(proto.CipherSuite, suites, &config.default_cipher_suites)) return suites;
     return &config.default_cipher_suites_chacha_first;
+}
+
+/// Room for every group we have a key exchange for.
+const max_groups = blk: {
+    var n = 0;
+    for (std.enums.values(proto.NamedGroup)) |group| {
+        if (handshake.groupSupported(group)) n += 1;
+    }
+    break :blk n;
+};
+
+/// The groups to offer in supported_groups: those of `named_groups` we
+/// have a key exchange for, each once, in their order. The hybrid is TLS
+/// 1.3's alone. In TLS 1.2 the list also names the curves an ECDSA
+/// certificate may use (RFC 8422 §5.1), so one we cannot exchange keys on
+/// is not accepted there either.
+fn offeredGroups(opt: config.Client, buf: *[max_groups]proto.NamedGroup) []const proto.NamedGroup {
+    var n: usize = 0;
+    for (opt.named_groups) |group| {
+        if (!handshake.groupSupported(group)) continue;
+        if (group == .x25519_ml_kem768 and !policy.offers(opt, .tls_1_3)) continue;
+        if (std.mem.indexOfScalar(proto.NamedGroup, buf[0..n], group) != null) continue;
+        buf[n] = group;
+        n += 1;
+    }
+    return buf[0..n];
 }
 
 /// A ServerHello of either version.
@@ -282,10 +310,8 @@ fn build(
         const ext = try w.beginLength(u16);
         // The hybrid is TLS 1.3's alone.
         const list = try w.beginLength(u16);
-        for (opt.named_groups) |group| {
-            if (group == .x25519_ml_kem768 and !policy.offers(opt, .tls_1_3)) continue;
-            try w.enumValue(group);
-        }
+        var groups_buf: [max_groups]proto.NamedGroup = undefined;
+        for (offeredGroups(opt, &groups_buf)) |group| try w.enumValue(group);
         try list.end(w);
         try ext.end(w);
     }
@@ -693,6 +719,16 @@ test "a CertificateRequest needs a non-empty signature_algorithms" {
         const result = parseCertificateRequest(w.written(), null, &config.default_signature_schemes);
         if (ext.expected) |err| try testing.expectError(err, result) else _ = try result;
     }
+}
+
+test "only groups with a key exchange are offered" {
+    var buf: [max_groups]proto.NamedGroup = undefined;
+    var opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .named_groups = &.{ .secp521r1, .x25519_ml_kem768, .x25519, .secp256r1 } };
+    try testing.expectEqualSlices(proto.NamedGroup, &.{ .x25519_ml_kem768, .x25519, .secp256r1 }, offeredGroups(opt, &buf));
+    opt.cipher_suites = &proto.CipherSuite.tls12;
+    try testing.expectEqualSlices(proto.NamedGroup, &.{ .x25519, .secp256r1 }, offeredGroups(opt, &buf));
+    opt.named_groups = &.{ .secp521r1, .x25519_ml_kem768 };
+    try testing.expectEqual(0, offeredGroups(opt, &buf).len);
 }
 
 test "the default suites put ChaCha20-Poly1305 first without AES hardware" {

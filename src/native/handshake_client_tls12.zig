@@ -153,7 +153,8 @@ fn suiteAuthentication(suite: proto.CipherSuite) Authentication {
 /// covers Ed25519, RFC 8422 §2.3), as AWS-LC checks, and must be allowed
 /// to sign: BoringSSL (and so Chrome) holds RSA leaves to that too, so a
 /// keyEncipherment-only one is refused. An ECDSA key must be on a curve
-/// we offered in supported_groups (RFC 8422 §5.1).
+/// we offered in supported_groups (RFC 8422 §5.1), which leaves out one
+/// we have no key exchange for.
 fn checkLeaf(peer: *const handshake.PeerCertificate, suite: proto.CipherSuite, named_groups: []const proto.NamedGroup) Error!void {
     const key_type = peer.public_key.key_type;
     switch (suiteAuthentication(suite)) {
@@ -166,7 +167,7 @@ fn checkLeaf(peer: *const handshake.PeerCertificate, suite: proto.CipherSuite, n
                         .p384 => .secp384r1,
                         .p521 => .secp521r1,
                     };
-                    if (std.mem.indexOfScalar(proto.NamedGroup, named_groups, group) == null) return error.TlsIllegalParameter;
+                    if (!handshake.groupSupported(group) or std.mem.indexOfScalar(proto.NamedGroup, named_groups, group) == null) return error.TlsIllegalParameter;
                 },
                 .ed25519 => {},
                 .rsa => return error.TlsIllegalParameter,
@@ -385,6 +386,16 @@ fn testServerKeyExchange(buf: []u8, pair: *const config.CertKeyPair, randoms: Ra
     try w.enumValue(scheme);
     try w.vector(u16, signature);
     return w.written();
+}
+
+test "an ECDSA leaf must be on a curve we offered" {
+    const named_groups: []const proto.NamedGroup = &.{ .secp521r1, .secp384r1 };
+    const suite: proto.CipherSuite = .ecdhe_ecdsa_with_aes_128_gcm_sha256;
+    // Refused before the chain is looked at.
+    for ([_]crypto.sig.Curve{ .p521, .p256 }) |curve| {
+        const peer: handshake.PeerCertificate = .{ .public_key = .{ .pkey = undefined, .key_type = .{ .ecdsa = curve } } };
+        try testing.expectError(error.TlsIllegalParameter, checkLeaf(&peer, suite, named_groups));
+    }
 }
 
 test "a ServerKeyExchange is signed over both randoms, with a group and scheme we offered" {

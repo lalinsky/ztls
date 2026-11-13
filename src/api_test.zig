@@ -575,6 +575,20 @@ test "a client without a group ztls knows is refused before anything is sent" {
     }
 }
 
+test "the native client is refused without a group it has a key exchange for" {
+    if (libssl_build) return error.SkipZigTest;
+    var input_buffer: [lib.input_buffer_len]u8 = undefined;
+    var output_buffer: [lib.output_buffer_len]u8 = undefined;
+    var opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = valid_now };
+    opt.named_groups = &.{.secp521r1};
+    opt.key_shares = &.{};
+    opt.cipher_suites = &proto.CipherSuite.tls12;
+    var input: Io.Reader = .fixed(&input_buffer);
+    var discard: Io.Writer.Discarding = .init(&output_buffer);
+    try testing.expectError(error.TlsInternalError, lib.client(&input, &discard.writer, opt));
+    try testing.expectEqual(0, discard.count + discard.writer.end);
+}
+
 test "signature scheme lists must be ones we implement, each once" {
     var input_buffer: [lib.input_buffer_len]u8 = undefined;
     var output_buffer: [lib.output_buffer_len]u8 = undefined;
