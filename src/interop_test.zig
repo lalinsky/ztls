@@ -617,7 +617,8 @@ fn sClientOnce(io: Io, options: config.Server, args: []const []const u8) !struct
     // failed before connecting would leave the server waiting to accept:
     // a connection that closes at once fails its handshake instead.
     peer.finish() catch {
-        if (loopback.connect()) |stream| stream.close(io) else |_| {}
+        const stream = try loopback.connect();
+        stream.close(io);
     };
     try task.await(io);
     return .{ .outcome = outcome, .echoed = echoed };
