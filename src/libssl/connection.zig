@@ -126,11 +126,6 @@ pub const Connection = struct {
     /// A failure one of our callbacks decided in the current call, which
     /// says more than the alert that goes out for it.
     callback_error: ?HandshakeError = null,
-    /// Why the server found no certificate to present, kept from libssl's
-    /// certificate callback, which can only send handshake_failure, to its
-    /// server name callback, which runs next in the same call and sends
-    /// the alert the native server sends.
-    selection_error: ?HandshakeError = null,
     /// KeyUpdates sent and received, counted by libssl's message callback.
     /// Atomic so either task may read them while the other's call runs.
     key_updates_sent: std.atomic.Value(u64) = .init(0),
@@ -234,7 +229,6 @@ pub const Connection = struct {
     /// write.
     fn call(conn: *Connection, op: Op, buf: []const u8) Result {
         conn.callback_error = null;
-        conn.selection_error = null;
         conn.alert_sent = null;
         conn.alert_received = null;
         conn.bind();
@@ -1201,80 +1195,67 @@ fn alpnSelectCallback(
     return c.SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
-/// The server's certificate, picked as the native server picks it: the
-/// application's choice, else the first of `certificates` for the client's
-/// server name that it can verify, else `auth`.
-fn selectCertificateCallback(hello: [*c]const c.SSL_CLIENT_HELLO) callconv(.c) c.enum_ssl_select_cert_result_t {
-    const ssl = hello.*.ssl.?;
-    const conn = connectionOf(ssl);
-    const pair = selectCertificate(hello, ssl, conn.options.server.*) catch |err| {
-        conn.selection_error = err;
-        return c.ssl_select_cert_success;
-    };
-    setCertificate(conn, pair) catch |err| {
-        conn.selection_error = err;
-        return c.ssl_select_cert_success;
-    };
-    return c.ssl_select_cert_success;
-}
-
-/// Fails the handshake for a certificate selection that failed, with the
-/// native server's alert. Otherwise acknowledges no server name, as the
-/// native server does not.
+/// Picks the server's certificate as the native server picks it: the
+/// application's choice, else the first of `certificates` for the
+/// client's server name that it can verify, else `auth`. libssl calls
+/// this once the first ClientHello's extensions are parsed, the
+/// signature algorithms and the server name among them, and sends the
+/// alert it is given. Acknowledges no server name, as the native server
+/// does not.
 fn serverNameCallback(ssl: ?*c.SSL, alert: ?*c_int, arg: ?*anyopaque) callconv(.c) c_int {
     _ = arg;
     const conn = connectionOf(ssl.?);
-    const err = conn.selection_error orelse return c.SSL_TLSEXT_ERR_NOACK;
-    conn.selection_error = null;
-    conn.callback_error = err;
-    const native = proto.Alert.forLocalError(err) orelse .internal_error;
-    alert.?.* = @intFromEnum(native);
-    return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+    selectCertificate(conn) catch |err| {
+        conn.callback_error = err;
+        alert.?.* = @intFromEnum(proto.Alert.forLocalError(err) orelse .internal_error);
+        return c.SSL_TLSEXT_ERR_ALERT_FATAL;
+    };
+    return c.SSL_TLSEXT_ERR_NOACK;
 }
 
-const max_schemes = 64;
-
-fn selectCertificate(hello: [*c]const c.SSL_CLIENT_HELLO, ssl: *c.SSL, opt: config.Server) HandshakeError!*const config.CertKeyPair {
-    var schemes_buf: [max_schemes]proto.SignatureScheme = undefined;
-    const schemes = offeredSchemes(hello, &schemes_buf);
-    const server_name: ?[]const u8 = if (c.SSL_get_servername(ssl, c.TLSEXT_NAMETYPE_host_name)) |name| std.mem.span(name) else null;
-    if (opt.select_certificate) |select| {
-        const info: config.SelectCertificate.Hello = .{
-            .server_name = server_name,
-            .accepts = acceptsKey,
-            .schemes = schemes,
-            .signing_schemes = opt.signing_schemes,
-        };
-        if (select.callback(select.context, info)) |pair| return pair;
-    }
-    for (opt.certificates) |pair| {
-        if (policy.selectScheme(opt.signing_schemes, pair.key.key_type, schemes, .tls13) == null) continue;
-        if (server_name) |name| {
-            if (!pair.leaf.matchesHost(name)) continue;
+fn selectCertificate(conn: *Connection) HandshakeError!void {
+    const opt = conn.options.server;
+    var schemes_buf: [all_schemes.len]proto.SignatureScheme = undefined;
+    const schemes = offeredSchemes(conn.ssl, &schemes_buf);
+    const server_name: ?[]const u8 = if (c.SSL_get_servername(conn.ssl, c.TLSEXT_NAMETYPE_host_name)) |name| std.mem.span(name) else null;
+    const pair = choice: {
+        if (opt.select_certificate) |select| {
+            const info: config.SelectCertificate.Hello = .{
+                .server_name = server_name,
+                .accepts = acceptsKey,
+                .schemes = schemes,
+                .signing_schemes = opt.signing_schemes,
+            };
+            if (select.callback(select.context, info)) |pair| break :choice pair;
         }
-        return pair;
-    }
-    return opt.auth orelse error.TlsUnrecognizedName;
+        for (opt.certificates) |pair| {
+            if (policy.selectScheme(opt.signing_schemes, pair.key.key_type, schemes, .tls13) == null) continue;
+            if (server_name) |name| {
+                if (!pair.leaf.matchesHost(name)) continue;
+            }
+            break :choice pair;
+        }
+        break :choice opt.auth orelse return error.TlsUnrecognizedName;
+    };
+    try setCertificate(conn, pair);
 }
 
 fn acceptsKey(hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
     return policy.selectScheme(hello.signing_schemes, key_type, hello.schemes, .tls13) != null;
 }
 
-/// The client's signature_algorithms that ztls supports, in its order.
-fn offeredSchemes(hello: [*c]const c.SSL_CLIENT_HELLO, buf: *[max_schemes]proto.SignatureScheme) []const proto.SignatureScheme {
-    var data: [*c]const u8 = null;
-    var len: usize = 0;
-    if (c.SSL_early_callback_ctx_extension_get(hello, c.TLSEXT_TYPE_signature_algorithms, &data, &len) != 1) return buf[0..0];
-    const ext = data[0..len];
-    if (ext.len < 2) return buf[0..0];
-    const list_len = std.mem.readInt(u16, ext[0..2], .big);
-    const list = ext[2..][0..@min(list_len, ext.len - 2)];
+const all_schemes = &config.default_signature_schemes;
+
+/// The client's signature_algorithms that ztls supports, in its order,
+/// each once, as the native server collects them.
+fn offeredSchemes(ssl: *c.SSL, buf: *[all_schemes.len]proto.SignatureScheme) []const proto.SignatureScheme {
+    var ids: [*c]const u16 = null;
+    const len = c.SSL_get0_peer_verify_algorithms(ssl, &ids);
     var n: usize = 0;
-    var i: usize = 0;
-    while (i + 2 <= list.len and n < buf.len) : (i += 2) {
-        const scheme: proto.SignatureScheme = @enumFromInt(std.mem.readInt(u16, list[i..][0..2], .big));
-        if (policy.schemeAlgorithm(scheme, .tls13) == null) continue;
+    for (0..len) |i| {
+        const scheme: proto.SignatureScheme = @enumFromInt(ids[i]);
+        if (std.mem.indexOfScalar(proto.SignatureScheme, all_schemes, scheme) == null) continue;
+        if (std.mem.indexOfScalar(proto.SignatureScheme, buf[0..n], scheme) != null) continue;
         buf[n] = scheme;
         n += 1;
     }
@@ -1305,7 +1286,6 @@ fn globals() error{OutOfMemory}!Globals {
     // No resumption yet, as in the native implementation: no tickets.
     if (c.SSL_CTX_set_num_tickets(server_ctx, 0) != 1) return error.OutOfMemory;
     c.SSL_CTX_set_alpn_select_cb(server_ctx, alpnSelectCallback, null);
-    c.SSL_CTX_set_select_certificate_cb(server_ctx, selectCertificateCallback);
     if (c.SSL_CTX_set_tlsext_servername_callback(server_ctx, serverNameCallback) != 1) return error.OutOfMemory;
 
     const index = c.SSL_get_ex_new_index(0, null, null, null, null);

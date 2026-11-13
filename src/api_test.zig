@@ -688,6 +688,42 @@ test "the server picks its certificate by server name" {
     try testing.expectError(error.TlsUnrecognizedName, bare_outcome.handshake);
 }
 
+test "select_certificate sees the client's schemes that ztls knows, rsa_pkcs1 ones included" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    const Recorder = struct {
+        schemes: [8]proto.SignatureScheme = undefined,
+        len: usize = 0,
+
+        fn pick(context: ?*anyopaque, hello: config.SelectCertificate.Hello) ?*const CertKeyPair {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.len = @min(hello.schemes.len, self.schemes.len);
+            @memcpy(self.schemes[0..self.len], hello.schemes[0..self.len]);
+            return null;
+        }
+    };
+    var recorder: Recorder = .{};
+    var run: Run(lib) = .{};
+    try run.start(io, .{
+        .gpa = testing.allocator,
+        .auth = &pki.server_ec,
+        .now = valid_now,
+        .select_certificate = .{ .context = &recorder, .callback = Recorder.pick },
+    });
+    const offered = [_]proto.SignatureScheme{ .rsa_pkcs1_sha256, .ecdsa_secp256r1_sha256 };
+    _ = try clientOnce(lib, &run.loopback, .{
+        .gpa = testing.allocator,
+        .host = "localhost",
+        .root_ca = &pki.ca,
+        .now = valid_now,
+        .verify_schemes = &offered,
+    });
+    const outcome = try run.finish(io);
+    try outcome.handshake;
+    try testing.expectEqualSlices(proto.SignatureScheme, &offered, recorder.schemes[0..recorder.len]);
+}
+
 test "a Certificate message longer than max_handshake_message_len is refused" {
     const io = testing.io;
     var pki = try Pki.init();
