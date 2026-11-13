@@ -86,9 +86,6 @@ const Result = union(enum) {
     ok: usize,
     /// It needs more of the transport's input.
     want_read,
-    /// libssl could not write; our BIO never refuses, so this does not
-    /// happen.
-    want_write,
     /// It waits for the signer hook.
     want_private_key,
     /// The peer's close_notify came.
@@ -179,14 +176,20 @@ pub const Connection = struct {
     strict_close_notify: bool = false,
     side: proto.Side,
 
-    fn init(ctx: *c.SSL_CTX, input: *Io.Reader, output: *Io.Writer, side: proto.Side) error{OutOfMemory}!Connection {
+    fn init(g: Globals, input: *Io.Reader, output: *Io.Writer, side: proto.Side) error{OutOfMemory}!Connection {
         if (input.buffer.len < input_buffer_len) @panic("ztls: the transport reader's buffer is shorter than input_buffer_len");
         if (output.buffer.len < output_buffer_len) @panic("ztls: the transport writer's buffer is shorter than output_buffer_len");
         const spill = c.BIO_new(c.BIO_s_mem()) orelse return error.OutOfMemory;
         errdefer _ = c.BIO_free(spill);
-        const ssl = c.SSL_new(ctx) orelse return error.OutOfMemory;
+        const ssl = c.SSL_new(switch (side) {
+            .client => g.client_ctx,
+            .server => g.server_ctx,
+        }) orelse return error.OutOfMemory;
         errdefer c.SSL_free(ssl);
-        const bio = c.BIO_new(globals_value.?.bio_method) orelse return error.OutOfMemory;
+        // The first set of the index allocates; later ones, in `bind`,
+        // only overwrite it.
+        if (c.SSL_set_ex_data(ssl, g.ex_index, null) != 1) return error.OutOfMemory;
+        const bio = c.BIO_new(g.bio_method) orelse return error.OutOfMemory;
         c.BIO_set_init(bio, 1);
         // The SSL takes it for both directions, and frees it with itself.
         c.SSL_set_bio(ssl, bio, bio);
@@ -269,7 +272,8 @@ pub const Connection = struct {
         };
         const result: Result = if (ok) .{ .ok = if (rc > 0) @intCast(rc) else 0 } else switch (c.SSL_get_error(ssl, rc)) {
             c.SSL_ERROR_WANT_READ => .want_read,
-            c.SSL_ERROR_WANT_WRITE => .want_write,
+            // Our BIO never refuses a write.
+            c.SSL_ERROR_WANT_WRITE => .{ .failed = error.TlsInternalError },
             c.SSL_ERROR_WANT_PRIVATE_KEY_OPERATION => .want_private_key,
             c.SSL_ERROR_ZERO_RETURN => .closed,
             // Anything else ends the connection, SSL_ERROR_SYSCALL
@@ -286,6 +290,7 @@ pub const Connection = struct {
     /// Points the callbacks and the BIO at this connection, which may have
     /// moved since the last call.
     fn bind(conn: *Connection) void {
+        // Cannot fail: `init` made the slot.
         _ = c.SSL_set_ex_data(conn.ssl, globals_value.?.ex_index, conn);
         c.BIO_set_data(conn.transport_bio, conn);
     }
@@ -305,7 +310,7 @@ pub const Connection = struct {
             if (packed_error == 0) break;
             if (reasonError(packed_error)) |err| return err;
         }
-        if (conn.alert_sent) |alert| return localError(alert);
+        if (conn.alert_sent) |alert| return alert.localError();
         return error.TlsInternalError;
     }
 
@@ -371,7 +376,6 @@ pub const Connection = struct {
                     try conn.sendWritten(true);
                     try conn.input.fillMore();
                 },
-                .want_write => try conn.sendWritten(true),
                 // The signer hook runs here, with the mutex released, and
                 // may block or suspend.
                 .want_private_key => conn.runSigner(),
@@ -476,9 +480,8 @@ pub const Connection = struct {
             const step = conn.call(.read, dest[0..len]);
             const failure: ?Failure = switch (step) {
                 .ok, .want_read, .closed => null,
-                // Neither can happen: our BIO takes all libssl writes,
-                // and no key operation runs after the handshake.
-                .want_write, .want_private_key => error.TlsInternalError,
+                // No key operation runs after the handshake.
+                .want_private_key => error.TlsInternalError,
                 .failed => |err| asFailure(err),
             };
             if (failure) |err| conn.failRead(err);
@@ -511,7 +514,7 @@ pub const Connection = struct {
                     },
                 },
                 // The read side failed, as recorded above.
-                .want_write, .want_private_key, .failed => return failure orelse error.TlsInternalError,
+                .want_private_key, .failed => return failure orelse error.TlsInternalError,
             }
         }
     }
@@ -611,10 +614,10 @@ pub const Connection = struct {
             unlock(&conn.mutex);
             switch (step) {
                 .ok => return,
-                // None can happen: our BIO takes all libssl writes,
-                // and none of these reads. libssl may hold half a write
-                // now, so the direction is over.
-                .want_read, .want_write, .want_private_key, .closed => return conn.failWrite(error.TlsInternalError),
+                // None can happen: none of these reads, and no key
+                // operation runs after the handshake. libssl may hold
+                // half a write now, so the direction is over.
+                .want_read, .want_private_key, .closed => return conn.failWrite(error.TlsInternalError),
                 .failed => |err| {
                     conn.sendWritten(true) catch {};
                     return conn.failWrite(asFailure(err));
@@ -799,7 +802,7 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Han
     // A failed setup call leaves its error on this thread's queue.
     errdefer c.ERR_clear_error();
     const g = try globals();
-    var conn = try Connection.init(g.client_ctx, input, output, .client);
+    var conn = try Connection.init(g, input, output, .client);
     errdefer conn.deinit();
     const ssl = conn.ssl;
     c.SSL_set_connect_state(ssl);
@@ -841,7 +844,7 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Han
     // A failed setup call leaves its error on this thread's queue.
     errdefer c.ERR_clear_error();
     const g = try globals();
-    var conn = try Connection.init(g.server_ctx, input, output, .server);
+    var conn = try Connection.init(g, input, output, .server);
     errdefer conn.deinit();
     const ssl = conn.ssl;
     c.SSL_set_accept_state(ssl);
@@ -1423,38 +1426,6 @@ fn errorNames(comptime E: type) []const [:0]const u8 {
         }
         return set.error_names.?;
     }
-}
-
-/// The failure an alert we sent stands for.
-fn localError(alert: proto.Alert) HandshakeError {
-    return switch (alert) {
-        .unexpected_message => error.TlsUnexpectedMessage,
-        .bad_record_mac => error.TlsBadRecordMac,
-        .record_overflow => error.TlsRecordOverflow,
-        .handshake_failure => error.TlsHandshakeFailure,
-        .bad_certificate => error.TlsBadCertificate,
-        .unsupported_certificate => error.TlsUnsupportedCertificate,
-        .certificate_revoked => error.TlsCertificateRevoked,
-        .certificate_expired => error.CertificateExpired,
-        .certificate_unknown => error.TlsCertificateUnknown,
-        .illegal_parameter => error.TlsIllegalParameter,
-        .unknown_ca => error.CertificateIssuerNotFound,
-        .access_denied => error.TlsAccessDenied,
-        .decode_error => error.TlsDecodeError,
-        .decrypt_error => error.TlsDecryptError,
-        .protocol_version => error.TlsProtocolVersion,
-        .insufficient_security => error.TlsInsufficientSecurity,
-        .inappropriate_fallback => error.TlsInappropriateFallback,
-        .no_renegotiation => error.TlsNoRenegotiation,
-        .missing_extension => error.TlsMissingExtension,
-        .unsupported_extension => error.TlsUnsupportedExtension,
-        .unrecognized_name => error.TlsUnrecognizedName,
-        .bad_certificate_status_response => error.TlsBadCertificateStatusResponse,
-        .unknown_psk_identity => error.TlsUnknownPskIdentity,
-        .certificate_required => error.TlsCertificateRequired,
-        .no_application_protocol => error.TlsNoApplicationProtocol,
-        else => error.TlsInternalError,
-    };
 }
 
 /// Where the ciphertext libssl took ends: inside a record, or between two.

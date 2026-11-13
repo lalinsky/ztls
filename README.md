@@ -19,9 +19,10 @@ between threads, and one task often reads a connection while another writes
 to it.
 
 libssl does not fit this well. It wants to call the transport itself, and a
-fiber must not block inside C code. A wrapper has to feed libssl through
-memory buffers, which copies every byte. Both directions also share one
-libssl object, so the reading and writing tasks need a lock.
+fiber must not block inside C code. A wrapper can only hand libssl what the
+transport has already buffered, and libssl copies every byte through record
+buffers of its own. Both directions also share one libssl object, so the
+reading and writing tasks need a lock.
 
 The native engine avoids all of this. Reading and writing are independent.
 Records are decrypted directly into the reader's buffer, and can be

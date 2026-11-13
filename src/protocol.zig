@@ -265,6 +265,39 @@ pub const Alert = enum(u8) {
         };
     }
 
+    /// The failure an alert we sent stands for: the reverse of
+    /// `forLocalError`.
+    pub fn localError(alert: Alert) LocalError {
+        return switch (alert) {
+            .unexpected_message => error.TlsUnexpectedMessage,
+            .bad_record_mac => error.TlsBadRecordMac,
+            .record_overflow => error.TlsRecordOverflow,
+            .handshake_failure => error.TlsHandshakeFailure,
+            .bad_certificate => error.TlsBadCertificate,
+            .unsupported_certificate => error.TlsUnsupportedCertificate,
+            .certificate_revoked => error.TlsCertificateRevoked,
+            .certificate_expired => error.CertificateExpired,
+            .certificate_unknown => error.TlsCertificateUnknown,
+            .illegal_parameter => error.TlsIllegalParameter,
+            .unknown_ca => error.CertificateIssuerNotFound,
+            .access_denied => error.TlsAccessDenied,
+            .decode_error => error.TlsDecodeError,
+            .decrypt_error => error.TlsDecryptError,
+            .protocol_version => error.TlsProtocolVersion,
+            .insufficient_security => error.TlsInsufficientSecurity,
+            .inappropriate_fallback => error.TlsInappropriateFallback,
+            .no_renegotiation => error.TlsNoRenegotiation,
+            .missing_extension => error.TlsMissingExtension,
+            .unsupported_extension => error.TlsUnsupportedExtension,
+            .unrecognized_name => error.TlsUnrecognizedName,
+            .bad_certificate_status_response => error.TlsBadCertificateStatusResponse,
+            .unknown_psk_identity => error.TlsUnknownPskIdentity,
+            .certificate_required => error.TlsCertificateRequired,
+            .no_application_protocol => error.TlsNoApplicationProtocol,
+            else => error.TlsInternalError,
+        };
+    }
+
     /// True for the errors `toError` produces: the peer's failure, not ours.
     pub fn isFromPeer(err: anyerror) bool {
         inline for (comptime std.meta.fieldNames(Error)) |name| {
