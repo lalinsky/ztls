@@ -266,7 +266,8 @@ pub const Connection = struct {
         const ok = switch (op) {
             .handshake, .read => rc > 0,
             // A write takes all of `buf`; an empty one returns 0.
-            .write, .key_update => if (buf.len == 0) rc == 0 else rc > 0,
+            .write => if (buf.len == 0) rc == 0 else rc > 0,
+            .key_update => rc == 0,
             // 0 once close_notify is out, 1 once the peer's came too.
             .shutdown => rc >= 0,
         };
@@ -432,17 +433,7 @@ pub const Connection = struct {
         if (scheme != 0) conn.peer_signature_scheme = @enumFromInt(scheme);
 
         const chain = peerChain(ssl);
-        if (chain.len > 0) {
-            if (x509.Certificate.parseDer(chain.get(0))) |leaf_const| {
-                var leaf = leaf_const;
-                defer leaf.deinit();
-                if (leaf.publicKey()) |key_const| {
-                    var key = key_const;
-                    conn.peer_key_type = key.key_type;
-                    key.deinit();
-                } else |_| {}
-            } else |_| {}
-        }
+        if (chain.len > 0) conn.peer_key_type = leafKeyType(chain.get(0));
         if (keep_peer_certificates and chain.len > 0) {
             var copies: std.ArrayList([]const u8) = .empty;
             errdefer {
@@ -1031,6 +1022,19 @@ const PeerChain = struct {
     }
 };
 
+/// The type of key in a certificate, if ztls supports it.
+fn keyType(cert: *const x509.Certificate) ?crypto.sig.KeyType {
+    var key = cert.publicKey() catch return null;
+    defer key.deinit();
+    return key.key_type;
+}
+
+fn leafKeyType(der: []const u8) ?crypto.sig.KeyType {
+    var leaf = x509.Certificate.parseDer(der) catch return null;
+    defer leaf.deinit();
+    return keyType(&leaf);
+}
+
 fn peerChain(ssl: *c.SSL) PeerChain {
     const stack = c.SSL_get0_peer_certificates(ssl);
     return .{ .stack = stack, .len = if (stack) |s| c.sk_CRYPTO_BUFFER_num(s) else 0 };
@@ -1164,8 +1168,7 @@ fn verifyPeer(conn: *Connection) HandshakeError!void {
         certs[n] = x509.Certificate.parseDer(chain.get(i)) catch return error.TlsBadCertificate;
         n += 1;
     }
-    var key = certs[0].publicKey() catch return error.TlsUnsupportedCertificate;
-    key.deinit();
+    _ = keyType(&certs[0]) orelse return error.TlsUnsupportedCertificate;
     switch (conn.options) {
         .none => unreachable,
         .client => |opt| try policy.verifyChain(certs[0..n], opt.root_ca.?, .server, opt.host, opt.now.toSeconds()),
@@ -1415,24 +1418,10 @@ fn unlock(m: *Io.Mutex) void {
 /// A failure of the handshake as one of a connection's, for those that can
 /// only come after it.
 fn asFailure(err: HandshakeError) Failure {
-    inline for (comptime errorNames(Failure)) |name| {
+    inline for (comptime std.meta.fieldNames(Failure)) |name| {
         if (err == @field(HandshakeError, name)) return @field(Failure, name);
     }
     return error.TlsInternalError;
-}
-
-/// The names in an error set; Zig 0.16 and 0.17 describe sets differently.
-fn errorNames(comptime E: type) []const [:0]const u8 {
-    comptime {
-        const set = @typeInfo(E).error_set;
-        if (@typeInfo(@TypeOf(set)) == .optional) {
-            var names: [set.?.len][:0]const u8 = undefined;
-            for (set.?, 0..) |e, i| names[i] = e.name;
-            const final = names;
-            return &final;
-        }
-        return set.error_names.?;
-    }
 }
 
 /// Where the ciphertext libssl took ends: inside a record, or between two.
