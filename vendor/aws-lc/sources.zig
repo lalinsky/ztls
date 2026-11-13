@@ -256,6 +256,48 @@ pub const c: []const []const u8 = &.{
     "generated-src/err_data.c",
 };
 
+/// libssl, all C++.
+pub const ssl: []const []const u8 = &.{
+    "ssl/custom_extensions.cc",
+    "ssl/d1_both.cc",
+    "ssl/d1_lib.cc",
+    "ssl/d1_pkt.cc",
+    "ssl/d1_srtp.cc",
+    "ssl/dtls_method.cc",
+    "ssl/dtls_record.cc",
+    "ssl/encrypted_client_hello.cc",
+    "ssl/extensions.cc",
+    "ssl/handoff.cc",
+    "ssl/handshake.cc",
+    "ssl/handshake_client.cc",
+    "ssl/handshake_server.cc",
+    "ssl/s3_both.cc",
+    "ssl/s3_lib.cc",
+    "ssl/s3_pkt.cc",
+    "ssl/ssl_aead_ctx.cc",
+    "ssl/ssl_asn1.cc",
+    "ssl/ssl_buffer.cc",
+    "ssl/ssl_cert.cc",
+    "ssl/ssl_cipher.cc",
+    "ssl/ssl_key_share.cc",
+    "ssl/ssl_lib.cc",
+    "ssl/ssl_privkey.cc",
+    "ssl/ssl_session.cc",
+    "ssl/ssl_stat.cc",
+    "ssl/ssl_text.cc",
+    "ssl/ssl_transcript.cc",
+    "ssl/ssl_transfer_asn1.cc",
+    "ssl/ssl_versions.cc",
+    "ssl/ssl_x509.cc",
+    "ssl/t1_enc.cc",
+    "ssl/tls13_both.cc",
+    "ssl/tls13_client.cc",
+    "ssl/tls13_enc.cc",
+    "ssl/tls13_server.cc",
+    "ssl/tls_method.cc",
+    "ssl/tls_record.cc",
+};
+
 pub const x86_64_linux: Target = .{
     .@"asm" = &.{
         "crypto/fipsmodule/ml_kem/mlkem/native/x86_64/src/intt.S",

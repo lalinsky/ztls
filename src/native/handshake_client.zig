@@ -4,10 +4,11 @@
 //! ServerHello hands over to `handshake_client_tls12.zig`.
 
 const std = @import("std");
-const proto = @import("protocol.zig");
+const proto = @import("../protocol.zig");
 const codec = @import("codec.zig");
-const config = @import("config.zig");
-const crypto = @import("crypto.zig");
+const config = @import("../config.zig");
+const policy = @import("../policy.zig");
+const crypto = @import("../crypto.zig");
 const handshake = @import("handshake.zig");
 const Handshake = handshake.Handshake;
 const KeyShares = handshake.KeyShares;
@@ -16,9 +17,11 @@ const Connection = @import("connection.zig").Connection;
 const tls12 = @import("handshake_client_tls12.zig");
 
 pub fn run(conn: *Connection, options: config.Client) Error!void {
-    try checkOptions(options);
+    try policy.checkClient(options);
     var opt = options;
-    opt.cipher_suites = offeredSuites(opt.cipher_suites, crypto.aead.hasAesHardware());
+    opt.cipher_suites = policy.offeredSuites(opt.cipher_suites, crypto.aead.hasAesHardware());
+    var groups_buf: [max_groups]proto.NamedGroup = undefined;
+    if (offeredGroups(opt, &groups_buf).len == 0) return error.TlsInternalError;
     var h = Handshake.init(conn, options.gpa, options.max_handshake_message_len);
     h.keep_peer_certificates = options.keep_peer_certificates;
     defer h.deinit();
@@ -28,12 +31,30 @@ pub fn run(conn: *Connection, options: config.Client) Error!void {
     };
 }
 
-/// The suites to offer: the default list puts ChaCha20-Poly1305 first
-/// without AES instructions, where software AES is several times slower,
-/// so that servers that follow the client's order pick it.
-fn offeredSuites(suites: []const proto.CipherSuite, aes_hardware: bool) []const proto.CipherSuite {
-    if (aes_hardware or !std.mem.eql(proto.CipherSuite, suites, &config.default_cipher_suites)) return suites;
-    return &config.default_cipher_suites_chacha_first;
+/// Room for every group we have a key exchange for.
+const max_groups = blk: {
+    var n = 0;
+    for (std.enums.values(proto.NamedGroup)) |group| {
+        if (handshake.groupSupported(group)) n += 1;
+    }
+    break :blk n;
+};
+
+/// The groups to offer in supported_groups: those of `named_groups` we
+/// have a key exchange for, each once, in their order. The hybrid is TLS
+/// 1.3's alone. In TLS 1.2 the list also names the curves an ECDSA
+/// certificate may use (RFC 8422 §5.1), so one we cannot exchange keys on
+/// is not accepted there either.
+fn offeredGroups(opt: config.Client, buf: *[max_groups]proto.NamedGroup) []const proto.NamedGroup {
+    var n: usize = 0;
+    for (opt.named_groups) |group| {
+        if (!handshake.groupSupported(group)) continue;
+        if (group == .x25519_ml_kem768 and !policy.offers(opt, .tls_1_3)) continue;
+        if (std.mem.indexOfScalar(proto.NamedGroup, buf[0..n], group) != null) continue;
+        buf[n] = group;
+        n += 1;
+    }
+    return buf[0..n];
 }
 
 /// A ServerHello of either version.
@@ -71,40 +92,6 @@ const CertificateRequest = struct {
 /// Misconfiguration is ours, not the peer's: nothing is sent for it, not
 /// even an alert. An empty host would leave the certificate's name
 /// unchecked, which only insecure_skip_verify may ask for.
-fn checkOptions(opt: config.Client) error{TlsInternalError}!void {
-    if (opt.root_ca == null and !opt.insecure_skip_verify) return error.TlsInternalError;
-    if (opt.host.len == 0 and !opt.insecure_skip_verify) return error.TlsInternalError;
-    if (opt.host.len > 255) return error.TlsInternalError;
-    // AWS-LC would match any subdomain of a name that starts with a dot.
-    if (opt.host.len > 0 and opt.host[0] == '.') return error.TlsInternalError;
-    if (opt.named_groups.len == 0) return error.TlsInternalError;
-    if (opt.verify_schemes.len == 0) return error.TlsInternalError;
-    if (!handshake.schemesSupported(opt.verify_schemes) or !handshake.schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
-    if (!proto.tls12_enabled) {
-        for (opt.cipher_suites) |suite| if (suite.version() == .tls_1_2) return error.TlsInternalError;
-    }
-    if (!offers(opt, .tls_1_3) and !offers(opt, .tls_1_2)) return error.TlsInternalError;
-    if (offers(opt, .tls_1_3)) {
-        if (opt.key_shares.len == 0) return error.TlsInternalError;
-        for (opt.key_shares, 0..) |group, i| {
-            if (std.mem.indexOfScalar(proto.NamedGroup, opt.named_groups, group) == null) return error.TlsInternalError;
-            // One share per group (§4.2.8).
-            if (std.mem.indexOfScalar(proto.NamedGroup, opt.key_shares[0..i], group) != null) return error.TlsInternalError;
-        }
-    }
-}
-
-/// Whether `cipher_suites` offers `version`: it does with any of its
-/// suites. Never TLS 1.2 in a build without it, which is known at compile
-/// time, so the code behind it is left out.
-fn offers(opt: config.Client, comptime version: proto.Version) bool {
-    if (version == .tls_1_2 and !proto.tls12_enabled) return false;
-    for (opt.cipher_suites) |suite| {
-        if (suite.version() == version) return true;
-    }
-    return false;
-}
-
 fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     var random: [32]u8 = undefined;
     crypto.rand.bytes(&random);
@@ -113,31 +100,30 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     // TLS 1.2 alone it would ask to resume a session, so none is sent.
     var session_id_buf: [32]u8 = undefined;
     crypto.rand.bytes(&session_id_buf);
-    const session_id: []const u8 = if (offers(opt, .tls_1_3)) &session_id_buf else &.{};
+    const session_id: []const u8 = if (policy.offers(opt, .tls_1_3)) &session_id_buf else &.{};
 
-    var shares: KeyShares = if (offers(opt, .tls_1_3)) try KeyShares.generate(opt.key_shares) else .{};
+    var shares: KeyShares = if (policy.offers(opt, .tls_1_3)) try KeyShares.generate(opt.key_shares) else .{};
     defer shares.deinit();
     // A TLS 1.2 client certificate signs the messages themselves.
-    if (offers(opt, .tls_1_2) and opt.auth != null and opt.signing_schemes.len > 0) h.keepRawTranscript();
+    if (policy.offers(opt, .tls_1_2) and opt.auth != null and opt.signing_schemes.len > 0) h.keepRawTranscript();
     h.record_version = @enumFromInt(0x0301);
     try writeClientHello(h, opt, &random, session_id, &shares, opt.key_shares, null);
     h.record_version = .tls_1_2;
     try h.flush();
     // A server that may answer TLS 1.2 sends no compatibility CCS, and may
     // send warning alerts before it says which version it speaks.
-    h.ccs_allowed = !offers(opt, .tls_1_2);
-    h.tolerate_warnings = offers(opt, .tls_1_2);
+    h.ccs_allowed = !policy.offers(opt, .tls_1_2);
+    h.tolerate_warnings = policy.offers(opt, .tls_1_2);
 
     var msg = try h.nextMessage();
     try h.expect(msg, .server_hello);
     var hello = switch (try parseServerHello(msg.body, opt, session_id)) {
         .tls13 => |hello| hello,
         .tls12 => |hello| {
-            if (!proto.tls12_enabled) unreachable;
             h.setSuite(hello.suite);
             try h.hashMessage(msg);
             try tls12.run(h, opt, &random, hello);
-            try h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
+            try h.conn.setServerName(if (policy.sendsSni(opt.host)) opt.host else null);
             return;
         },
     };
@@ -258,20 +244,9 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     try h.installWriteKeys(ap.client);
     h.conn.read.ccs = .refuse;
     h.conn.alpn_protocol = alpn;
-    try h.conn.setServerName(if (sendsSni(opt.host)) opt.host else null);
+    try h.conn.setServerName(if (policy.sendsSni(opt.host)) opt.host else null);
     h.conn.strict_close_notify = opt.strict_close_notify;
-}
-
-/// Whether `host` is an IP literal, which gets no SNI (RFC 6066 §3).
-fn isIpLiteral(host: []const u8) bool {
-    _ = std.Io.net.IpAddress.parse(host, 0) catch return false;
-    return true;
-}
-
-/// Whether `host` goes out as SNI: a non-empty name that is not an
-/// IP literal.
-fn sendsSni(host: []const u8) bool {
-    return host.len != 0 and !isIpLiteral(host);
+    h.conn.max_ticket_message_len = @intCast(@min(@max(16 * 1024, opt.max_handshake_message_len), std.math.maxInt(u24)));
 }
 
 fn writeClientHello(
@@ -308,12 +283,12 @@ fn build(
         for (opt.cipher_suites) |suite| try w.enumValue(suite);
         // Secure renegotiation (RFC 5746 §3.4), which we never do: the
         // signal that we would refuse it safely.
-        if (offers(opt, .tls_1_2)) try w.enumValue(proto.CipherSuite.empty_renegotiation_info_scsv);
+        if (policy.offers(opt, .tls_1_2)) try w.enumValue(proto.CipherSuite.empty_renegotiation_info_scsv);
         try suites.end(w);
     }
     try w.vector(u8, &.{0}); // legacy_compression_methods: null only
     const extensions = try w.beginLength(u16);
-    if (sendsSni(opt.host)) {
+    if (policy.sendsSni(opt.host)) {
         try w.enumValue(proto.Extension.server_name);
         const ext = try w.beginLength(u16);
         const list = try w.beginLength(u16);
@@ -327,10 +302,8 @@ fn build(
         const ext = try w.beginLength(u16);
         // The hybrid is TLS 1.3's alone.
         const list = try w.beginLength(u16);
-        for (opt.named_groups) |group| {
-            if (group == .x25519_ml_kem768 and !offers(opt, .tls_1_3)) continue;
-            try w.enumValue(group);
-        }
+        var groups_buf: [max_groups]proto.NamedGroup = undefined;
+        for (offeredGroups(opt, &groups_buf)) |group| try w.enumValue(group);
         try list.end(w);
         try ext.end(w);
     }
@@ -340,16 +313,16 @@ fn build(
         try w.enumList(opt.verify_schemes);
         try ext.end(w);
     }
-    if (offers(opt, .tls_1_3)) {
+    if (policy.offers(opt, .tls_1_3)) {
         try w.enumValue(proto.Extension.supported_versions);
         const ext = try w.beginLength(u16);
         const list = try w.beginLength(u8);
         try w.enumValue(proto.Version.tls_1_3);
-        if (offers(opt, .tls_1_2)) try w.enumValue(proto.Version.tls_1_2);
+        if (policy.offers(opt, .tls_1_2)) try w.enumValue(proto.Version.tls_1_2);
         try list.end(w);
         try ext.end(w);
     }
-    if (offers(opt, .tls_1_2)) {
+    if (policy.offers(opt, .tls_1_2)) {
         // Uncompressed points only (RFC 8422 §5.1.2).
         try w.enumValue(proto.Extension.ec_point_formats);
         try w.vector(u16, &.{ 1, 0 });
@@ -364,7 +337,7 @@ fn build(
         try list.end(w);
         try ext.end(w);
     }
-    if (offers(opt, .tls_1_3)) {
+    if (policy.offers(opt, .tls_1_3)) {
         try w.enumValue(proto.Extension.key_share);
         const ext = try w.beginLength(u16);
         const list = try w.beginLength(u16);
@@ -413,15 +386,15 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
         var data = try scan.vector(u16);
         if (extension == .supported_versions) {
             // Only in answer to ours, and only for TLS 1.3.
-            if (!offers(opt, .tls_1_3)) return error.TlsUnsupportedExtension;
+            if (!policy.offers(opt, .tls_1_3)) return error.TlsUnsupportedExtension;
             if (try data.decode(proto.Version) != .tls_1_3) return error.TlsIllegalParameter;
             try data.expectEof();
             version = .tls_1_3;
         }
     }
     const offered = switch (version) {
-        .tls_1_3 => offers(opt, .tls_1_3),
-        .tls_1_2 => offers(opt, .tls_1_2),
+        .tls_1_3 => policy.offers(opt, .tls_1_3),
+        .tls_1_2 => policy.offers(opt, .tls_1_2),
         else => unreachable,
     };
     if (!offered) return error.TlsProtocolVersion;
@@ -429,7 +402,7 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
     if (std.mem.indexOfScalar(proto.CipherSuite, opt.cipher_suites, suite) == null) return error.TlsIllegalParameter;
     if (suite.version() != version) return error.TlsIllegalParameter;
 
-    if (version == .tls_1_2) return if (!proto.tls12_enabled) unreachable else .{ .tls12 = try parseServerHelloTls12(opt, random, session_id, echoed_session_id, suite, extensions) };
+    if (version == .tls_1_2) return .{ .tls12 = try parseServerHelloTls12(opt, random, session_id, echoed_session_id, suite, extensions) };
 
     const is_retry = std.mem.eql(u8, &random, &handshake.hello_retry_request_random);
     if (!std.mem.eql(u8, echoed_session_id, session_id)) return error.TlsIllegalParameter;
@@ -463,7 +436,7 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
 fn parseServerHelloTls12(opt: config.Client, random: [32]u8, session_id: []const u8, echoed_session_id: []const u8, suite: proto.CipherSuite, extensions: codec.Decoder) Error!tls12.ServerHello {
     // A server that could speak TLS 1.3 and chose an older version has
     // been tampered with, when we offered 1.3 (§4.2.3).
-    if (offers(opt, .tls_1_3)) {
+    if (policy.offers(opt, .tls_1_3)) {
         if (std.mem.eql(u8, random[24..], downgrade_tls12) or std.mem.eql(u8, random[24..], downgrade_tls11)) return error.TlsIllegalParameter;
     }
     // Our TLS 1.3 session ID back would be resuming a session we never
@@ -493,7 +466,7 @@ fn parseServerHelloTls12(opt: config.Client, random: [32]u8, session_id: []const
                 if (std.mem.indexOfScalar(u8, formats, 0) == null) return error.TlsIllegalParameter;
             },
             .application_layer_protocol_negotiation => hello.alpn = try parseAlpn(&data, opt),
-            .server_name => if (!sendsSni(opt.host)) return error.TlsUnsupportedExtension,
+            .server_name => if (!policy.sendsSni(opt.host)) return error.TlsUnsupportedExtension,
             // Not allowed here, but sent by some servers, so tolerated as
             // AWS-LC does.
             .supported_groups => continue,
@@ -537,7 +510,7 @@ fn parseEncryptedExtensions(body: []const u8, opt: config.Client) Error!?[]const
         switch (extension) {
             .application_layer_protocol_negotiation => alpn = try parseAlpn(&data, opt),
             // An acknowledgement of our SNI, which must have been sent.
-            .server_name => if (!sendsSni(opt.host)) return error.TlsUnsupportedExtension,
+            .server_name => if (!policy.sendsSni(opt.host)) return error.TlsUnsupportedExtension,
             // The server's preferences, for a later connection.
             .supported_groups => {},
             else => return error.TlsUnsupportedExtension,
@@ -607,14 +580,14 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair, s
         }
     }
     const n = offered_len orelse return error.TlsMissingExtension;
-    if (auth) |pair| request.scheme = handshake.selectScheme(signing, pair.key.key_type, offered[0..n], .tls13);
+    if (auth) |pair| request.scheme = policy.selectScheme(signing, pair.key.key_type, offered[0..n], .tls13);
     return request;
 }
 
 const testing = std.testing;
 
 test "a ServerHello must echo the session id and name TLS 1.3" {
-    const opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
+    const opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
     var session_id: [32]u8 = @splat(7);
     var buf: [256]u8 = undefined;
     var w = codec.Writer.init(&buf);
@@ -663,10 +636,9 @@ fn testServerHello(buf: []u8, version: proto.Version, random: *const [32]u8, ses
 }
 
 test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
-    if (!proto.tls12_enabled) return error.SkipZigTest;
     const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
-    const opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
-    const only13: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
+    const opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
+    const only13: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
     const ours: [32]u8 = @splat(7);
     const theirs: [32]u8 = @splat(9);
     var random: [32]u8 = @splat(0x5a);
@@ -698,7 +670,7 @@ test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
 
     // The downgrade sentinels, since we offered TLS 1.3 too, but not when
     // we offered TLS 1.2 alone.
-    const tls12_only: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &proto.CipherSuite.tls12 };
+    const tls12_only: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &proto.CipherSuite.tls12 };
     for ([_]*const [8]u8{ downgrade_tls12, downgrade_tls11 }) |sentinel| {
         random[24..].* = sentinel.*;
         try testing.expectError(error.TlsIllegalParameter, parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, null), opt, &ours));
@@ -741,48 +713,12 @@ test "a CertificateRequest needs a non-empty signature_algorithms" {
     }
 }
 
-test "a host longer than 255 bytes, or starting with a dot, is a misconfiguration" {
-    const long: [256]u8 = @splat('a');
-    try checkOptions(.{ .gpa = testing.allocator, .host = long[0..255], .insecure_skip_verify = true, .now = undefined });
-    try testing.expectError(error.TlsInternalError, checkOptions(.{ .gpa = testing.allocator, .host = &long, .insecure_skip_verify = true, .now = undefined }));
-    try testing.expectError(error.TlsInternalError, checkOptions(.{ .gpa = testing.allocator, .host = ".example.com", .insecure_skip_verify = true, .now = undefined }));
-}
-
-test "a key share for a group listed twice is a misconfiguration" {
-    const opt: config.Client = .{
-        .gpa = testing.allocator,
-        .host = "localhost",
-        .insecure_skip_verify = true,
-        .now = undefined,
-        .named_groups = &.{.secp256r1},
-        .key_shares = &.{ .secp256r1, .secp256r1 },
-    };
-    try testing.expectError(error.TlsInternalError, checkOptions(opt));
-}
-
-test "TLS 1.2 suites are refused in a build without TLS 1.2" {
-    const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
-    const opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
-    if (proto.tls12_enabled) {
-        try checkOptions(opt);
-    } else {
-        try testing.expectError(error.TlsInternalError, checkOptions(opt));
-        try checkOptions(.{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined });
-    }
-}
-
-test "the default suites put ChaCha20-Poly1305 first without AES hardware" {
-    const default: []const proto.CipherSuite = &config.default_cipher_suites;
-    try testing.expectEqual(default, offeredSuites(default, true));
-    const chacha = offeredSuites(default, false);
-    try testing.expectEqual(proto.CipherSuite.chacha20_poly1305_sha256, chacha[0]);
-    // The same suites, in an order of the same versions.
-    try testing.expectEqual(default.len, chacha.len);
-    for (default, chacha) |a, b| {
-        try testing.expect(std.mem.indexOfScalar(proto.CipherSuite, chacha, a) != null);
-        try testing.expectEqual(a.version(), b.version());
-    }
-    // A list of one's own is offered as given.
-    const own = [_]proto.CipherSuite{ .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
-    try testing.expectEqual(@as([]const proto.CipherSuite, &own), offeredSuites(&own, false));
+test "only groups with a key exchange are offered" {
+    var buf: [max_groups]proto.NamedGroup = undefined;
+    var opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .named_groups = &.{ .secp521r1, .x25519_ml_kem768, .x25519, .secp256r1 } };
+    try testing.expectEqualSlices(proto.NamedGroup, &.{ .x25519_ml_kem768, .x25519, .secp256r1 }, offeredGroups(opt, &buf));
+    opt.cipher_suites = &proto.CipherSuite.tls12;
+    try testing.expectEqualSlices(proto.NamedGroup, &.{ .x25519, .secp256r1 }, offeredGroups(opt, &buf));
+    opt.named_groups = &.{ .secp521r1, .x25519_ml_kem768 };
+    try testing.expectEqual(0, offeredGroups(opt, &buf).len);
 }

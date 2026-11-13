@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+- The `tls12` build option is gone; the TLS 1.2 client is always built in.
+- `config.Client` and `config.Server` take an `io`, which the libssl engine waits with; there, reads, writes and handshakes may fail with `Canceled`.
+
 ## [0.1.0] - 2026-11-11
 
 The first release. ztls is a TLS library for Zig on AWS-LC's libcrypto, for clients and servers on `std.Io` readers and writers, with independent read and write directions for one task reading while another writes.

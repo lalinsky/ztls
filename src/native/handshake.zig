@@ -5,11 +5,12 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const proto = @import("protocol.zig");
+const proto = @import("../protocol.zig");
 const codec = @import("codec.zig");
 const cipher = @import("cipher.zig");
-const config = @import("config.zig");
-const crypto = @import("crypto.zig");
+const config = @import("../config.zig");
+const policy = @import("../policy.zig");
+const crypto = @import("../crypto.zig");
 const kx = crypto.kx;
 const sig = crypto.sig;
 const x509 = crypto.x509;
@@ -20,81 +21,13 @@ const Connection = connection.Connection;
 
 const log = std.log.scoped(.ztls);
 
-/// What a handshake can fail with. `EndOfStream` is the peer going away
-/// before it was done; `ReadFailed`/`WriteFailed` are the transport's,
-/// whose own error says why.
-pub const Error = proto.LocalError || proto.Alert.Error || error{
-    ReadFailed,
-    WriteFailed,
-    EndOfStream,
-    OutOfMemory,
-};
+pub const Error = @import("../api.zig").Error;
 
 /// The ServerHello.random that makes it a HelloRetryRequest (§4.2.3).
 pub const hello_retry_request_random = [32]u8{
     0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 };
-
-/// The algorithm a scheme stands for when it signs a handshake in
-/// `version`: a CertificateVerify, or in TLS 1.2 a ServerKeyExchange too.
-/// Null for one that may not: the rsa_pkcs1 ones in TLS 1.3 (§4.2.3), and
-/// any scheme we do not implement.
-pub fn schemeAlgorithm(scheme: proto.SignatureScheme, version: cipher.Version) ?sig.Algorithm {
-    return switch (scheme) {
-        .ecdsa_secp256r1_sha256 => .ecdsa_sha256,
-        .ecdsa_secp384r1_sha384 => .ecdsa_sha384,
-        .ecdsa_secp521r1_sha512 => .ecdsa_sha512,
-        .ed25519 => .ed25519,
-        .rsa_pss_rsae_sha256 => .rsa_pss_sha256,
-        .rsa_pss_rsae_sha384 => .rsa_pss_sha384,
-        .rsa_pss_rsae_sha512 => .rsa_pss_sha512,
-        .rsa_pkcs1_sha256 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha256 else null,
-        .rsa_pkcs1_sha384 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha384 else null,
-        .rsa_pkcs1_sha512 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha512 else null,
-        else => null,
-    };
-}
-
-/// Whether a key of `key_type` may sign a handshake under `scheme` in
-/// `version`: the algorithm must suit the kind of key, and in TLS 1.3 an
-/// ECDSA scheme names the key's curve too (§4.2.3). TLS 1.2 schemes name
-/// only the hash (RFC 5246 §7.4.1.4.1); there the leaf's curve is checked
-/// against supported_groups instead.
-pub fn schemeSuits(scheme: proto.SignatureScheme, key_type: sig.KeyType, version: cipher.Version) bool {
-    const algorithm = schemeAlgorithm(scheme, version) orelse return false;
-    if (!algorithm.suits(key_type)) return false;
-    if (version == .tls12) return true;
-    const curve: sig.Curve = switch (scheme) {
-        .ecdsa_secp256r1_sha256 => .p256,
-        .ecdsa_secp384r1_sha384 => .p384,
-        .ecdsa_secp521r1_sha512 => .p521,
-        else => return true,
-    };
-    return switch (key_type) {
-        .ecdsa => |key_curve| key_curve == curve,
-        else => false,
-    };
-}
-
-/// Whether `schemes` are all ones we implement, none twice.
-pub fn schemesSupported(schemes: []const proto.SignatureScheme) bool {
-    for (schemes, 0..) |scheme, i| {
-        if (std.mem.indexOfScalar(proto.SignatureScheme, &config.default_signature_schemes, scheme) == null) return false;
-        if (std.mem.indexOfScalar(proto.SignatureScheme, schemes[0..i], scheme) != null) return false;
-    }
-    return true;
-}
-
-/// The scheme to sign with in `version`: the first of `ours` that the
-/// peer offered and that suits the key.
-pub fn selectScheme(ours: []const proto.SignatureScheme, key_type: sig.KeyType, offered: []const proto.SignatureScheme, version: cipher.Version) ?proto.SignatureScheme {
-    for (ours) |scheme| {
-        if (!schemeSuits(scheme, key_type, version)) continue;
-        if (std.mem.indexOfScalar(proto.SignatureScheme, offered, scheme) != null) return scheme;
-    }
-    return null;
-}
 
 pub fn groupSupported(group: proto.NamedGroup) bool {
     return switch (group) {
@@ -453,7 +386,6 @@ pub const Handshake = struct {
     /// `raw_transcript` is on.
     fn addTranscript(h: *Handshake, bytes: []const u8) Error!void {
         h.transcript.update(bytes);
-        if (!proto.tls12_enabled) return;
         if (h.raw_transcript) |*raw| try raw.appendSlice(h.gpa, bytes);
     }
 
@@ -692,14 +624,14 @@ pub const Handshake = struct {
     pub fn writeCertificateVerify(h: *Handshake, pair: *const config.CertKeyPair, scheme: proto.SignatureScheme, side: proto.Side) Error!void {
         var content_buf: [64 + 33 + 1 + crypto.hash.max_digest_length]u8 = undefined;
         const content = h.certificateVerifyContent(side, &content_buf);
-        try h.writeSignedCertificateVerify(pair, scheme, schemeAlgorithm(scheme, .tls13).?, content);
+        try h.writeSignedCertificateVerify(pair, scheme, policy.schemeAlgorithm(scheme, .tls13).?, content);
     }
 
     /// TLS 1.2's CertificateVerify (RFC 5246 §7.4.8): the handshake
     /// messages so far, signed whole, which `keepRawTranscript` kept.
     pub fn writeCertificateVerifyTls12(h: *Handshake, pair: *const config.CertKeyPair, scheme: proto.SignatureScheme) Error!void {
         const content = h.raw_transcript.?.items;
-        try h.writeSignedCertificateVerify(pair, scheme, schemeAlgorithm(scheme, .tls12).?, content);
+        try h.writeSignedCertificateVerify(pair, scheme, policy.schemeAlgorithm(scheme, .tls12).?, content);
     }
 
     fn writeSignedCertificateVerify(h: *Handshake, pair: *const config.CertKeyPair, scheme: proto.SignatureScheme, algorithm: sig.Algorithm, content: []const u8) Error!void {
@@ -808,28 +740,7 @@ pub const Handshake = struct {
     /// the name or IP literal a server must be certified for.
     pub fn verifyChain(h: *Handshake, peer: *const PeerCertificate, store: *const x509.TrustStore, purpose: x509.Purpose, host: ?[]const u8, now: i64) Error!void {
         _ = h;
-        var options: x509.VerifyOptions = .{ .now = now, .purpose = purpose };
-        // `options.ip` points into this.
-        var address: std.Io.net.IpAddress = undefined;
-        if (host) |name| {
-            if (std.Io.net.IpAddress.parse(name, 0)) |parsed| {
-                address = parsed;
-                options.ip = switch (address) {
-                    .ip4 => |*a| &a.bytes,
-                    .ip6 => |*a| &a.bytes,
-                };
-            } else |_| {
-                options.host = name;
-            }
-        }
-        x509.verify(store, peer.chain[0..peer.len], options) catch |err| return switch (err) {
-            error.CertificateExpired => error.CertificateExpired,
-            error.CertificateNotYetValid => error.CertificateNotYetValid,
-            error.UnknownCa => error.CertificateIssuerNotFound,
-            error.HostnameMismatch => error.CertificateHostMismatch,
-            error.BadCertificate => error.TlsBadCertificate,
-            error.CryptoFailed => error.TlsInternalError,
-        };
+        return policy.verifyChain(peer.chain[0..peer.len], store, purpose, host, now);
     }
 
     /// Checks a CertificateVerify against the transcript so far and the
@@ -841,8 +752,8 @@ pub const Handshake = struct {
         const signature = try d.vectorBytes(u16);
         try d.expectEof();
         if (std.mem.indexOfScalar(proto.SignatureScheme, accepted, scheme) == null) return error.TlsIllegalParameter;
-        if (!schemeSuits(scheme, public_key.key_type, .tls13)) return error.TlsIllegalParameter;
-        const algorithm = schemeAlgorithm(scheme, .tls13).?;
+        if (!policy.schemeSuits(scheme, public_key.key_type, .tls13)) return error.TlsIllegalParameter;
+        const algorithm = policy.schemeAlgorithm(scheme, .tls13).?;
         h.conn.peer_signature_scheme = scheme;
 
         var content_buf: [64 + 33 + 1 + crypto.hash.max_digest_length]u8 = undefined;
@@ -872,7 +783,7 @@ pub const Handshake = struct {
 };
 
 const testing = std.testing;
-const testu = @import("testu.zig");
+const testu = @import("../testu.zig");
 const Io = std.Io;
 
 test "key shares agree for every group" {
@@ -897,46 +808,10 @@ test "key shares agree for every group" {
     try testing.expectError(error.TlsInternalError, KeyShares.generate(&.{ .secp256r1, .x25519, .secp256r1 }));
 }
 
-test "scheme selection" {
-    try testing.expectEqual(proto.SignatureScheme.ecdsa_secp256r1_sha256, selectScheme(&config.default_signature_schemes, .{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp256r1_sha256 }, .tls13).?);
-    try testing.expectEqual(null, selectScheme(&config.default_signature_schemes, .{ .ecdsa = .p256 }, &.{ .rsa_pss_rsae_sha256, .ecdsa_secp384r1_sha384 }, .tls13));
-    try testing.expectEqual(proto.SignatureScheme.rsa_pss_rsae_sha384, selectScheme(&config.default_signature_schemes, .{ .rsa = 2048 }, &.{ .rsa_pkcs1_sha256, .rsa_pss_rsae_sha384 }, .tls13).?);
-    try testing.expectEqual(null, selectScheme(&config.default_signature_schemes, .{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls13)); // pkcs1 may not sign a CertificateVerify
-    try testing.expectEqual(proto.SignatureScheme.ed25519, selectScheme(&config.default_signature_schemes, .ed25519, &.{.ed25519}, .tls13).?);
-    // Our order, not the peer's; and only what we list.
-    try testing.expectEqual(proto.SignatureScheme.rsa_pss_rsae_sha512, selectScheme(&.{ .rsa_pss_rsae_sha512, .rsa_pss_rsae_sha256 }, .{ .rsa = 2048 }, &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha512 }, .tls13).?);
-    try testing.expectEqual(null, selectScheme(&.{.rsa_pss_rsae_sha384}, .{ .rsa = 2048 }, &.{.rsa_pss_rsae_sha256}, .tls13));
-}
-
-test "TLS 1.3 binds each ECDSA scheme to a curve" {
-    try testing.expect(schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p256 }, .tls13));
-    try testing.expect(!schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p384 }, .tls13));
-    try testing.expect(schemeSuits(.ecdsa_secp384r1_sha384, .{ .ecdsa = .p384 }, .tls13));
-    try testing.expect(!schemeSuits(.ecdsa_secp384r1_sha384, .{ .ecdsa = .p521 }, .tls13));
-    try testing.expect(schemeSuits(.ecdsa_secp521r1_sha512, .{ .ecdsa = .p521 }, .tls13));
-    try testing.expect(!schemeSuits(.ecdsa_secp521r1_sha512, .{ .rsa = 2048 }, .tls13));
-    try testing.expect(schemeSuits(.rsa_pss_rsae_sha256, .{ .rsa = 4096 }, .tls13));
-    try testing.expect(!schemeSuits(.rsa_pkcs1_sha256, .{ .rsa = 2048 }, .tls13));
-    try testing.expect(!schemeSuits(.ed25519, .{ .ecdsa = .p256 }, .tls13));
-}
-
-test "TLS 1.2 schemes name the hash only, and take PKCS#1 v1.5" {
-    if (!proto.tls12_enabled) return error.SkipZigTest;
-    try testing.expect(schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p384 }, .tls12));
-    try testing.expect(schemeSuits(.ecdsa_secp521r1_sha512, .{ .ecdsa = .p256 }, .tls12));
-    try testing.expect(!schemeSuits(.ecdsa_secp256r1_sha256, .{ .rsa = 2048 }, .tls12));
-    try testing.expect(schemeSuits(.rsa_pkcs1_sha256, .{ .rsa = 2048 }, .tls12));
-    try testing.expect(schemeSuits(.rsa_pss_rsae_sha512, .{ .rsa = 2048 }, .tls12));
-    try testing.expect(!schemeSuits(.rsa_pkcs1_sha384, .{ .ecdsa = .p384 }, .tls12));
-    try testing.expect(schemeSuits(.ed25519, .ed25519, .tls12));
-    try testing.expect(!schemeSuits(.rsa_pkcs1_sha1, .{ .rsa = 2048 }, .tls12));
-    try testing.expectEqual(proto.SignatureScheme.rsa_pkcs1_sha256, selectScheme(&config.default_signature_schemes, .{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls12).?);
-}
-
 test "a CertificateVerify under another curve's scheme is refused" {
     // A P-384 key's genuine ECDSA-SHA256 signature, labelled
     // ecdsa_secp256r1_sha256: valid cryptography, but not in TLS 1.3.
-    var key = try sig.PrivateKey.parsePem(testing.allocator, @embedFile("testdata/keys/ec_secp384r1_private_key.pem"));
+    var key = try sig.PrivateKey.parsePem(testing.allocator, @embedFile("../testdata/keys/ec_secp384r1_private_key.pem"));
     defer key.deinit();
     _ = crypto.c.EVP_PKEY_up_ref(key.pkey);
     var public = try sig.PublicKey.fromPkey(key.pkey);
@@ -971,7 +846,7 @@ test "a CertificateVerify under another curve's scheme is refused" {
 }
 
 test "certificate, certificate verify and finished round-trip through records" {
-    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-chain.pem"), @embedFile("testdata/pki/server-chain.key"));
+    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("../testdata/pki/server-chain.pem"), @embedFile("../testdata/pki/server-chain.key"));
     defer pair.deinit(testing.allocator);
 
     // The sender writes into a buffer large enough for everything.
@@ -1018,7 +893,7 @@ test "certificate, certificate verify and finished round-trip through records" {
     try testing.expectEqual(sig.KeyType{ .ecdsa = .p384 }, peer.public_key.key_type);
     var store = try x509.TrustStore.init();
     defer store.deinit();
-    try store.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+    try store.addPem(testing.allocator, @embedFile("../testdata/pki/ca.pem"));
     try receiver.verifyChain(&peer, &store, .server, "localhost", 1_800_000_000);
     try receiver.verifyChain(&peer, &store, .server, "127.0.0.1", 1_800_000_000);
     try testing.expectError(error.CertificateHostMismatch, receiver.verifyChain(&peer, &store, .server, "example.org", 1_800_000_000));
@@ -1044,7 +919,7 @@ test "certificate, certificate verify and finished round-trip through records" {
 }
 
 test "a flight goes out in one transport write" {
-    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
+    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("../testdata/pki/server-ec.pem"), @embedFile("../testdata/pki/server-ec.key"));
     defer pair.deinit(testing.allocator);
 
     var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
@@ -1218,7 +1093,7 @@ test "an empty certificate and the request context" {
 }
 
 test "the peer's chain is kept only when asked for" {
-    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-chain.pem"), @embedFile("testdata/pki/server-chain.key"));
+    var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("../testdata/pki/server-chain.pem"), @embedFile("../testdata/pki/server-chain.key"));
     defer pair.deinit(testing.allocator);
     for ([_]bool{ false, true }) |keep| {
         var counting: testu.CountingAllocator = .init(testing.allocator);

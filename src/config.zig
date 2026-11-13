@@ -194,23 +194,21 @@ pub const ClientAuth = struct {
     };
 };
 
-/// TLS 1.3's suites, then TLS 1.2's, for servers that have nothing newer,
-/// when the TLS 1.2 client is built in (`proto.tls12_enabled`).
-pub const default_cipher_suites = if (proto.tls12_enabled) proto.CipherSuite.all ++ proto.CipherSuite.tls12 else proto.CipherSuite.all;
+/// TLS 1.3's suites, then TLS 1.2's, for servers that have nothing newer.
+pub const default_cipher_suites = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
 /// `default_cipher_suites` with ChaCha20-Poly1305 first in each version,
 /// what a client offers on a machine without AES instructions.
 pub const default_cipher_suites_chacha_first = [_]proto.CipherSuite{
     .chacha20_poly1305_sha256,
     .aes_128_gcm_sha256,
     .aes_256_gcm_sha384,
-} ++ if (proto.tls12_enabled) [_]proto.CipherSuite{
     .ecdhe_ecdsa_with_chacha20_poly1305_sha256,
     .ecdhe_rsa_with_chacha20_poly1305_sha256,
     .ecdhe_ecdsa_with_aes_128_gcm_sha256,
     .ecdhe_rsa_with_aes_128_gcm_sha256,
     .ecdhe_ecdsa_with_aes_256_gcm_sha384,
     .ecdhe_rsa_with_aes_256_gcm_sha384,
-} else [_]proto.CipherSuite{};
+};
 /// The server's preference when ChaCha20-Poly1305 is the better choice.
 pub const default_server_cipher_suites_chacha_first = default_cipher_suites_chacha_first[0..proto.CipherSuite.all.len].*;
 /// The groups a client supports, in preference order.
@@ -238,6 +236,11 @@ pub const default_signature_schemes = [_]proto.SignatureScheme{
 };
 
 pub const Client = struct {
+    /// What the connection waits with: under `-Dimpl=libssl`, the reading
+    /// and the writing task take turns at libssl's state under a lock that
+    /// parks the waiting task rather than its thread. The native engine
+    /// does not use it.
+    io: std.Io,
     /// For the handshake's working memory, such as the peer's messages
     /// while they are reassembled. Nothing is kept after the handshake unless
     /// `keep_peer_certificates` is set; then it must stay valid until
@@ -257,15 +260,25 @@ pub const Client = struct {
     auth: ?*const CertKeyPair = null,
     /// Offered in this order. Any of `CipherSuite.tls12` among them offers
     /// TLS 1.2 too, after TLS 1.3; with only those, TLS 1.2 alone.
-    /// `CipherSuite.all` offers TLS 1.3 alone. TLS 1.2 suites in a build
-    /// without TLS 1.2 fail the handshake before anything is sent. The
-    /// default puts ChaCha20-Poly1305 first on a machine without AES
-    /// instructions (`default_cipher_suites_chacha_first`), as does a list
-    /// equal to it; any other list is offered as given.
+    /// `CipherSuite.all` offers TLS 1.3 alone. The default puts
+    /// ChaCha20-Poly1305 first on a machine without AES instructions
+    /// (`default_cipher_suites_chacha_first`), as does a list equal to it;
+    /// any other list is offered as given.
     cipher_suites: []const proto.CipherSuite = &default_cipher_suites,
+    /// In preference order, with at least one group ztls knows. Groups
+    /// the implementation has no key exchange for are not offered: the
+    /// native one has none for secp521r1, and refuses a list with nothing
+    /// else. In TLS 1.2 this also limits the curve of the server's ECDSA
+    /// certificate; there a P-521 one is taken when secp521r1 is listed.
     named_groups: []const proto.NamedGroup = &default_named_groups,
     /// Groups to send key shares for; each must be in `named_groups`, and
-    /// listed once.
+    /// listed once. The native implementation refuses secp521r1 here too.
+    ///
+    /// Not used under `-Dimpl=libssl`, where AWS-LC picks the shares: one
+    /// for the first of `named_groups`, and one for the first group after
+    /// it of the other kind, post-quantum or classical. With the default
+    /// `named_groups`, those are the default key shares. The rules above
+    /// are checked all the same.
     key_shares: []const proto.NamedGroup = &default_key_shares,
     /// Sent as signature_algorithms, and the only schemes the server may
     /// sign the handshake with: its CertificateVerify, or in TLS 1.2 its
@@ -289,6 +302,9 @@ pub const Client = struct {
     /// The longest Certificate or CertificateRequest message accepted
     /// from the peer. Other handshake messages are held to 16 KiB, or to
     /// this if it is less.
+    ///
+    /// Under `-Dimpl=libssl` every handshake message is held to this, but
+    /// to no less than 16 KiB.
     max_handshake_message_len: usize = 64 * 1024,
     /// Keep a copy of the server's certificate chain in
     /// `Connection.peer_certificates`, allocated through `gpa`.
@@ -296,6 +312,11 @@ pub const Client = struct {
 };
 
 pub const Server = struct {
+    /// What the connection waits with: under `-Dimpl=libssl`, the reading
+    /// and the writing task take turns at libssl's state under a lock that
+    /// parks the waiting task rather than its thread. The native engine
+    /// does not use it.
+    io: std.Io,
     /// For the handshake's working memory, such as the peer's messages
     /// while they are reassembled. Nothing is kept after the handshake unless
     /// `keep_peer_certificates` is set; then it must stay valid until
@@ -314,12 +335,21 @@ pub const Server = struct {
     /// `auth` are tried. Null leaves the choice to them.
     select_certificate: ?SelectCertificate = null,
     client_auth: ?ClientAuth = null,
-    /// In preference order. The server speaks TLS 1.3 only; TLS 1.2 suites
-    /// here are skipped. The default prefers ChaCha20-Poly1305 when either
-    /// side lacks AES instructions: this machine, or a client that lists
-    /// it first among the TLS 1.3 suites. So does a list equal to the
-    /// default; any other is followed as given.
+    /// In preference order, followed over the client's. The server speaks
+    /// TLS 1.3 only; TLS 1.2 suites here are skipped. The default prefers
+    /// ChaCha20-Poly1305 when either side lacks AES instructions: this
+    /// machine, or a client that lists it first among the TLS 1.3 suites.
+    /// So does a list equal to the default; any other is followed as
+    /// given. At least one TLS 1.3 suite.
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
+    /// In preference order, followed over the client's, with at least one
+    /// group ztls knows. Groups the implementation has no key exchange for
+    /// are passed over: the native one has none for secp521r1. The native
+    /// server takes its favourite of the groups the client sent a key
+    /// share for, and asks for another with a HelloRetryRequest only when
+    /// it can use none of them. Under `-Dimpl=libssl`, AWS-LC takes its
+    /// favourite of all the groups the client supports, asking for that
+    /// one's share when it was not sent.
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
     /// Sent in a CertificateRequest, and the only schemes a client
     /// certificate's key may sign with. Signatures inside the chain are
@@ -342,6 +372,9 @@ pub const Server = struct {
     /// The longest client Certificate message accepted. Other handshake
     /// messages, and all of them without `client_auth`, are held to
     /// 16 KiB, or to this if it is less.
+    ///
+    /// Under `-Dimpl=libssl`, with `client_auth` every handshake message is
+    /// held to this, but to no less than 16 KiB; without it, to 16 KiB.
     max_handshake_message_len: usize = 64 * 1024,
     /// Keep a copy of the client's certificate chain, if it sent one, in
     /// `Connection.peer_certificates`, allocated through `gpa`.

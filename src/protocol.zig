@@ -37,10 +37,6 @@ pub const HandshakeType = enum(u8) {
     _,
 };
 
-/// Whether the TLS 1.2 client is built in: the `tls12` build option,
-/// true unless `-Dtls12=false`. Without it the code is left out.
-pub const tls12_enabled = @import("build_options").tls12;
-
 pub const CipherSuite = enum(u16) {
     aes_128_gcm_sha256 = 0x1301,
     aes_256_gcm_sha384 = 0x1302,
@@ -59,8 +55,7 @@ pub const CipherSuite = enum(u16) {
     /// The TLS 1.3 suites.
     pub const all = [_]CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
     /// The TLS 1.2 suites a client may offer, in preference order. Listing
-    /// any of them in a client's `cipher_suites` offers TLS 1.2, in a
-    /// build with `tls12_enabled`.
+    /// any of them in a client's `cipher_suites` offers TLS 1.2.
     pub const tls12 = [_]CipherSuite{
         .ecdhe_ecdsa_with_aes_128_gcm_sha256,
         .ecdhe_rsa_with_aes_128_gcm_sha256,
@@ -267,6 +262,39 @@ pub const Alert = enum(u8) {
             .general_error => error.TlsAlertGeneralError,
             .no_application_protocol => error.TlsAlertNoApplicationProtocol,
             _ => error.TlsAlertUnknown,
+        };
+    }
+
+    /// The failure an alert we sent stands for: the reverse of
+    /// `forLocalError`.
+    pub fn localError(alert: Alert) LocalError {
+        return switch (alert) {
+            .unexpected_message => error.TlsUnexpectedMessage,
+            .bad_record_mac => error.TlsBadRecordMac,
+            .record_overflow => error.TlsRecordOverflow,
+            .handshake_failure => error.TlsHandshakeFailure,
+            .bad_certificate => error.TlsBadCertificate,
+            .unsupported_certificate => error.TlsUnsupportedCertificate,
+            .certificate_revoked => error.TlsCertificateRevoked,
+            .certificate_expired => error.CertificateExpired,
+            .certificate_unknown => error.TlsCertificateUnknown,
+            .illegal_parameter => error.TlsIllegalParameter,
+            .unknown_ca => error.CertificateIssuerNotFound,
+            .access_denied => error.TlsAccessDenied,
+            .decode_error => error.TlsDecodeError,
+            .decrypt_error => error.TlsDecryptError,
+            .protocol_version => error.TlsProtocolVersion,
+            .insufficient_security => error.TlsInsufficientSecurity,
+            .inappropriate_fallback => error.TlsInappropriateFallback,
+            .no_renegotiation => error.TlsNoRenegotiation,
+            .missing_extension => error.TlsMissingExtension,
+            .unsupported_extension => error.TlsUnsupportedExtension,
+            .unrecognized_name => error.TlsUnrecognizedName,
+            .bad_certificate_status_response => error.TlsBadCertificateStatusResponse,
+            .unknown_psk_identity => error.TlsUnknownPskIdentity,
+            .certificate_required => error.TlsCertificateRequired,
+            .no_application_protocol => error.TlsNoApplicationProtocol,
+            else => error.TlsInternalError,
         };
     }
 

@@ -3,10 +3,11 @@
 //! then the client's Finished (and certificate, if we asked).
 
 const std = @import("std");
-const proto = @import("protocol.zig");
+const proto = @import("../protocol.zig");
 const codec = @import("codec.zig");
-const config = @import("config.zig");
-const crypto = @import("crypto.zig");
+const config = @import("../config.zig");
+const policy = @import("../policy.zig");
+const crypto = @import("../crypto.zig");
 const handshake = @import("handshake.zig");
 const Handshake = handshake.Handshake;
 const KeyShares = handshake.KeyShares;
@@ -14,7 +15,7 @@ const Error = handshake.Error;
 const Connection = @import("connection.zig").Connection;
 
 pub fn run(conn: *Connection, options: config.Server) Error!void {
-    try checkOptions(options);
+    try policy.checkServer(options);
     // No Certificate is taken from a client that is not asked for one, so
     // nothing needs more than the small limit.
     const max_message_len = if (options.client_auth == null) @min(options.max_handshake_message_len, handshake.max_small_message_len) else options.max_handshake_message_len;
@@ -25,11 +26,6 @@ pub fn run(conn: *Connection, options: config.Server) Error!void {
         h.sendAlert(err);
         return err;
     };
-}
-
-fn checkOptions(opt: config.Server) error{TlsInternalError}!void {
-    if (opt.verify_schemes.len == 0 or opt.signing_schemes.len == 0) return error.TlsInternalError;
-    if (!handshake.schemesSupported(opt.verify_schemes) or !handshake.schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
 }
 
 /// What a ClientHello offers. Slices point into the message.
@@ -65,26 +61,6 @@ const ClientHello = struct {
         share: []const u8,
     };
 
-    /// The client's first TLS 1.3 suite: its favourite of those we could
-    /// pick, telling, if it is ChaCha20-Poly1305, that it lacks AES
-    /// instructions.
-    fn firstTls13Suite(ch: *const ClientHello) ?proto.CipherSuite {
-        var d = codec.Decoder.init(ch.suites);
-        while (!d.eof()) {
-            const suite = d.decode(proto.CipherSuite) catch unreachable;
-            if (suite.version() == .tls_1_3) return suite;
-        }
-        return null;
-    }
-
-    fn offersSuite(ch: *const ClientHello, suite: proto.CipherSuite) bool {
-        var d = codec.Decoder.init(ch.suites);
-        while (!d.eof()) {
-            if ((d.decode(proto.CipherSuite) catch unreachable) == suite) return true;
-        }
-        return false;
-    }
-
     fn supportsGroup(ch: *const ClientHello, group: proto.NamedGroup) bool {
         return std.mem.indexOfScalar(proto.NamedGroup, ch.groups[0..ch.groups_len], group) != null;
     }
@@ -107,8 +83,6 @@ const Choices = struct {
 
 fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     @setRuntimeSafety(true);
-    if (opt.cipher_suites.len == 0 or opt.named_groups.len == 0) return error.TlsInternalError;
-
     var msg = try h.nextMessage();
     try h.expect(msg, .client_hello);
     h.ccs_allowed = true;
@@ -224,7 +198,7 @@ fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const
         if (select.callback(select.context, info)) |pair| return pair;
     }
     for (opt.certificates) |pair| {
-        if (handshake.selectScheme(opt.signing_schemes, pair.key.key_type, schemes, .tls13) == null) continue;
+        if (policy.selectScheme(opt.signing_schemes, pair.key.key_type, schemes, .tls13) == null) continue;
         if (hello.server_name) |name| {
             if (!pair.leaf.matchesHost(name)) continue;
         }
@@ -234,17 +208,14 @@ fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const
 }
 
 fn acceptsKey(hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
-    return handshake.selectScheme(hello.signing_schemes, key_type, hello.schemes, .tls13) != null;
+    return policy.selectScheme(hello.signing_schemes, key_type, hello.schemes, .tls13) != null;
 }
 
 /// Picks the suite, group, signature scheme and ALPN protocol, or says
 /// why no handshake is possible.
 fn choose(hello: *const ClientHello, opt: config.Server, auth: *const config.CertKeyPair) Error!Choices {
     // The server speaks TLS 1.3 only: TLS 1.2 suites in the list are passed over.
-    const ours = preferredSuites(opt.cipher_suites, crypto.aead.hasAesHardware(), hello.firstTls13Suite());
-    const suite = for (ours) |suite| {
-        if (suite.version() == .tls_1_3 and hello.offersSuite(suite)) break suite;
-    } else return error.TlsHandshakeFailure;
+    const suite = policy.chooseSuite(opt.cipher_suites, hello.suites, crypto.aead.hasAesHardware()) orelse return error.TlsHandshakeFailure;
 
     // Of the groups the client sent shares for, our favourite; failing
     // that, our favourite among the ones it supports, via a retry.
@@ -255,19 +226,9 @@ fn choose(hello: *const ClientHello, opt: config.Server, auth: *const config.Cer
     } else return error.TlsHandshakeFailure;
 
     const schemes = hello.schemes[0..hello.schemes_len.?];
-    const scheme = handshake.selectScheme(opt.signing_schemes, auth.key.key_type, schemes, .tls13) orelse return error.TlsHandshakeFailure;
+    const scheme = policy.selectScheme(opt.signing_schemes, auth.key.key_type, schemes, .tls13) orelse return error.TlsHandshakeFailure;
 
     return .{ .suite = suite, .group = group, .scheme = scheme, .alpn = try selectAlpn(opt.alpn_protocols, hello.alpn) };
-}
-
-/// Our suites in preference order: the default list prefers
-/// ChaCha20-Poly1305 when either side lacks AES instructions, ours or the
-/// client's, which it tells by listing ChaCha20 first, as Go and BoringSSL
-/// servers have it.
-fn preferredSuites(suites: []const proto.CipherSuite, aes_hardware: bool, client_first: ?proto.CipherSuite) []const proto.CipherSuite {
-    if (!std.mem.eql(proto.CipherSuite, suites, &proto.CipherSuite.all)) return suites;
-    if (aes_hardware and client_first != .chacha20_poly1305_sha256) return suites;
-    return &config.default_server_cipher_suites_chacha_first;
 }
 
 /// Our most preferred protocol the client offered. Null when either side
@@ -509,14 +470,14 @@ fn buildCertificateRequest(w: *codec.Writer, verify_schemes: []const proto.Signa
 }
 
 const testing = std.testing;
-const data13 = @import("testdata/tls13.zig");
+const data13 = @import("../testdata/tls13.zig");
 
 test "parsing the example ClientHello" {
     const hello = try parseClientHello(data13.client_hello[9..]);
     try testing.expectEqual(32, hello.session_id.len);
-    try testing.expect(hello.offersSuite(.aes_256_gcm_sha384));
-    try testing.expect(hello.offersSuite(.chacha20_poly1305_sha256));
-    try testing.expect(!hello.offersSuite(@enumFromInt(0x1304)));
+    try testing.expectEqual(proto.CipherSuite.aes_256_gcm_sha384, policy.chooseSuite(&.{ @enumFromInt(0x1304), .aes_256_gcm_sha384 }, hello.suites, true));
+    try testing.expectEqual(proto.CipherSuite.chacha20_poly1305_sha256, policy.chooseSuite(&.{.chacha20_poly1305_sha256}, hello.suites, true));
+    try testing.expectEqual(null, policy.chooseSuite(&.{@enumFromInt(0x1304)}, hello.suites, true));
     try testing.expectEqualStrings("example.ulfheim.net", hello.server_name.?);
     try testing.expect(hello.supportsGroup(.x25519));
     try testing.expect(hello.supportsGroup(.secp384r1));
@@ -594,18 +555,4 @@ test "ALPN selection follows the server's order and refuses an offer with nothin
     try testing.expectEqual(null, try selectAlpn(&.{"h2"}, null));
     try testing.expectEqual(null, try selectAlpn(&.{}, offer));
     try testing.expectError(error.TlsIllegalParameter, selectAlpn(&.{"h2"}, "\x00"));
-}
-
-test "the default suites prefer ChaCha20-Poly1305 when either side lacks AES hardware" {
-    const default: []const proto.CipherSuite = &proto.CipherSuite.all;
-    try testing.expectEqual(default, preferredSuites(default, true, .aes_128_gcm_sha256));
-    try testing.expectEqual(default, preferredSuites(default, true, null));
-    for ([_]struct { bool, ?proto.CipherSuite }{ .{ false, .aes_128_gcm_sha256 }, .{ true, .chacha20_poly1305_sha256 } }) |case| {
-        const ours = preferredSuites(default, case[0], case[1]);
-        try testing.expectEqual(proto.CipherSuite.chacha20_poly1305_sha256, ours[0]);
-        try testing.expectEqual(default.len, ours.len);
-    }
-    // A list of one's own is followed as given.
-    const own = [_]proto.CipherSuite{.aes_128_gcm_sha256};
-    try testing.expectEqual(@as([]const proto.CipherSuite, &own), preferredSuites(&own, false, .chacha20_poly1305_sha256));
 }

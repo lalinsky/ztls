@@ -2,12 +2,16 @@
 //! processes: OpenSSL's `s_server` and `s_client`, and a Go echo peer
 //! (tests/go/echo) that brings X25519MLKEM768, which OpenSSL before 3.5
 //! lacks. Each is skipped when its tool is not on the PATH, and all of
-//! them on Windows.
+//! them on Windows. They run against the implementation being built
+//! (`-Dimpl`).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
-const ztls = @import("root.zig");
+const build_options = @import("build_options");
+const libssl_build = build_options.libssl;
+/// The implementation under test.
+const ztls = if (libssl_build) @import("root_libssl.zig") else @import("root_native.zig");
 const config = ztls.config;
 const proto = ztls.protocol;
 const testu = @import("testu.zig");
@@ -96,11 +100,14 @@ fn firstLine(peer: *Peer, buffer: []u8) ![]const u8 {
 fn requireOpenSsl(io: Io) ![]const u8 {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const peer = try Peer.spawn(io, &.{ "openssl", "version" }, .ignore, .pipe);
-    errdefer peer.abort();
+    // Until `finish`, which frees the peer whether or not it fails.
+    var peer_running = true;
+    errdefer if (peer_running) peer.abort();
     const S = struct {
         var line_buf: [256]u8 = undefined;
     };
     const line = try firstLine(peer, &S.line_buf);
+    peer_running = false;
     try peer.finish();
     if (!std.mem.startsWith(u8, line, "OpenSSL 3") and !std.mem.startsWith(u8, line, "OpenSSL 1.1.1")) return error.SkipZigTest;
     return line;
@@ -109,7 +116,7 @@ fn requireOpenSsl(io: Io) ![]const u8 {
 fn requireGo(io: Io) !void {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const peer = try Peer.spawn(io, &.{ "go", "version" }, .ignore, .ignore);
-    errdefer peer.abort();
+    // `finish` frees the peer whether or not it fails.
     peer.finish() catch return error.SkipZigTest;
 }
 
@@ -136,6 +143,12 @@ fn connectWhenListening(io: Io, port: u16) !Io.net.Stream {
             else => return err,
         };
     }
+}
+
+/// A cleartext writer that encrypts in place where the implementation
+/// can.
+fn writerOf(conn: *ztls.Connection, buffer: []u8) ztls.Connection.Writer {
+    return if (@hasDecl(ztls.Connection, "writerInPlace")) conn.writerInPlace() else conn.writer(buffer);
 }
 
 /// Our end's transport, pinned in place.
@@ -255,7 +268,6 @@ test "our client against openssl s_server" {
     defer client_pair.deinit(testing.allocator);
 
     for (cases) |case| {
-        if (case.tls12 and !proto.tls12_enabled) continue;
         const port = try freePort(io);
         var port_buf: [32]u8 = undefined;
         const accept = try std.fmt.bufPrint(&port_buf, "127.0.0.1:{d}", .{port});
@@ -281,12 +293,15 @@ test "our client against openssl s_server" {
         if (case.request_cert) try argv.appendSlice(testing.allocator, &.{ "-verify", "1", "-CAfile", pki ++ "ca.pem" });
 
         const peer = try Peer.spawn(io, argv.items, .ignore, .ignore);
-        errdefer peer.abort();
+        // Until `finish`, which frees the peer whether or not it fails.
+        var peer_running = true;
+        errdefer if (peer_running) peer.abort();
 
         var t: Transport = .{ .io = io, .stream = try connectWhenListening(io, port) };
         defer t.stream.close(io);
         t.setUp();
         var conn = try ztls.client(&t.input.interface, &t.output.interface, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &trust,
@@ -301,7 +316,8 @@ test "our client against openssl s_server" {
 
         var rbuf: [256]u8 = undefined;
         var r = conn.reader(&rbuf);
-        var w = conn.writerInPlace();
+        var wbuf: [1024]u8 = undefined;
+        var w = writerOf(&conn, &wbuf);
         try w.interface.writeAll("hello openssl\n");
         try w.interface.flush();
         try testing.expectEqualStrings("lssnepo olleh", (try r.interface.takeDelimiter('\n')).?);
@@ -309,12 +325,12 @@ test "our client against openssl s_server" {
         if (case.key_update) {
             // We update and ask; OpenSSL must answer with its own update
             // before its next record, which the reply below is.
-            const read_secret = conn.read.keys.?.version.tls13.secret;
+            const before = conn.keyUpdatesReceived();
             try w.requestKeyUpdate();
             try w.interface.writeAll("after update\n");
             try w.interface.flush();
             try testing.expectEqualStrings("etadpu retfa", (try r.interface.takeDelimiter('\n')).?);
-            try testing.expect(!std.mem.eql(u8, read_secret.slice(), conn.read.keys.?.version.tls13.secret.slice()));
+            try testing.expect(conn.keyUpdatesReceived() > before);
         }
         if (case.transfer > 0) {
             var sender = try io.concurrent(writePattern, .{ &w.interface, case.transfer });
@@ -324,6 +340,7 @@ test "our client against openssl s_server" {
         }
         try conn.close();
         try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+        peer_running = false;
         try peer.finish();
     }
 }
@@ -349,15 +366,15 @@ fn serveOnce(loopback: *testu.Loopback, options: config.Server, outcome: *Outcom
     defer conn.deinit();
     outcome.alpn = conn.alpn_protocol;
     outcome.peer_key_type = conn.peer_key_type;
-    const read_secret = conn.read.keys.?.version.tls13.secret;
     outcome.echo = echo(&conn);
-    outcome.read_keys_updated = !std.mem.eql(u8, read_secret.slice(), conn.read.keys.?.version.tls13.secret.slice());
+    outcome.read_keys_updated = conn.keyUpdatesReceived() > 0;
 }
 
 fn echo(conn: *ztls.Connection) !void {
     var rbuf: [1024]u8 = undefined;
     var r = conn.reader(&rbuf);
-    var w = conn.writerInPlace();
+    var wbuf: [1024]u8 = undefined;
+    var w = writerOf(conn, &wbuf);
     while (r.interface.takeDelimiter('\n') catch |err| return r.err orelse err) |line| {
         try w.interface.print("echo: {s}\n", .{line});
         try w.interface.flush();
@@ -413,6 +430,7 @@ test "openssl s_client against our server" {
         defer loopback.deinit();
         var outcome: Outcome = .{};
         var options: config.Server = .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .auth = case.cert,
             .now = valid_now,
@@ -442,7 +460,9 @@ test "openssl s_client against our server" {
         if (case.ciphersuites) |suites| try argv.appendSlice(testing.allocator, &.{ "-ciphersuites", suites });
 
         const peer = try Peer.spawn(io, argv.items, .pipe, .pipe);
-        errdefer peer.abort();
+        // Until `finish`, which frees the peer whether or not it fails.
+        var peer_running = true;
+        errdefer if (peer_running) peer.abort();
         var wbuf: [1024]u8 = undefined;
         var stdin = peer.child.stdin.?.writer(io, &wbuf);
         var rbuf: [1024]u8 = undefined;
@@ -475,6 +495,7 @@ test "openssl s_client against our server" {
         peer.child.stdin.?.close(io);
         peer.child.stdin = null;
         try testing.expectEqual(null, try stdout.interface.takeDelimiter('\n'));
+        peer_running = false;
         try peer.finish();
 
         try task.await(io);
@@ -512,7 +533,6 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
         .{ .groups = &.{.secp256r1}, .transfer = 1 << 20 },
     };
     for (cases) |case| {
-        if (case.tls12 and !proto.tls12_enabled) continue;
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(testing.allocator);
         try argv.appendSlice(testing.allocator, &.{
@@ -526,7 +546,9 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
         if (case.client_cert) try argv.appendSlice(testing.allocator, &.{ "-require-client-cert", "-ca", pki ++ "ca.pem" });
         if (case.tls12) try argv.append(testing.allocator, "-tls12");
         const peer = try Peer.spawn(io, argv.items, .ignore, .pipe);
-        errdefer peer.abort();
+        // Until `finish`, which frees the peer whether or not it fails.
+        var peer_running = true;
+        errdefer if (peer_running) peer.abort();
         var line_buf: [128]u8 = undefined;
         const ready = try firstLine(peer, &line_buf);
         if (!std.mem.startsWith(u8, ready, "READY ")) return error.PeerNotReady;
@@ -536,6 +558,7 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
         defer t.stream.close(io);
         t.setUp();
         var conn = try ztls.client(&t.input.interface, &t.output.interface, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &trust,
@@ -551,7 +574,8 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
 
         var rbuf: [256]u8 = undefined;
         var r = conn.reader(&rbuf);
-        var w = conn.writerInPlace();
+        var wbuf: [1024]u8 = undefined;
+        var w = writerOf(&conn, &wbuf);
         try w.interface.writeAll("hello go\n");
         try w.interface.flush();
         try testing.expectEqualStrings("echo: hello go", (try r.interface.takeDelimiter('\n')).?);
@@ -563,6 +587,7 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
         }
         try conn.close();
         try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+        peer_running = false;
         try peer.finish();
     }
 }
@@ -591,6 +616,7 @@ test "Go's crypto/tls against our server, with X25519MLKEM768" {
         defer loopback.deinit();
         var outcome: Outcome = .{};
         const options: config.Server = .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .auth = &ec,
             .now = valid_now,
@@ -608,7 +634,9 @@ test "Go's crypto/tls against our server, with X25519MLKEM768" {
         try argv.appendSlice(testing.allocator, &.{ "go", "run", go_echo, "-connect", connect, "-ca", pki ++ "ca.pem", "-alpn", "h2" });
         if (case.client_cert) try argv.appendSlice(testing.allocator, &.{ "-cert", pki ++ "client.pem", "-key", pki ++ "client.key" });
         const peer = try Peer.spawn(io, argv.items, .pipe, .pipe);
-        errdefer peer.abort();
+        // Until `finish`, which frees the peer whether or not it fails.
+        var peer_running = true;
+        errdefer if (peer_running) peer.abort();
         var wbuf: [1024]u8 = undefined;
         var stdin = peer.child.stdin.?.writer(io, &wbuf);
         var rbuf: [1024]u8 = undefined;
@@ -627,6 +655,7 @@ test "Go's crypto/tls against our server, with X25519MLKEM768" {
         peer.child.stdin.?.close(io);
         peer.child.stdin = null;
         try testing.expectEqual(null, try stdout.interface.takeDelimiter('\n'));
+        peer_running = false;
         try peer.finish();
 
         try task.await(io);
