@@ -622,19 +622,22 @@ test "signature scheme lists decide what each side signs with and accepts" {
     try testing.expectError(error.TlsCertificateRequired, outcome.handshake);
 }
 
-test "a server without a TLS 1.3 suite or a group ztls knows is refused before anything is read" {
+test "a server without a group ztls knows, or with no version in range, is refused before anything is read" {
     var pki = try Pki.init();
     defer pki.deinit();
     var input_buffer: [lib.input_buffer_len]u8 = undefined;
     var output_buffer: [lib.output_buffer_len]u8 = undefined;
     const base: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec };
-    var no_tls13 = base;
-    no_tls13.cipher_suites = &proto.CipherSuite.tls12;
     var no_groups = base;
     no_groups.named_groups = &.{};
     var unknown_groups = base;
     unknown_groups.named_groups = &.{ .x448, .ffdhe2048 };
-    for ([_]config.Server{ no_tls13, no_groups, unknown_groups }) |opt| {
+    var empty_range = base;
+    empty_range.min_version = .tls_1_3;
+    empty_range.max_version = .tls_1_2;
+    var unknown_version = base;
+    unknown_version.max_version = @enumFromInt(0x0305);
+    for ([_]config.Server{ no_groups, unknown_groups, empty_range, unknown_version }) |opt| {
         var input: Io.Reader = .fixed(&input_buffer);
         var discard: Io.Writer.Discarding = .init(&output_buffer);
         try testing.expectError(error.TlsInternalError, lib.server(&input, &discard.writer, opt));
@@ -642,7 +645,47 @@ test "a server without a TLS 1.3 suite or a group ztls knows is refused before a
     }
 }
 
-test "a client without a group ztls knows is refused before anything is sent" {
+test "the native server is refused without TLS 1.3 in range or among its suites" {
+    if (libssl_build) return error.SkipZigTest;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    var input_buffer: [lib.input_buffer_len]u8 = undefined;
+    var output_buffer: [lib.output_buffer_len]u8 = undefined;
+    const base: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec };
+    var no_tls13 = base;
+    no_tls13.cipher_suites = &proto.CipherSuite.tls12;
+    var tls12_range = base;
+    tls12_range.max_version = .tls_1_2;
+    for ([_]config.Server{ no_tls13, tls12_range }) |opt| {
+        var input: Io.Reader = .fixed(&input_buffer);
+        var discard: Io.Writer.Discarding = .init(&output_buffer);
+        try testing.expectError(error.TlsInternalError, lib.server(&input, &discard.writer, opt));
+        try testing.expectEqual(0, discard.count + discard.writer.end);
+    }
+}
+
+test "the native client is refused without a version it speaks, or with a suite it does not implement" {
+    if (libssl_build) return error.SkipZigTest;
+    var input_buffer: [lib.input_buffer_len]u8 = undefined;
+    var output_buffer: [lib.output_buffer_len]u8 = undefined;
+    const base: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true };
+    var old_range = base;
+    old_range.min_version = .tls_1_0;
+    old_range.max_version = .tls_1_1;
+    var tls12_suites_tls13_range = base;
+    tls12_suites_tls13_range.cipher_suites = &proto.CipherSuite.tls12;
+    tls12_suites_tls13_range.min_version = .tls_1_3;
+    var cbc = base;
+    cbc.cipher_suites = &.{ .aes_128_gcm_sha256, @enumFromInt(0x002f) };
+    for ([_]config.Client{ old_range, tls12_suites_tls13_range, cbc }) |opt| {
+        var input: Io.Reader = .fixed(&input_buffer);
+        var discard: Io.Writer.Discarding = .init(&output_buffer);
+        try testing.expectError(error.TlsInternalError, lib.client(&input, &discard.writer, opt));
+        try testing.expectEqual(0, discard.count + discard.writer.end);
+    }
+}
+
+test "a client without a group ztls knows, or with no version in range, is refused before anything is sent" {
     var input_buffer: [lib.input_buffer_len]u8 = undefined;
     var output_buffer: [lib.output_buffer_len]u8 = undefined;
     const base: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true };
@@ -651,7 +694,10 @@ test "a client without a group ztls knows is refused before anything is sent" {
     var unknown_groups = base;
     unknown_groups.named_groups = &.{ .x448, .ffdhe2048 };
     unknown_groups.key_shares = &.{.x448};
-    for ([_]config.Client{ no_groups, unknown_groups }) |opt| {
+    var empty_range = base;
+    empty_range.min_version = .tls_1_3;
+    empty_range.max_version = .tls_1_2;
+    for ([_]config.Client{ no_groups, unknown_groups, empty_range }) |opt| {
         var input: Io.Reader = .fixed(&input_buffer);
         var discard: Io.Writer.Discarding = .init(&output_buffer);
         try testing.expectError(error.TlsInternalError, lib.client(&input, &discard.writer, opt));
@@ -678,7 +724,7 @@ test "signature scheme lists must be ones we implement, each once" {
     var output_buffer: [lib.output_buffer_len]u8 = undefined;
     const bad = [_][]const proto.SignatureScheme{
         &.{},
-        &.{.rsa_pkcs1_sha1},
+        &.{.ed448},
         &.{ .ed25519, .ed25519 },
     };
     for (bad, 0..) |schemes, i| {
@@ -889,22 +935,47 @@ test "an empty host is a misconfiguration unless verification is off" {
     try testing.expectEqual(0, discard.count + discard.writer.end);
 }
 
-test "a client held to TLS 1.2 is refused by the TLS 1.3 server" {
+test "a client held to TLS 1.2 is refused by the native server, and served by libssl's" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    var by_suites: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca };
+    by_suites.cipher_suites = &proto.CipherSuite.tls12;
+    var by_range = by_suites;
+    by_range.cipher_suites = null;
+    by_range.max_version = .tls_1_2;
+    for ([_]config.Client{ by_suites, by_range }) |client_options| {
+        var run: Run(lib) = .{};
+        try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec });
+        defer run.deinit(io);
+        const result = clientOnce(lib, &run.loopback, client_options);
+        const outcome = try run.finish(io);
+        if (libssl_build) {
+            try testing.expectEqual(proto.Version.tls_1_2, (try result).version.?);
+            try outcome.handshake;
+        } else {
+            try testing.expectError(error.TlsAlertProtocolVersion, result);
+            try testing.expectError(error.TlsProtocolVersion, outcome.handshake);
+        }
+    }
+}
+
+test "a client held to TLS 1.3 takes TLS 1.3" {
     const io = testing.io;
     var pki = try Pki.init();
     defer pki.deinit();
     var run: Run(lib) = .{};
     try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec });
     defer run.deinit(io);
-    try testing.expectError(error.TlsAlertProtocolVersion, clientOnce(lib, &run.loopback, .{
+    const seen = try clientOnce(lib, &run.loopback, .{
         .io = testing.io,
         .gpa = testing.allocator,
         .host = "localhost",
         .root_ca = &pki.ca,
-        .cipher_suites = &proto.CipherSuite.tls12,
-    }));
-    const outcome = try run.finish(io);
-    try testing.expectError(error.TlsProtocolVersion, outcome.handshake);
+        .min_version = .tls_1_3,
+    });
+    try (try run.finish(io)).handshake;
+    try testing.expectEqual(proto.Version.tls_1_3, seen.version.?);
 }
 
 const data13 = @import("testdata/tls13.zig");

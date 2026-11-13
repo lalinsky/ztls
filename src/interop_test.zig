@@ -349,6 +349,8 @@ const Outcome = struct {
     peer_key_type: ?ztls.crypto.sig.KeyType = null,
     /// Whether the peer updated its keys at least once.
     read_keys_updated: bool = false,
+    version: ?proto.Version = null,
+    suite: ?proto.CipherSuite = null,
     echo: anyerror!void = {},
 };
 
@@ -363,6 +365,8 @@ fn serveOnce(loopback: *testu.Loopback, options: config.Server, outcome: *Outcom
     defer conn.deinit();
     outcome.alpn = conn.alpn_protocol;
     outcome.peer_key_type = conn.peer_key_type;
+    outcome.version = conn.version;
+    outcome.suite = conn.suite;
     outcome.echo = echo(&conn);
     outcome.read_keys_updated = conn.keyUpdatesReceived() > 0;
 }
@@ -501,6 +505,311 @@ test "openssl s_client against our server" {
         if (case.client_cert) try testing.expectEqual(ztls.crypto.sig.KeyType{ .ecdsa = .p256 }, outcome.peer_key_type.?);
         try testing.expectEqual(case.key_update, outcome.read_keys_updated);
     }
+}
+
+/// A peer held to a version or suite that only libssl speaks: TLS 1.2
+/// with CBC or RSA key exchange, or TLS 1.1 and 1.0, which OpenSSL 3
+/// allows only at security level 0.
+const LegacyCase = struct {
+    /// OpenSSL's version flag and suite.
+    flag: []const u8,
+    cipher: []const u8,
+    cert: []const u8,
+    version: proto.Version,
+    suite: proto.CipherSuite,
+    /// What the native client gets from a server it cannot talk to.
+    native_err: anyerror,
+};
+
+const legacy_cases = [_]LegacyCase{
+    .{ .flag = "-tls1_2", .cipher = "AES128-SHA", .cert = "server-rsa", .version = .tls_1_2, .suite = @enumFromInt(0x002f), .native_err = error.TlsAlertHandshakeFailure },
+    .{ .flag = "-tls1_2", .cipher = "ECDHE-ECDSA-AES128-SHA", .cert = "server-ec", .version = .tls_1_2, .suite = @enumFromInt(0xc009), .native_err = error.TlsAlertHandshakeFailure },
+    .{ .flag = "-tls1_1", .cipher = "ECDHE-RSA-AES128-SHA:@SECLEVEL=0", .cert = "server-rsa", .version = .tls_1_1, .suite = @enumFromInt(0xc013), .native_err = error.TlsAlertProtocolVersion },
+    .{ .flag = "-tls1", .cipher = "AES256-SHA:@SECLEVEL=0", .cert = "server-rsa", .version = .tls_1_0, .suite = @enumFromInt(0x0035), .native_err = error.TlsAlertProtocolVersion },
+};
+
+/// What our client settled with an `openssl s_server`.
+const ClientSeen = struct {
+    version: proto.Version,
+    suite: proto.CipherSuite,
+    peer_signature_scheme: ?proto.SignatureScheme,
+};
+
+/// Connects our client to `openssl s_server` with `args` added, once,
+/// and exchanges a line with it.
+fn sServerOnce(io: Io, cert: []const u8, args: []const []const u8, options: config.Client) !ClientSeen {
+    const port = try freePort(io);
+    var port_buf: [32]u8 = undefined;
+    const accept = try std.fmt.bufPrint(&port_buf, "127.0.0.1:{d}", .{port});
+    var cert_buf: [128]u8 = undefined;
+    var key_buf: [128]u8 = undefined;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(testing.allocator);
+    try argv.appendSlice(testing.allocator, &.{
+        "openssl", "s_server",                                                 "-accept", accept,
+        "-rev",    "-naccept",                                                 "1",       "-quiet",
+        "-cert",   try std.fmt.bufPrint(&cert_buf, pki ++ "{s}.pem", .{cert}), "-key",    try std.fmt.bufPrint(&key_buf, pki ++ "{s}.key", .{cert}),
+    });
+    try argv.appendSlice(testing.allocator, args);
+    const peer = try Peer.spawn(io, argv.items, .ignore, .ignore);
+    // Until `finish`, which frees the peer whether or not it fails.
+    var peer_running = true;
+    errdefer if (peer_running) peer.abort();
+
+    var t: Transport = .{ .io = io, .stream = try connectWhenListening(io, port) };
+    defer t.stream.close(io);
+    t.setUp();
+    var conn = try ztls.client(&t.input.interface, &t.output.interface, options);
+    defer conn.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = conn.reader(&rbuf);
+    var wbuf: [1024]u8 = undefined;
+    var w = writerOf(&conn, &wbuf);
+    try w.interface.writeAll("hello openssl\n");
+    try w.interface.flush();
+    try testing.expectEqualStrings("lssnepo olleh", (try r.interface.takeDelimiter('\n')).?);
+    try conn.close();
+    try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+    peer_running = false;
+    try peer.finish();
+    return .{ .version = conn.version.?, .suite = conn.suite.?, .peer_signature_scheme = conn.peer_signature_scheme };
+}
+
+/// Serves `openssl s_client` with `args` added, once. A line goes back
+/// and forth if the handshake succeeds; `echoed` says whether it did.
+fn sClientOnce(io: Io, options: config.Server, args: []const []const u8) !struct { outcome: Outcome, echoed: bool } {
+    var loopback = try testu.Loopback.init(io);
+    defer loopback.deinit();
+    var outcome: Outcome = .{};
+    var task = try io.concurrent(serveOnce, .{ &loopback, options, &outcome });
+    defer task.cancel(io) catch {};
+
+    var port_buf: [32]u8 = undefined;
+    const connect = try std.fmt.bufPrint(&port_buf, "127.0.0.1:{d}", .{loopback.server.socket.address.getPort()});
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(testing.allocator);
+    try argv.appendSlice(testing.allocator, &.{
+        "openssl",     "s_client",    "-connect", connect,
+        "-quiet",      "-no_ign_eof", "-CAfile",  pki ++ "ca.pem",
+        "-servername", "localhost",
+    });
+    try argv.appendSlice(testing.allocator, args);
+    const peer = try Peer.spawn(io, argv.items, .pipe, .pipe);
+    // Until `finish`, which frees the peer whether or not it fails.
+    var peer_running = true;
+    errdefer if (peer_running) peer.abort();
+    var wbuf: [1024]u8 = undefined;
+    var stdin = peer.child.stdin.?.writer(io, &wbuf);
+    var rbuf: [1024]u8 = undefined;
+    var stdout = peer.child.stdout.?.reader(io, &rbuf);
+
+    // A failed handshake ends s_client, so these may find it gone.
+    stdin.interface.writeAll("hello ztls\n") catch {};
+    stdin.interface.flush() catch {};
+    const line = stdout.interface.takeDelimiter('\n') catch null;
+    const echoed = if (line) |l| std.mem.eql(u8, l, "echo: hello ztls") else false;
+    // Closing its stdin makes s_client end the connection.
+    peer.child.stdin.?.close(io);
+    peer.child.stdin = null;
+    while (stdout.interface.takeDelimiter('\n') catch null) |_| {}
+    peer_running = false;
+    // s_client fails with the handshake; the outcome says how.
+    peer.finish() catch {};
+    try task.await(io);
+    return .{ .outcome = outcome, .echoed = echoed };
+}
+
+test "our client against a legacy openssl s_server: libssl connects, native refuses" {
+    const io = testing.io;
+    _ = try requireOpenSsl(io);
+    var trust = try ztls.TrustStore.init();
+    defer trust.deinit();
+    try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+    const options: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &trust };
+
+    for (legacy_cases) |case| {
+        const result = sServerOnce(io, case.cert, &.{ case.flag, "-cipher", case.cipher }, options);
+        if (!libssl_build) {
+            try testing.expectError(case.native_err, result);
+            continue;
+        }
+        const seen = try result;
+        try testing.expectEqual(case.version, seen.version);
+        try testing.expectEqual(case.suite, seen.suite);
+    }
+}
+
+test "a TLS 1.2 server that signs with SHA-1 only: libssl takes it by default, native when asked" {
+    const io = testing.io;
+    _ = try requireOpenSsl(io);
+    var trust = try ztls.TrustStore.init();
+    defer trust.deinit();
+    try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+    const args: []const []const u8 = &.{ "-tls1_2", "-sigalgs", "RSA+SHA1", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256:@SECLEVEL=0" };
+    var options: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &trust };
+    if (libssl_build) {
+        const seen = try sServerOnce(io, "server-rsa", args, options);
+        try testing.expectEqual(proto.SignatureScheme.rsa_pkcs1_sha1, seen.peer_signature_scheme.?);
+    } else {
+        try testing.expect(std.meta.isError(sServerOnce(io, "server-rsa", args, options)));
+    }
+    options.verify_schemes = &config.known_signature_schemes;
+    const seen = try sServerOnce(io, "server-rsa", args, options);
+    try testing.expectEqual(proto.SignatureScheme.rsa_pkcs1_sha1, seen.peer_signature_scheme.?);
+}
+
+test "the libssl client: a version range, and an Ed25519 certificate it cannot sign with before TLS 1.2" {
+    if (!libssl_build) return error.SkipZigTest;
+    const io = testing.io;
+    _ = try requireOpenSsl(io);
+    var trust = try ztls.TrustStore.init();
+    defer trust.deinit();
+    try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+    var options: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &trust };
+
+    // Held to TLS 1.3, against a TLS 1.2 server.
+    options.min_version = .tls_1_3;
+    try testing.expectError(error.TlsAlertProtocolVersion, sServerOnce(io, "server-ec", &.{"-tls1_2"}, options));
+    options.min_version = null;
+
+    // Asked for a certificate by a TLS 1.1 server that does not require
+    // one: an Ed25519 key cannot sign there, so none goes out.
+    var ed = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ed25519.pem"), @embedFile("testdata/pki/server-ed25519.key"));
+    defer ed.deinit(testing.allocator);
+    options.auth = &ed;
+    const seen = try sServerOnce(io, "server-rsa", &.{ "-tls1_1", "-cipher", "ECDHE-RSA-AES128-SHA:@SECLEVEL=0", "-verify", "1", "-CAfile", pki ++ "ca.pem" }, options);
+    try testing.expectEqual(proto.Version.tls_1_1, seen.version);
+}
+
+test "a legacy openssl s_client against our libssl server" {
+    if (!libssl_build) return error.SkipZigTest;
+    const io = testing.io;
+    _ = try requireOpenSsl(io);
+    var ec = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
+    defer ec.deinit(testing.allocator);
+    var rsa = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
+    defer rsa.deinit(testing.allocator);
+
+    for (legacy_cases) |case| {
+        const options: config.Server = .{
+            .io = testing.io,
+            .gpa = testing.allocator,
+            .auth = if (std.mem.eql(u8, case.cert, "server-ec")) &ec else &rsa,
+        };
+        const result = try sClientOnce(io, options, &.{ case.flag, "-cipher", case.cipher, "-verify_return_error" });
+        try result.outcome.handshake;
+        try result.outcome.echo;
+        try testing.expect(result.echoed);
+        try testing.expectEqual(case.version, result.outcome.version.?);
+        try testing.expectEqual(case.suite, result.outcome.suite.?);
+    }
+}
+
+test "the libssl server: version ranges, suite lists, client certificates and SHA-1" {
+    if (!libssl_build) return error.SkipZigTest;
+    const io = testing.io;
+    _ = try requireOpenSsl(io);
+    var trust = try ztls.TrustStore.init();
+    defer trust.deinit();
+    try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
+    var rsa = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
+    defer rsa.deinit(testing.allocator);
+    const base: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = &rsa };
+
+    // Held to TLS 1.2 at most, against a client that offers 1.3 too.
+    var capped = base;
+    capped.max_version = .tls_1_2;
+    var result = try sClientOnce(io, capped, &.{});
+    try result.outcome.handshake;
+    try testing.expectEqual(proto.Version.tls_1_2, result.outcome.version.?);
+
+    // Held to TLS 1.2 at least, against a TLS 1.1 client.
+    var floor = base;
+    floor.min_version = .tls_1_2;
+    result = try sClientOnce(io, floor, &.{ "-tls1_1", "-cipher", "ECDHE-RSA-AES128-SHA:@SECLEVEL=0" });
+    try testing.expectError(error.TlsProtocolVersion, result.outcome.handshake);
+
+    // A list with one legacy suite is followed strictly.
+    var listed = base;
+    listed.cipher_suites = &.{ .aes_128_gcm_sha256, @enumFromInt(0x002f) };
+    result = try sClientOnce(io, listed, &.{"-tls1_2"});
+    try result.outcome.handshake;
+    try testing.expectEqual(@as(proto.CipherSuite, @enumFromInt(0x002f)), result.outcome.suite.?);
+    result = try sClientOnce(io, listed, &.{ "-tls1_2", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256" });
+    try testing.expectError(error.TlsHandshakeFailure, result.outcome.handshake);
+
+    // A client certificate over TLS 1.2.
+    var auth = base;
+    auth.client_auth = .{ .root_ca = &trust, .auth_type = .require };
+    result = try sClientOnce(io, auth, &.{ "-tls1_2", "-cert", pki ++ "client.pem", "-key", pki ++ "client.key" });
+    try result.outcome.handshake;
+    try testing.expectEqual(ztls.crypto.sig.KeyType{ .ecdsa = .p256 }, result.outcome.peer_key_type.?);
+
+    // A TLS 1.2 client that takes SHA-1 signatures only.
+    result = try sClientOnce(io, base, &.{ "-tls1_2", "-sigalgs", "RSA+SHA1", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256:@SECLEVEL=0" });
+    try result.outcome.handshake;
+    try testing.expect(result.echoed);
+}
+
+/// Signs as the key would, and counts.
+const CountingSigner = struct {
+    calls: usize = 0,
+
+    fn sign(context: ?*anyopaque, key: *const config.PrivateKey, algorithm: ztls.crypto.sig.Algorithm, message: []const u8, out: []u8) anyerror![]u8 {
+        const self: *CountingSigner = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        return key.sign(algorithm, message, out);
+    }
+};
+
+test "the libssl server picks a certificate older clients can use, and keeps a signer from RSA key exchange" {
+    if (!libssl_build) return error.SkipZigTest;
+    const io = testing.io;
+    _ = try requireOpenSsl(io);
+    var rsa = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
+    defer rsa.deinit(testing.allocator);
+    var ed = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ed25519.pem"), @embedFile("testdata/pki/server-ed25519.key"));
+    defer ed.deinit(testing.allocator);
+    var signed = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
+    defer signed.deinit(testing.allocator);
+    var signer: CountingSigner = .{};
+    signed.signer = .{ .context = &signer, .sign = CountingSigner.sign };
+    const tls11: []const []const u8 = &.{ "-tls1_1", "-cipher", "ECDHE-RSA-AES128-SHA:@SECLEVEL=0" };
+
+    // Before TLS 1.2: not the Ed25519 certificate, nor one with a signer.
+    var result = try sClientOnce(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .certificates = &.{ &ed, &signed, &rsa } }, tls11);
+    try result.outcome.handshake;
+    try testing.expectEqual(0, signer.calls);
+
+    // The application's choice, told what the client can verify.
+    const Picker = struct {
+        offered: []const *const ztls.CertKeyPair,
+        fn pick(context: ?*anyopaque, hello: config.SelectCertificate.Hello) ?*const ztls.CertKeyPair {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            for (self.offered) |pair| {
+                if (hello.acceptsKey(pair.key.key_type)) return pair;
+            }
+            return null;
+        }
+    };
+    var picker: Picker = .{ .offered = &.{ &ed, &rsa } };
+    const picking: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .select_certificate = .{ .context = &picker, .callback = Picker.pick } };
+    result = try sClientOnce(io, picking, tls11);
+    try result.outcome.handshake;
+    // In TLS 1.2, PKCS#1 v1.5 signs too.
+    result = try sClientOnce(io, picking, &.{ "-tls1_2", "-sigalgs", "RSA+SHA256" });
+    try result.outcome.handshake;
+
+    // A signer's certificate, to a client that offers RSA key exchange
+    // first: ECDHE is chosen instead, and with nothing else, the
+    // handshake fails.
+    const signing: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = &signed };
+    result = try sClientOnce(io, signing, &.{ "-tls1_2", "-cipher", "AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256" });
+    try result.outcome.handshake;
+    try testing.expectEqual(proto.CipherSuite.ecdhe_rsa_with_aes_128_gcm_sha256, result.outcome.suite.?);
+    try testing.expectEqual(1, signer.calls);
+    result = try sClientOnce(io, signing, &.{ "-tls1_2", "-cipher", "AES128-GCM-SHA256" });
+    try testing.expectError(error.TlsHandshakeFailure, result.outcome.handshake);
 }
 
 const go_echo = "tests/go/echo/main.go";

@@ -648,7 +648,7 @@ pub const Connection = struct {
     }
 
     /// Asks the peer to update its keys, updating ours, and sends the
-    /// request. Does nothing in TLS 1.2, which has no KeyUpdate. After a
+    /// request. Does nothing before TLS 1.3, which has no KeyUpdate. After a
     /// transport failure the update may have happened with only the flush
     /// left; calling this again makes another update.
     fn requestKeyUpdate(conn: *Connection) WriteError!void {
@@ -743,7 +743,7 @@ pub const Connection = struct {
         }
 
         /// Sends what is buffered, then asks the peer to update its keys,
-        /// updating ours first. Does nothing in TLS 1.2.
+        /// updating ours first. Does nothing before TLS 1.3.
         pub fn requestKeyUpdate(self: *Writer) WriteError!void {
             self.interface.flush() catch return self.err.?;
             self.conn.requestKeyUpdate() catch |err| {
@@ -815,10 +815,13 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Han
     const ssl = conn.ssl;
     c.SSL_set_connect_state(ssl);
 
-    const offers_tls12 = policy.offers(options, .tls_1_2);
-    const offers_tls13 = policy.offers(options, .tls_1_3);
-    try setVersions(ssl, if (offers_tls12) c.TLS1_2_VERSION else c.TLS1_3_VERSION, if (offers_tls13) c.TLS1_3_VERSION else c.TLS1_2_VERSION);
-    try setCipherSuites(ssl, policy.offeredSuites(options.cipher_suites, crypto.aead.hasAesHardware()));
+    if (options.cipher_suites) |suites| {
+        const ours = policy.offeredSuites(suites, crypto.aead.hasAesHardware());
+        try setVersions(ssl, options.min_version, options.max_version, ours);
+        try setCipherSuites(ssl, ours);
+    } else {
+        try setVersions(ssl, options.min_version, options.max_version, null);
+    }
     try setPreferences(ssl, options.named_groups, options.signing_schemes, options.verify_schemes);
     // libssl holds every handshake message to this, but to no less than
     // 16 KiB.
@@ -860,9 +863,8 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Han
     // `selectSuiteCallback`.
     _ = c.SSL_set_options(ssl, c.SSL_OP_CIPHER_SERVER_PREFERENCE);
 
-    // The server speaks TLS 1.3 only, as the native one does.
-    try setVersions(ssl, c.TLS1_3_VERSION, c.TLS1_3_VERSION);
-    try setCipherSuites(ssl, options.cipher_suites);
+    try setVersions(ssl, options.min_version, options.max_version, options.cipher_suites);
+    if (options.cipher_suites) |suites| try setCipherSuites(ssl, suites);
     try setPreferences(ssl, options.named_groups, options.signing_schemes, options.verify_schemes);
     // libssl holds every handshake message to this, but to no less than
     // 16 KiB.
@@ -883,13 +885,29 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Han
     return conn;
 }
 
-fn setVersions(ssl: *c.SSL, min: u16, max: u16) error{TlsInternalError}!void {
-    if (c.SSL_set_min_proto_version(ssl, min) != 1) return error.TlsInternalError;
-    if (c.SSL_set_max_proto_version(ssl, max) != 1) return error.TlsInternalError;
+/// The versions in range, AWS-LC's TLS 1.0 to 1.3 for a null bound, and
+/// with a list of `suites`, only those it has a suite for: TLS 1.3's are
+/// its own, every other is for the versions before it.
+fn setVersions(ssl: *c.SSL, min: ?proto.Version, max: ?proto.Version, suites: ?[]const proto.CipherSuite) error{TlsInternalError}!void {
+    var low: u16 = if (min) |v| @intFromEnum(v) else c.TLS1_VERSION;
+    var high: u16 = if (max) |v| @intFromEnum(v) else c.TLS1_3_VERSION;
+    if (suites) |list| {
+        var tls13 = false;
+        var older = false;
+        for (list) |suite| {
+            if (suite.version() == .tls_1_3) tls13 = true else older = true;
+        }
+        if (!tls13) high = @min(high, c.TLS1_2_VERSION);
+        if (!older) low = @max(low, c.TLS1_3_VERSION);
+    }
+    if (low > high) return error.TlsInternalError;
+    if (c.SSL_set_min_proto_version(ssl, low) != 1) return error.TlsInternalError;
+    if (c.SSL_set_max_proto_version(ssl, high) != 1) return error.TlsInternalError;
 }
 
 /// Hands libssl the suites in our order: TLS 1.3's by their standard
-/// names, TLS 1.2's by OpenSSL's.
+/// names, the others by OpenSSL's. A suite AWS-LC does not know is
+/// refused.
 fn setCipherSuites(ssl: *c.SSL, suites: []const proto.CipherSuite) error{TlsInternalError}!void {
     var tls13: [512]u8 = undefined;
     var tls12: [1024]u8 = undefined;
@@ -910,12 +928,12 @@ fn setCipherSuites(ssl: *c.SSL, suites: []const proto.CipherSuite) error{TlsInte
 }
 
 /// Groups and signature schemes in our order. libssl's own defaults
-/// differ: its client offers no Ed25519, for one.
+/// differ: its client takes no Ed25519, for one.
 fn setPreferences(
     ssl: *c.SSL,
     groups: []const proto.NamedGroup,
-    signing: []const proto.SignatureScheme,
-    verify: []const proto.SignatureScheme,
+    signing: ?[]const proto.SignatureScheme,
+    verify: ?[]const proto.SignatureScheme,
 ) error{TlsInternalError}!void {
     // Room for each group ztls knows: the switch below.
     var nids: [5]c_int = undefined;
@@ -936,8 +954,8 @@ fn setPreferences(
         n += 1;
     }
     if (n == 0 or c.SSL_set1_groups(ssl, &nids, n) != 1) return error.TlsInternalError;
-    try setSchemes(ssl, signing, c.SSL_set_signing_algorithm_prefs);
-    try setSchemes(ssl, verify, c.SSL_set_verify_algorithm_prefs);
+    try setSchemes(ssl, signing orelse libssl_schemes, c.SSL_set_signing_algorithm_prefs);
+    try setSchemes(ssl, verify orelse libssl_schemes, c.SSL_set_verify_algorithm_prefs);
 }
 
 fn setSchemes(ssl: *c.SSL, schemes: []const proto.SignatureScheme, set: anytype) error{TlsInternalError}!void {
@@ -1002,9 +1020,17 @@ const Signing = struct {
 /// libssl's interface to keys it does not hold: ours, for the signer hook.
 const key_method: c.SSL_PRIVATE_KEY_METHOD = .{
     .sign = signCallback,
-    .decrypt = null,
+    .decrypt = decryptCallback,
     .complete = completeCallback,
 };
+
+/// RSA key exchange, which `dropRsaKeyExchange` keeps away from a
+/// signer's certificate; libssl calls this without checking for it.
+fn decryptCallback(ssl: ?*c.SSL, out: [*c]u8, out_len: [*c]usize, max_out: usize, in: [*c]const u8, in_len: usize) callconv(.c) c.enum_ssl_private_key_result_t {
+    _ = .{ out, out_len, max_out, in, in_len };
+    connectionOf(ssl).callback_error = error.TlsInternalError;
+    return c.ssl_private_key_failure;
+}
 
 /// Gives the connection a certificate chain and its key, or its signer.
 fn setCertificate(conn: *Connection, pair: *const config.CertKeyPair) HandshakeError!void {
@@ -1102,8 +1128,7 @@ fn clientCertificateCallback(ssl: ?*c.SSL, arg: ?*anyopaque) callconv(.c) c_int 
     var algs: [*c]const u16 = null;
     const len = c.SSL_get0_peer_verify_algorithms(ssl, &algs);
     const theirs: []const proto.SignatureScheme = if (len == 0) &.{} else @ptrCast(algs[0..len]);
-    const version: policy.Version = if (c.SSL_version(ssl) == c.TLS1_2_VERSION) .tls12 else .tls13;
-    if (policy.selectScheme(opt.signing_schemes, pair.key.key_type, theirs, version) == null) return 1;
+    if (!pairSigns(ssl.?, pair, opt.signing_schemes orelse libssl_schemes, theirs)) return 1;
     setCertificate(conn, pair) catch |err| {
         conn.callback_error = err;
         return 0;
@@ -1125,8 +1150,8 @@ fn signCallback(
     _ = .{ out, out_len, max_out };
     const conn = connectionOf(ssl);
     const scheme: proto.SignatureScheme = @enumFromInt(signature_algorithm);
-    const version: policy.Version = if (c.SSL_version(ssl) == c.TLS1_2_VERSION) .tls12 else .tls13;
-    const algorithm = policy.schemeAlgorithm(scheme, version) orelse {
+    // Never before TLS 1.2: `pairSigns` passes a signer over there.
+    const algorithm = policy.schemeAlgorithm(scheme, schemeRules(ssl.?) orelse .tls12) orelse {
         conn.callback_error = error.TlsInternalError;
         return c.ssl_private_key_failure;
     };
@@ -1264,21 +1289,26 @@ fn serverNameCallback(ssl: ?*c.SSL, alert: ?*c_int, arg: ?*anyopaque) callconv(.
 
 fn selectCertificate(conn: *Connection) HandshakeError!void {
     const opt = conn.options.server;
+    const ssl = conn.ssl;
+    const signing = opt.signing_schemes orelse libssl_schemes;
     var schemes_buf: [all_schemes.len]proto.SignatureScheme = undefined;
-    const schemes = offeredSchemes(conn.ssl, &schemes_buf);
-    const server_name: ?[]const u8 = if (c.SSL_get_servername(conn.ssl, c.TLSEXT_NAMETYPE_host_name)) |name| std.mem.span(name) else null;
+    const schemes = offeredSchemes(ssl, &schemes_buf);
+    const server_name: ?[]const u8 = if (c.SSL_get_servername(ssl, c.TLSEXT_NAMETYPE_host_name)) |name| std.mem.span(name) else null;
     const pair = choice: {
         if (opt.select_certificate) |select| {
             const info: config.SelectCertificate.Hello = .{
                 .server_name = server_name,
-                .accepts = acceptsKey,
+                .accepts = if (schemeRules(ssl)) |version| switch (version) {
+                    .tls13 => acceptsKey(.tls13),
+                    .tls12 => acceptsKey(.tls12),
+                } else acceptsKeyLegacy,
                 .schemes = schemes,
-                .signing_schemes = opt.signing_schemes,
+                .signing_schemes = signing,
             };
             if (select.callback(select.context, info)) |pair| break :choice pair;
         }
         for (opt.certificates) |pair| {
-            if (policy.selectScheme(opt.signing_schemes, pair.key.key_type, schemes, .tls13) == null) continue;
+            if (!pairSigns(ssl, pair, signing, schemes)) continue;
             if (server_name) |name| {
                 if (!pair.leaf.matchesHost(name)) continue;
             }
@@ -1287,19 +1317,63 @@ fn selectCertificate(conn: *Connection) HandshakeError!void {
         break :choice opt.auth orelse return error.TlsUnrecognizedName;
     };
     try setCertificate(conn, pair);
+    // RSA key exchange decrypts with the key, which a signer cannot.
+    if (pair.signer != null and c.SSL_version(ssl) <= c.TLS1_2_VERSION) try dropRsaKeyExchange(ssl);
 }
 
-fn acceptsKey(hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
-    return policy.selectScheme(hello.signing_schemes, key_type, hello.schemes, .tls13) != null;
+/// The signature scheme rules of the version libssl negotiated, null
+/// before TLS 1.2, which has none.
+fn schemeRules(ssl: *const c.SSL) ?policy.Version {
+    return switch (c.SSL_version(ssl)) {
+        c.TLS1_3_VERSION => .tls13,
+        c.TLS1_2_VERSION => .tls12,
+        else => null,
+    };
 }
 
-const all_schemes = &config.default_signature_schemes;
+/// Whether `pair` can sign this handshake for a peer that takes `theirs`:
+/// under one of `ours` that suits its key, or before TLS 1.2, which has
+/// no schemes, with an RSA or ECDSA key and without a signer, since
+/// libssl then signs MD5-SHA1 or SHA-1 digests that name no algorithm.
+/// Empty `ours` signs nothing either way.
+fn pairSigns(ssl: *const c.SSL, pair: *const config.CertKeyPair, ours: []const proto.SignatureScheme, theirs: []const proto.SignatureScheme) bool {
+    const version = schemeRules(ssl) orelse return ours.len > 0 and pair.signer == null and legacyKey(pair.key.key_type);
+    return policy.selectScheme(ours, pair.key.key_type, theirs, version) != null;
+}
+
+fn legacyKey(key_type: crypto.sig.KeyType) bool {
+    return key_type == .rsa or key_type == .ecdsa;
+}
+
+fn acceptsKey(comptime version: policy.Version) *const fn (hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
+    return struct {
+        fn accepts(hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
+            return policy.selectScheme(hello.signing_schemes, key_type, hello.schemes, version) != null;
+        }
+    }.accepts;
+}
+
+fn acceptsKeyLegacy(hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
+    _ = hello;
+    return legacyKey(key_type);
+}
+
+/// The schemes for a null `signing_schemes` or `verify_schemes`: the
+/// native defaults, then TLS 1.2's SHA-1 ones, which AWS-LC takes too.
+const libssl_schemes = &config.known_signature_schemes;
+
+const all_schemes = libssl_schemes;
 
 /// The client's signature_algorithms that ztls supports, in its order,
-/// each once, as the native server collects them.
+/// each once, as the native server collects them. A TLS 1.2 client that
+/// sends none takes the SHA-1 ones (RFC 5246 §7.4.1.4.1).
 fn offeredSchemes(ssl: *c.SSL, buf: *[all_schemes.len]proto.SignatureScheme) []const proto.SignatureScheme {
     var ids: [*c]const u16 = null;
     const len = c.SSL_get0_peer_verify_algorithms(ssl, &ids);
+    if (len == 0 and c.SSL_version(ssl) == c.TLS1_2_VERSION) {
+        buf[0..2].* = .{ .rsa_pkcs1_sha1, .ecdsa_sha1 };
+        return buf[0..2];
+    }
     var n: usize = 0;
     for (0..len) |i| {
         const scheme: proto.SignatureScheme = @enumFromInt(ids[i]);
@@ -1309,6 +1383,30 @@ fn offeredSchemes(ssl: *c.SSL, buf: *[all_schemes.len]proto.SignatureScheme) []c
         n += 1;
     }
     return buf[0..n];
+}
+
+/// Takes RSA key exchange out of libssl's suites before TLS 1.3, for a
+/// certificate whose key only a signer holds. A peer that offers nothing
+/// else gets handshake_failure.
+fn dropRsaKeyExchange(ssl: *c.SSL) HandshakeError!void {
+    const ciphers = c.SSL_get_ciphers(ssl) orelse return;
+    var buf: [4096]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    var dropped = false;
+    for (0..c.sk_SSL_CIPHER_num(ciphers)) |i| {
+        const cipher = c.sk_SSL_CIPHER_value(ciphers, i);
+        if (c.SSL_CIPHER_get_min_version(cipher) >= c.TLS1_3_VERSION) continue;
+        if (c.SSL_CIPHER_get_kx_nid(cipher) == c.NID_kx_rsa) {
+            dropped = true;
+            continue;
+        }
+        if (w.end > 0) w.writeByte(':') catch return error.TlsInternalError;
+        w.writeAll(std.mem.span(c.SSL_CIPHER_get_name(cipher))) catch return error.TlsInternalError;
+    }
+    if (!dropped) return;
+    if (w.end == 0) return error.TlsHandshakeFailure;
+    w.writeByte(0) catch return error.TlsInternalError;
+    if (c.SSL_set_strict_cipher_list(ssl, @ptrCast(&buf)) != 1) return error.TlsInternalError;
 }
 
 // The BIO between libssl and the transport's buffers. Its functions run
@@ -1392,6 +1490,8 @@ fn globals(io: Io) error{ OutOfMemory, Canceled }!Globals {
     errdefer c.SSL_CTX_free(server_ctx);
     // No resumption yet, as in the native implementation: no tickets.
     if (c.SSL_CTX_set_num_tickets(server_ctx, 0) != 1) return error.OutOfMemory;
+    // Nor TLS 1.2's tickets: no session is resumed.
+    _ = c.SSL_CTX_set_options(server_ctx, c.SSL_OP_NO_TICKET);
     c.SSL_CTX_set_alpn_select_cb(server_ctx, alpnSelectCallback, null);
     c.SSL_CTX_set_select_certificate_cb(server_ctx, selectSuiteCallback);
     if (c.SSL_CTX_set_tlsext_servername_callback(server_ctx, serverNameCallback) != 1) return error.OutOfMemory;

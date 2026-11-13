@@ -14,12 +14,20 @@ pub const Certificate = crypto.x509.Certificate;
 /// task can hand the work to a thread pool.
 pub const Signer = struct {
     context: ?*anyopaque = null,
-    /// Signs `message`, the framed CertificateVerify content (in TLS 1.2,
-    /// the handshake messages so far, which can run long), with `key`
-    /// under `algorithm` into `out`, and returns the signature as a slice
-    /// of `out`. Runs on the handshake's task and may block or suspend;
-    /// it must not touch the connection. Any error fails the handshake
-    /// with internal_error.
+    /// Signs `message` with `key` under `algorithm` into `out`, and
+    /// returns the signature as a slice of `out`. The message is the
+    /// framed CertificateVerify content; in TLS 1.2, a client's is the
+    /// handshake messages so far, which can run long, and under
+    /// `-Dimpl=libssl` a server's is its ServerKeyExchange parameters.
+    /// Runs on the handshake's task and may block or suspend; it must not
+    /// touch the connection. Any error fails the handshake with
+    /// internal_error.
+    ///
+    /// A pair with a signer needs TLS 1.2 or newer, whose signatures name
+    /// their algorithm, and a server presenting one does no RSA key
+    /// exchange, which decrypts with the key: under `-Dimpl=libssl` such a
+    /// pair is passed over before TLS 1.2, and RSA key exchange is not
+    /// offered with it.
     sign: *const fn (context: ?*anyopaque, key: *const PrivateKey, algorithm: crypto.sig.Algorithm, message: []const u8, out: []u8) anyerror![]u8,
 };
 
@@ -165,13 +173,16 @@ pub const SelectCertificate = struct {
         /// The server_name extension's host name, if any.
         server_name: ?[]const u8,
         /// Whether the client can verify signatures by a key of this type,
-        /// under a scheme in the server's `signing_schemes`.
+        /// under a scheme in the server's `signing_schemes`. Before TLS
+        /// 1.2, which has no signature schemes, any RSA or ECDSA key.
         accepts: *const fn (hello: *const Hello, key_type: crypto.sig.KeyType) bool,
         /// The client's signature_algorithms that ztls supports, in the
-        /// client's order.
+        /// client's order. In TLS 1.2 a client that sends none takes the
+        /// SHA-1 ones; before TLS 1.2, empty.
         schemes: []const proto.SignatureScheme,
-        /// The server's `signing_schemes`, for `accepts`; a callback that
-        /// uses `acceptsKey` need not look at it.
+        /// The server's `signing_schemes`, or the implementation's default,
+        /// for `accepts`; a callback that uses `acceptsKey` need not look
+        /// at it.
         signing_schemes: []const proto.SignatureScheme,
 
         pub fn acceptsKey(hello: *const Hello, key_type: crypto.sig.KeyType) bool {
@@ -217,11 +228,11 @@ pub const default_server_named_groups = default_named_groups;
 /// The groups a client sends key shares for in its first ClientHello:
 /// the ones a server is likely to pick, so a HelloRetryRequest is rare.
 pub const default_key_shares = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519 };
-/// Every signature scheme ztls implements, in preference order, and the
-/// default for both `verify_schemes` and `signing_schemes`. In TLS 1.3
-/// the rsa_pkcs1 ones only tell the peer which certificate signatures we
-/// accept; they never sign a CertificateVerify. In TLS 1.2 they sign
-/// handshakes too.
+/// The signature schemes the native implementation uses by default, in
+/// preference order, for both `verify_schemes` and `signing_schemes`. In
+/// TLS 1.3 the rsa_pkcs1 ones only tell the peer which certificate
+/// signatures we accept; they never sign a CertificateVerify. In TLS 1.2
+/// they sign handshakes too.
 pub const default_signature_schemes = [_]proto.SignatureScheme{
     .ecdsa_secp256r1_sha256,
     .ecdsa_secp384r1_sha384,
@@ -234,6 +245,11 @@ pub const default_signature_schemes = [_]proto.SignatureScheme{
     .rsa_pkcs1_sha384,
     .rsa_pkcs1_sha512,
 };
+
+/// Every signature scheme ztls implements: the default ones, then TLS
+/// 1.2's SHA-1 ones, for peers that take nothing else. In TLS 1.3 those
+/// sign nothing.
+pub const known_signature_schemes = default_signature_schemes ++ [_]proto.SignatureScheme{ .ecdsa_sha1, .rsa_pkcs1_sha1 };
 
 pub const Client = struct {
     /// What the connection waits with: under `-Dimpl=libssl`, the reading
@@ -258,13 +274,23 @@ pub const Client = struct {
     insecure_skip_verify: bool = false,
     /// A certificate to present if the server asks for one.
     auth: ?*const CertKeyPair = null,
-    /// Offered in this order. Any of `CipherSuite.tls12` among them offers
-    /// TLS 1.2 too, after TLS 1.3; with only those, TLS 1.2 alone.
-    /// `CipherSuite.all` offers TLS 1.3 alone. The default puts
-    /// ChaCha20-Poly1305 first on a machine without AES instructions
-    /// (`default_cipher_suites_chacha_first`), as does a list equal to it;
-    /// any other list is offered as given.
-    cipher_suites: []const proto.CipherSuite = &default_cipher_suites,
+    /// The lowest and highest versions offered. Null is the
+    /// implementation's own bound: the native one speaks TLS 1.2 and 1.3,
+    /// and refuses a range without either; under `-Dimpl=libssl`, AWS-LC
+    /// speaks TLS 1.0 to 1.3.
+    min_version: ?proto.Version = null,
+    max_version: ?proto.Version = null,
+    /// Offered in this order. A version is offered only when it is in
+    /// range and a suite of it is listed.
+    ///
+    /// Null is the implementation's default. For the native one, that is
+    /// `default_cipher_suites`, with ChaCha20-Poly1305 first on a machine
+    /// without AES instructions (`default_cipher_suites_chacha_first`), as
+    /// for a list equal to it; it refuses a suite it does not implement.
+    /// Under `-Dimpl=libssl` it is AWS-LC's, which includes CBC and RSA
+    /// key exchange suites for older servers, and a list may name any
+    /// suite AWS-LC knows.
+    cipher_suites: ?[]const proto.CipherSuite = null,
     /// In preference order, with at least one group ztls knows. Groups
     /// the implementation has no key exchange for are not offered: the
     /// native one has none for secp521r1, and refuses a list with nothing
@@ -286,12 +312,19 @@ pub const Client = struct {
     /// checked by X.509 verification, not against this list, but in TLS
     /// 1.3 the list also tells the server which chain signatures we take:
     /// leaving out rsa_pkcs1_* may make it pick another certificate or
-    /// fail. Not empty, and each one of `default_signature_schemes`.
-    verify_schemes: []const proto.SignatureScheme = &default_signature_schemes,
+    /// fail. Not empty, and each one of `known_signature_schemes`.
+    ///
+    /// Null is the implementation's default: `default_signature_schemes`
+    /// for the native one, and under `-Dimpl=libssl`
+    /// `known_signature_schemes`, which adds TLS 1.2's SHA-1 ones.
+    verify_schemes: ?[]const proto.SignatureScheme = null,
     /// What a client certificate's key signs with, in preference order:
     /// the first the server accepts that suits the key. Each must be one
-    /// of `default_signature_schemes`. Empty never presents `auth`.
-    signing_schemes: []const proto.SignatureScheme = &default_signature_schemes,
+    /// of `known_signature_schemes`. Empty never presents `auth`. Before
+    /// TLS 1.2, which has no schemes, any RSA or ECDSA key signs.
+    ///
+    /// Null is the implementation's default, as for `verify_schemes`.
+    signing_schemes: ?[]const proto.SignatureScheme = null,
     /// Offered through ALPN, in preference order. Empty sends no ALPN.
     alpn_protocols: []const []const u8 = &.{},
     /// The time the server's certificate must be valid at. Null reads
@@ -336,13 +369,23 @@ pub const Server = struct {
     /// `auth` are tried. Null leaves the choice to them.
     select_certificate: ?SelectCertificate = null,
     client_auth: ?ClientAuth = null,
-    /// In preference order, followed over the client's. The server speaks
-    /// TLS 1.3 only; TLS 1.2 suites here are skipped. The default prefers
-    /// ChaCha20-Poly1305 when either side lacks AES instructions: this
-    /// machine, or a client that lists it first among the TLS 1.3 suites.
-    /// So does a list equal to the default; any other is followed as
-    /// given. At least one TLS 1.3 suite.
-    cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
+    /// The lowest and highest versions spoken. Null is the
+    /// implementation's own bound: the native server speaks TLS 1.3 only,
+    /// and refuses a range without it; under `-Dimpl=libssl`, AWS-LC
+    /// speaks TLS 1.0 to 1.3.
+    min_version: ?proto.Version = null,
+    max_version: ?proto.Version = null,
+    /// In preference order, followed over the client's. A version is
+    /// spoken only when it is in range and a suite of it is listed.
+    ///
+    /// Null is the implementation's default. Among the TLS 1.3 suites, it
+    /// prefers ChaCha20-Poly1305 when either side lacks AES instructions:
+    /// this machine, or a client that lists it first; so does a list
+    /// equal to `CipherSuite.all`, and any other is followed as given. The
+    /// native server skips TLS 1.2 suites, and needs a TLS 1.3 one. Under
+    /// `-Dimpl=libssl` the default for older versions is AWS-LC's, and a
+    /// list may name any suite AWS-LC knows.
+    cipher_suites: ?[]const proto.CipherSuite = null,
     /// In preference order, followed over the client's, with at least one
     /// group ztls knows. Groups the implementation has no key exchange for
     /// are passed over: the native one has none for secp521r1. The native
@@ -356,13 +399,20 @@ pub const Server = struct {
     /// certificate's key may sign with. Signatures inside the chain are
     /// checked by X.509 verification, not against this list, but in TLS
     /// 1.3 the list also tells the client which chain signatures we take.
-    /// Not empty, and each one of `default_signature_schemes`.
-    verify_schemes: []const proto.SignatureScheme = &default_signature_schemes,
+    /// Not empty, and each one of `known_signature_schemes`.
+    ///
+    /// Null is the implementation's default: `default_signature_schemes`
+    /// for the native one, and under `-Dimpl=libssl`
+    /// `known_signature_schemes`, which adds TLS 1.2's SHA-1 ones.
+    verify_schemes: ?[]const proto.SignatureScheme = null,
     /// What the server signs with, in preference order: the first the
     /// client accepts that suits the certificate's key. A certificate
-    /// with no such scheme is passed over. Not empty, and each one of
-    /// `default_signature_schemes`.
-    signing_schemes: []const proto.SignatureScheme = &default_signature_schemes,
+    /// with no such scheme is passed over; before TLS 1.2, which has no
+    /// schemes, one with a key other than RSA or ECDSA is. Not empty, and
+    /// each one of `known_signature_schemes`.
+    ///
+    /// Null is the implementation's default, as for `verify_schemes`.
+    signing_schemes: ?[]const proto.SignatureScheme = null,
     /// Supported, in preference order. A client whose offer shares none
     /// is refused with no_application_protocol; one that offers none
     /// gets none. Empty disables ALPN.

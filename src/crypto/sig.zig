@@ -24,9 +24,13 @@ pub const Algorithm = enum {
     rsa_pkcs1_sha384,
     rsa_pkcs1_sha512,
     ed25519,
+    /// TLS 1.2's last resort, for peers that take nothing else.
+    ecdsa_sha1,
+    rsa_pkcs1_sha1,
 
     fn md(a: Algorithm) ?*const c.EVP_MD {
         return switch (a) {
+            .ecdsa_sha1, .rsa_pkcs1_sha1 => c.EVP_sha1(),
             .ecdsa_sha256, .rsa_pss_sha256, .rsa_pkcs1_sha256 => c.EVP_sha256(),
             .ecdsa_sha384, .rsa_pss_sha384, .rsa_pkcs1_sha384 => c.EVP_sha384(),
             .ecdsa_sha512, .rsa_pss_sha512, .rsa_pkcs1_sha512 => c.EVP_sha512(),
@@ -45,9 +49,9 @@ pub const Algorithm = enum {
     /// ECDSA takes a key on any curve here.
     pub fn suits(a: Algorithm, key_type: KeyType) bool {
         return switch (a) {
-            .ecdsa_sha256, .ecdsa_sha384, .ecdsa_sha512 => key_type == .ecdsa,
+            .ecdsa_sha1, .ecdsa_sha256, .ecdsa_sha384, .ecdsa_sha512 => key_type == .ecdsa,
             .rsa_pss_sha256, .rsa_pss_sha384, .rsa_pss_sha512 => key_type == .rsa,
-            .rsa_pkcs1_sha256, .rsa_pkcs1_sha384, .rsa_pkcs1_sha512 => key_type == .rsa,
+            .rsa_pkcs1_sha1, .rsa_pkcs1_sha256, .rsa_pkcs1_sha384, .rsa_pkcs1_sha512 => key_type == .rsa,
             .ed25519 => key_type == .ed25519,
         };
     }
@@ -306,7 +310,7 @@ test "PKCS#1 v1.5, and ECDSA with any hash on any curve" {
     var rsa_public = try publicOf(&rsa);
     defer rsa_public.deinit();
     var sig_buf: [512]u8 = undefined;
-    for ([_]Algorithm{ .rsa_pkcs1_sha256, .rsa_pkcs1_sha384, .rsa_pkcs1_sha512 }) |algorithm| {
+    for ([_]Algorithm{ .rsa_pkcs1_sha1, .rsa_pkcs1_sha256, .rsa_pkcs1_sha384, .rsa_pkcs1_sha512 }) |algorithm| {
         const signature = try rsa.sign(algorithm, "ServerKeyExchange", &sig_buf);
         try rsa_public.verify(algorithm, "ServerKeyExchange", signature);
         try testing.expectError(error.SignatureInvalid, rsa_public.verify(algorithm, "other", signature));
@@ -325,7 +329,7 @@ test "PKCS#1 v1.5, and ECDSA with any hash on any curve" {
     defer p384.deinit();
     var p384_public = try publicOf(&p384);
     defer p384_public.deinit();
-    for ([_]Algorithm{ .ecdsa_sha256, .ecdsa_sha384, .ecdsa_sha512 }) |algorithm| {
+    for ([_]Algorithm{ .ecdsa_sha1, .ecdsa_sha256, .ecdsa_sha384, .ecdsa_sha512 }) |algorithm| {
         const signature = try p384.sign(algorithm, "ServerKeyExchange", &sig_buf);
         try p384_public.verify(algorithm, "ServerKeyExchange", signature);
     }

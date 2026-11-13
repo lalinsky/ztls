@@ -16,13 +16,22 @@ const Connection = @import("connection.zig").Connection;
 
 pub fn run(conn: *Connection, options: config.Server) Error!void {
     try policy.checkServer(options);
+    // The native server speaks TLS 1.3 only, so it needs the version in
+    // range and one of its suites.
+    if (!policy.inRange(options.min_version, options.max_version, .tls_1_3)) return error.TlsInternalError;
+    for (options.cipher_suites orelse &proto.CipherSuite.all) |suite| {
+        if (suite.version() == .tls_1_3) break;
+    } else return error.TlsInternalError;
     // No Certificate is taken from a client that is not asked for one, so
     // nothing needs more than the small limit.
     const max_message_len = if (options.client_auth == null) @min(options.max_handshake_message_len, handshake.max_small_message_len) else options.max_handshake_message_len;
     var h = Handshake.init(conn, options.gpa, max_message_len);
     h.keep_peer_certificates = options.keep_peer_certificates;
     defer h.deinit();
-    handshakeInner(&h, options) catch |err| {
+    var opt = options;
+    opt.verify_schemes = opt.verify_schemes orelse &config.default_signature_schemes;
+    opt.signing_schemes = opt.signing_schemes orelse &config.default_signature_schemes;
+    handshakeInner(&h, opt) catch |err| {
         h.sendAlert(err);
         return err;
     };
@@ -143,7 +152,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     if (!retried) h.conn.writeChangeCipherSpec() catch return error.WriteFailed;
 
     try writeEncryptedExtensions(h, choices.alpn);
-    if (opt.client_auth != null) try writeCertificateRequest(h, opt.verify_schemes);
+    if (opt.client_auth != null) try writeCertificateRequest(h, opt.verify_schemes.?);
     try h.writeCertificate("", auth);
     try h.writeCertificateVerify(auth, choices.scheme, .server);
     try h.writeFinished(&hs.server);
@@ -165,7 +174,7 @@ fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
             try h.hashMessage(msg);
             msg = try h.nextMessage();
             try h.expect(msg, .certificate_verify);
-            try h.verifyCertificateVerify(msg.body, &peer.public_key, .client, opt.verify_schemes);
+            try h.verifyCertificateVerify(msg.body, &peer.public_key, .client, opt.verify_schemes.?);
             try h.hashMessage(msg);
         } else {
             if (client_auth.auth_type == .require) return error.TlsCertificateRequired;
@@ -193,12 +202,12 @@ fn selectCertificate(hello: *const ClientHello, opt: config.Server) Error!*const
             .server_name = hello.server_name,
             .accepts = acceptsKey,
             .schemes = schemes,
-            .signing_schemes = opt.signing_schemes,
+            .signing_schemes = opt.signing_schemes.?,
         };
         if (select.callback(select.context, info)) |pair| return pair;
     }
     for (opt.certificates) |pair| {
-        if (policy.selectScheme(opt.signing_schemes, pair.key.key_type, schemes, .tls13) == null) continue;
+        if (policy.selectScheme(opt.signing_schemes.?, pair.key.key_type, schemes, .tls13) == null) continue;
         if (hello.server_name) |name| {
             if (!pair.leaf.matchesHost(name)) continue;
         }
@@ -226,7 +235,7 @@ fn choose(hello: *const ClientHello, opt: config.Server, auth: *const config.Cer
     } else return error.TlsHandshakeFailure;
 
     const schemes = hello.schemes[0..hello.schemes_len.?];
-    const scheme = policy.selectScheme(opt.signing_schemes, auth.key.key_type, schemes, .tls13) orelse return error.TlsHandshakeFailure;
+    const scheme = policy.selectScheme(opt.signing_schemes.?, auth.key.key_type, schemes, .tls13) orelse return error.TlsHandshakeFailure;
 
     return .{ .suite = suite, .group = group, .scheme = scheme, .alpn = try selectAlpn(opt.alpn_protocols, hello.alpn) };
 }
