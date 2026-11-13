@@ -3,22 +3,31 @@
 //! transport's reader and writer, and the connection hands out a cleartext
 //! reader and writer.
 //!
-//! libssl never sees the transport. It reads ciphertext from one memory
-//! BIO, `rbio`, and writes it to another, `wbio`. Transport I/O happens
-//! only between libssl calls, in Zig, so a fiber may wait on it and move
-//! to another thread: the reading task copies what the transport reader
-//! holds into `rbio`, and the writing task moves what is in `wbio` to the
-//! transport writer.
+//! libssl never waits on the transport. Its BIO, `transport_bio`, only
+//! moves bytes the transport's buffers already hold: it reads ciphertext
+//! straight from the transport reader's buffer, and says "retry" when that
+//! is empty; it writes ciphertext straight into the transport writer's
+//! free space, and what does not fit there goes to `spill`, a memory BIO.
+//! Transport I/O happens only between libssl calls, in Zig, so a fiber may
+//! wait on it and move to another thread: the reading task fills the
+//! transport reader, and the writing task flushes the transport writer and
+//! moves what is in `spill` to it.
 //!
 //! What keeps this safe:
 //!
-//! - A transport failure never reaches libssl. A memory BIO takes all it
-//!   is given, so libssl's writes always finish within the call: it never
+//! - A transport failure never reaches libssl. The BIO takes all it is
+//!   given, so libssl's writes always finish within the call: it never
 //!   stops halfway through a record and never needs a call repeated.
 //!   Plaintext counts as written once libssl has taken it; a failed
-//!   transport write leaves the ciphertext in `wbio` or in the transport's
-//!   buffer, for the next flush. The writing task empties `wbio` before
-//!   each write, so it holds about a record at most.
+//!   transport write leaves the ciphertext in `spill` or in the
+//!   transport's buffer, for the next flush. The writing task empties
+//!   `spill` and makes room for a record before each write, so `spill`
+//!   rarely holds anything.
+//! - Each transport buffer is touched by the task that owns it only. The
+//!   BIO reads the transport reader in the handshake's and the reading
+//!   task's calls, and writes to the transport writer in the handshake's
+//!   and the writing task's; everything else libssl writes, an alert from
+//!   the read side say, goes to `spill`.
 //! - Each libssl call's result becomes a `Result`, and every place that
 //!   makes a call switches over all of it, with no catch-all.
 //! - One libssl object serves both directions, so the reading and the
@@ -30,7 +39,7 @@
 //!
 //! As in the native implementation, the read side never writes to the
 //! transport. libssl queues a KeyUpdate reply for the next write; the alert
-//! for a failure found while reading waits in `wbio` for the write side,
+//! for a failure found while reading waits in `spill` for the write side,
 //! which then fails with the same error.
 
 const std = @import("std");
@@ -77,8 +86,8 @@ const Result = union(enum) {
     ok: usize,
     /// It needs more of the transport's input.
     want_read,
-    /// libssl could not write; a memory BIO never refuses, so this does
-    /// not happen.
+    /// libssl could not write; our BIO never refuses, so this does not
+    /// happen.
     want_write,
     /// It waits for the signer hook.
     want_private_key,
@@ -90,7 +99,7 @@ const Result = union(enum) {
 
 const WriteState = enum {
     open,
-    /// close_notify is in `wbio` or the transport's buffer, maybe not yet
+    /// close_notify is in `spill` or the transport's buffer, maybe not yet
     /// sent.
     closing,
     closed,
@@ -105,15 +114,21 @@ pub const Connection = struct {
     /// handshake.
     output: *Io.Writer,
     ssl: *c.SSL,
-    /// Ciphertext for libssl to read and what it wrote, both memory BIOs
-    /// owned by `ssl`.
-    rbio: *c.BIO,
-    wbio: *c.BIO,
+    /// libssl's BIO for both directions, owned by `ssl`; see the top of the
+    /// file.
+    transport_bio: *c.BIO,
+    /// What libssl wrote that could not go into the transport writer's
+    /// buffer, waiting for the writing task: a memory BIO, ours.
+    spill: *c.BIO,
 
     /// Serializes the libssl and BIO calls of the reading and the writing
     /// task and guards what they share, below. Held for one call at a
     /// time, never across transport I/O.
     mutex: Io.Mutex = .init,
+    /// What the BIO may touch in the current call: the transport reader,
+    /// and the transport writer.
+    may_read: bool = false,
+    may_write: bool = false,
     /// The read side's failure: the write side sends its alert, then fails
     /// with it too.
     read_failure: ?Failure = null,
@@ -167,26 +182,26 @@ pub const Connection = struct {
     fn init(ctx: *c.SSL_CTX, input: *Io.Reader, output: *Io.Writer, side: proto.Side) error{OutOfMemory}!Connection {
         if (input.buffer.len < input_buffer_len) @panic("ztls: the transport reader's buffer is shorter than input_buffer_len");
         if (output.buffer.len < output_buffer_len) @panic("ztls: the transport writer's buffer is shorter than output_buffer_len");
+        const spill = c.BIO_new(c.BIO_s_mem()) orelse return error.OutOfMemory;
+        errdefer _ = c.BIO_free(spill);
         const ssl = c.SSL_new(ctx) orelse return error.OutOfMemory;
         errdefer c.SSL_free(ssl);
-        const rbio = c.BIO_new(c.BIO_s_mem()) orelse return error.OutOfMemory;
-        const wbio = c.BIO_new(c.BIO_s_mem()) orelse {
-            _ = c.BIO_free(rbio);
-            return error.OutOfMemory;
-        };
-        // The SSL takes both, and frees them with itself.
-        c.SSL_set_bio(ssl, rbio, wbio);
+        const bio = c.BIO_new(globals_value.?.bio_method) orelse return error.OutOfMemory;
+        c.BIO_set_init(bio, 1);
+        // The SSL takes it for both directions, and frees it with itself.
+        c.SSL_set_bio(ssl, bio, bio);
         c.SSL_set_info_callback(ssl, infoCallback);
         c.SSL_set_msg_callback(ssl, messageCallback);
         // Everything is set on the SSL, not the shared SSL_CTX, and none of
         // it is needed once the handshake is done.
         c.SSL_set_shed_handshake_config(ssl, 1);
-        return .{ .input = input, .output = output, .ssl = ssl, .rbio = rbio, .wbio = wbio, .side = side };
+        return .{ .input = input, .output = output, .ssl = ssl, .transport_bio = bio, .spill = spill, .side = side };
     }
 
     /// Frees libssl's state. Sends nothing; both tasks must be done.
     pub fn deinit(conn: *Connection) void {
         c.SSL_free(conn.ssl);
+        _ = c.BIO_free(conn.spill);
         if (conn.gpa) |gpa| {
             for (conn.peer_certificates) |der| gpa.free(der);
             gpa.free(conn.peer_certificates);
@@ -229,6 +244,13 @@ pub const Connection = struct {
         conn.alert_sent = null;
         conn.alert_received = null;
         conn.bind();
+        // Only the task that owns a transport buffer touches it.
+        conn.may_read = op == .handshake or op == .read;
+        conn.may_write = op != .read;
+        defer {
+            conn.may_read = false;
+            conn.may_write = false;
+        }
         const ssl = conn.ssl;
         const len: c_int = @intCast(buf.len);
         const rc: c_int = switch (op) {
@@ -251,8 +273,8 @@ pub const Connection = struct {
             c.SSL_ERROR_WANT_PRIVATE_KEY_OPERATION => .want_private_key,
             c.SSL_ERROR_ZERO_RETURN => .closed,
             // Anything else ends the connection, SSL_ERROR_SYSCALL
-            // included, which a memory BIO never gives libssl a reason
-            // for.
+            // included, which our BIO gives libssl a reason for only when
+            // `spill` runs out of memory.
             else => .{ .failed = conn.classify() },
         };
         // libssl's calls clear the queue on entry; empty it for others on
@@ -261,24 +283,11 @@ pub const Connection = struct {
         return result;
     }
 
-    /// Points the callbacks at this connection, which may have moved since
-    /// the last call.
+    /// Points the callbacks and the BIO at this connection, which may have
+    /// moved since the last call.
     fn bind(conn: *Connection) void {
         _ = c.SSL_set_ex_data(conn.ssl, globals_value.?.ex_index, conn);
-    }
-
-    /// Copies what the transport reader holds into `rbio`, for the next
-    /// call to read. Only the reading task, or the handshake's, reads the
-    /// transport.
-    fn feed(conn: *Connection) error{OutOfMemory}!void {
-        const bytes = conn.input.buffered();
-        if (bytes.len == 0) return;
-        if (c.BIO_write(conn.rbio, bytes.ptr, @intCast(bytes.len)) != @as(c_int, @intCast(bytes.len))) {
-            c.ERR_clear_error();
-            return error.OutOfMemory;
-        }
-        conn.tracker.feed(bytes);
-        conn.input.toss(bytes.len);
+        c.BIO_set_data(conn.transport_bio, conn);
     }
 
     /// Why the last call failed, best said first: our own callbacks'
@@ -314,7 +323,7 @@ pub const Connection = struct {
     // Moving ciphertext to the transport: the handshake's task or the
     // writing task only.
 
-    /// Moves what libssl wrote from `wbio` into the transport writer,
+    /// Moves what libssl wrote from `spill` into the transport writer,
     /// flushing that whenever it fills, and at the end too when `flush` is
     /// set. A transport failure leaves what was not sent where it is, for
     /// the next time.
@@ -322,9 +331,9 @@ pub const Connection = struct {
         while (true) {
             lock(&conn.mutex);
             const space = conn.output.unusedCapacitySlice();
-            const want = @min(c.BIO_pending(conn.wbio), space.len, std.math.maxInt(c_int));
-            const got = if (want == 0) 0 else c.BIO_read(conn.wbio, space.ptr, @intCast(want));
-            const left = c.BIO_pending(conn.wbio);
+            const want = @min(c.BIO_pending(conn.spill), space.len, std.math.maxInt(c_int));
+            const got = if (want == 0) 0 else c.BIO_read(conn.spill, space.ptr, @intCast(want));
+            const left = c.BIO_pending(conn.spill);
             unlock(&conn.mutex);
             // A memory BIO hands over what it holds.
             if (got != @as(c_int, @intCast(want))) @panic("ztls: a memory BIO failed to hand over its contents");
@@ -335,9 +344,9 @@ pub const Connection = struct {
         if (flush) conn.output.flush() catch return error.WriteFailed;
     }
 
-    /// Whether `wbio` holds something not yet moved to the transport.
+    /// Whether `spill` holds something not yet moved to the transport.
     fn writtenPending(conn: *Connection) bool {
-        return c.BIO_pending(conn.wbio) > 0;
+        return c.BIO_pending(conn.spill) > 0;
     }
 
     // Handshake
@@ -350,7 +359,7 @@ pub const Connection = struct {
         defer conn.dropSigning();
         while (true) {
             lock(&conn.mutex);
-            const step: Result = if (conn.feed()) conn.call(.handshake, "") else |err| .{ .failed = err };
+            const step = conn.call(.handshake, "");
             switch (step) {
                 .failed => |err| conn.ensureAlert(err),
                 else => {},
@@ -464,10 +473,10 @@ pub const Connection = struct {
         const len = @min(dest.len, std.math.maxInt(c_int));
         while (true) {
             lock(&conn.mutex);
-            const step: Result = if (conn.feed()) conn.call(.read, dest[0..len]) else |err| .{ .failed = err };
+            const step = conn.call(.read, dest[0..len]);
             const failure: ?Failure = switch (step) {
                 .ok, .want_read, .closed => null,
-                // Neither can happen: a memory BIO takes all libssl writes,
+                // Neither can happen: our BIO takes all libssl writes,
                 // and no key operation runs after the handshake.
                 .want_write, .want_private_key => error.TlsInternalError,
                 .failed => |err| asFailure(err),
@@ -487,7 +496,8 @@ pub const Connection = struct {
                     error.ReadFailed => return error.ReadFailed,
                     error.EndOfStream => {
                         // libssl asks for more only once it has taken all
-                        // of `rbio`, so the tracker has seen what it read.
+                        // the transport reader held, so the tracker has
+                        // seen what it read.
                         // Between records it is the end, unless the peer
                         // must say so with close_notify.
                         if (conn.tracker.atBoundary() and !conn.strict_close_notify) {
@@ -569,11 +579,13 @@ pub const Connection = struct {
 
     /// Runs one write-side libssl operation, which is done in one call:
     /// libssl never holds half a write that would have to be repeated. It
-    /// runs with `wbio` empty, to keep that to about a record; moving
-    /// earlier ciphertext out of it may fail on the transport, and then
-    /// nothing was done.
+    /// runs with `spill` empty and room in the transport writer for what
+    /// it seals, so that goes straight there; making room may fail on the
+    /// transport, and then nothing was done.
     fn writeOp(conn: *Connection, op: Op, bytes: []const u8) WriteError!void {
         if (bytes.len > max_plaintext_len) @panic("ztls: more than a record's worth given to one write");
+        // The sealed record, and a KeyUpdate reply that may go ahead of it.
+        const room = bytes.len + (output_buffer_len - max_plaintext_len);
         while (true) {
             lock(&conn.mutex);
             if (conn.read_failure) |err| {
@@ -585,6 +597,12 @@ pub const Connection = struct {
                 try conn.sendWritten(false);
                 continue;
             }
+            // Only this task writes to the transport, so the room stays.
+            if (conn.output.end > 0 and conn.output.unusedCapacitySlice().len < room) {
+                unlock(&conn.mutex);
+                conn.output.flush() catch return error.WriteFailed;
+                continue;
+            }
             const step = conn.call(op, bytes);
             switch (step) {
                 .failed => |err| conn.ensureAlert(err),
@@ -593,7 +611,7 @@ pub const Connection = struct {
             unlock(&conn.mutex);
             switch (step) {
                 .ok => return,
-                // None can happen: a memory BIO takes all libssl writes,
+                // None can happen: our BIO takes all libssl writes,
                 // and none of these reads. libssl may hold half a write
                 // now, so the direction is over.
                 .want_read, .want_write, .want_private_key, .closed => return conn.failWrite(error.TlsInternalError),
@@ -605,7 +623,8 @@ pub const Connection = struct {
         }
     }
 
-    /// Encrypts `bytes`, at most a record's worth, into `wbio`.
+    /// Encrypts `bytes`, at most a record's worth, into the transport
+    /// writer.
     fn writeRecord(conn: *Connection, bytes: []const u8) WriteError!void {
         try conn.checkWritable();
         try conn.writeOp(.write, bytes);
@@ -1246,12 +1265,70 @@ fn offeredSchemes(ssl: *c.SSL, buf: *[all_schemes.len]proto.SignatureScheme) []c
     return buf[0..n];
 }
 
+// The BIO between libssl and the transport's buffers. Its functions run
+// inside a libssl call, under the connection's mutex, and never wait.
+
+fn bioConnection(bio: ?*c.BIO) *Connection {
+    return @ptrCast(@alignCast(c.BIO_get_data(bio).?));
+}
+
+/// Hands libssl what the transport reader holds, if this call may read it.
+fn bioRead(bio: ?*c.BIO, out: [*c]u8, len: c_int) callconv(.c) c_int {
+    c.BIO_clear_retry_flags(bio);
+    if (len <= 0) return 0;
+    const conn = bioConnection(bio);
+    const bytes = if (conn.may_read) conn.input.buffered() else &.{};
+    if (bytes.len == 0) {
+        c.BIO_set_retry_read(bio);
+        return -1;
+    }
+    const n = @min(bytes.len, @as(usize, @intCast(len)));
+    @memcpy(out[0..n], bytes[0..n]);
+    conn.tracker.feed(bytes[0..n]);
+    conn.input.toss(n);
+    return @intCast(n);
+}
+
+/// Takes all of what libssl wrote: into the transport writer's free space
+/// if this call may write there and nothing waits in `spill` ahead of it,
+/// the rest into `spill`.
+fn bioWrite(bio: ?*c.BIO, data: [*c]const u8, len: c_int) callconv(.c) c_int {
+    // This is the read direction's BIO too, so this clears a retry a read
+    // left. libssl never writes between a failed read and asking about it.
+    c.BIO_clear_retry_flags(bio);
+    if (len <= 0) return 0;
+    const conn = bioConnection(bio);
+    const bytes = data[0..@intCast(len)];
+    var direct: usize = 0;
+    if (conn.may_write and !conn.writtenPending()) {
+        const space = conn.output.unusedCapacitySlice();
+        direct = @min(space.len, bytes.len);
+        @memcpy(space[0..direct], bytes[0..direct]);
+        conn.output.advance(direct);
+    }
+    const rest = bytes[direct..];
+    if (rest.len > 0 and c.BIO_write(conn.spill, rest.ptr, @intCast(rest.len)) != @as(c_int, @intCast(rest.len))) {
+        // Out of memory: take none of it, so that no half record goes out.
+        conn.output.end -= direct;
+        return -1;
+    }
+    return len;
+}
+
+/// libssl flushes after each flight and alert; the task that owns the
+/// transport writer does that, between calls.
+fn bioCtrl(bio: ?*c.BIO, cmd: c_int, larg: c_long, parg: ?*anyopaque) callconv(.c) c_long {
+    _ = .{ bio, larg, parg };
+    return if (cmd == c.BIO_CTRL_FLUSH) 1 else 0;
+}
+
 // Process-wide state, made on first use.
 
 const Globals = struct {
     client_ctx: *c.SSL_CTX,
     server_ctx: *c.SSL_CTX,
     ex_index: c_int,
+    bio_method: *c.BIO_METHOD,
 };
 
 var globals_mutex: Io.Mutex = .init;
@@ -1274,7 +1351,14 @@ fn globals() error{OutOfMemory}!Globals {
 
     const index = c.SSL_get_ex_new_index(0, null, null, null, null);
     if (index < 0) return error.OutOfMemory;
-    globals_value = .{ .client_ctx = client_ctx, .server_ctx = server_ctx, .ex_index = index };
+    const bio_type = c.BIO_get_new_index();
+    if (bio_type < 0) return error.OutOfMemory;
+    const bio_method = c.BIO_meth_new(bio_type | c.BIO_TYPE_SOURCE_SINK, "ztls transport") orelse return error.OutOfMemory;
+    errdefer c.BIO_meth_free(bio_method);
+    if (c.BIO_meth_set_read(bio_method, bioRead) != 1 or
+        c.BIO_meth_set_write(bio_method, bioWrite) != 1 or
+        c.BIO_meth_set_ctrl(bio_method, bioCtrl) != 1) return error.OutOfMemory;
+    globals_value = .{ .client_ctx = client_ctx, .server_ctx = server_ctx, .ex_index = index, .bio_method = bio_method };
     return globals_value.?;
 }
 
