@@ -305,27 +305,6 @@ test "a HelloRetryRequest when the client sent no share the server takes" {
     try testing.expectEqual(proto.NamedGroup.secp256r1, seen.group.?);
 }
 
-test "the server passes over groups it has no key exchange for" {
-    const io = testing.io;
-    var pki = try Pki.init();
-    defer pki.deinit();
-    var run: Run(lib) = .{};
-    try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{ .secp521r1, .x25519 } });
-    const seen = try clientOnce(lib, &run.loopback, .{
-        .gpa = testing.allocator,
-        .host = "localhost",
-        .root_ca = &pki.ca,
-        .now = valid_now,
-        .named_groups = &.{ .secp256r1, .secp521r1, .x25519 },
-        .key_shares = &.{.secp256r1},
-    });
-    const outcome = try run.finish(io);
-    try outcome.handshake;
-    try outcome.echo;
-    try testing.expect(seen.retried);
-    try testing.expectEqual(proto.NamedGroup.x25519, seen.group.?);
-}
-
 test "client certificates: none, requested, required" {
     const io = testing.io;
     var pki = try Pki.init();
@@ -482,10 +461,14 @@ test "no common ALPN protocol, suite or group ends the handshake" {
     var group_client = base_client;
     group_client.named_groups = &.{.x25519};
     group_client.key_shares = &.{.x25519};
+    // P-521 is not among a default client's groups.
+    var p521_server = base_server;
+    p521_server.named_groups = &.{.secp521r1};
     const cases = [_]Case{
         .{ .server = alpn_server, .client = alpn_client, .client_err = error.TlsAlertNoApplicationProtocol, .server_err = error.TlsNoApplicationProtocol },
         .{ .server = suite_server, .client = suite_client, .client_err = error.TlsAlertHandshakeFailure, .server_err = error.TlsHandshakeFailure },
         .{ .server = group_server, .client = group_client, .client_err = error.TlsAlertHandshakeFailure, .server_err = error.TlsHandshakeFailure },
+        .{ .server = p521_server, .client = base_client, .client_err = error.TlsAlertHandshakeFailure, .server_err = error.TlsHandshakeFailure },
     };
     for (cases) |case| {
         var run: Run(lib) = .{};
@@ -555,7 +538,7 @@ test "signature scheme lists decide what each side signs with and accepts" {
     try testing.expectError(error.TlsCertificateRequired, outcome.handshake);
 }
 
-test "a server without a TLS 1.3 suite or a group it can use is refused before anything is read" {
+test "a server without a TLS 1.3 suite or a group ztls knows is refused before anything is read" {
     var pki = try Pki.init();
     defer pki.deinit();
     var input_buffer: [lib.input_buffer_len]u8 = undefined;
@@ -565,9 +548,9 @@ test "a server without a TLS 1.3 suite or a group it can use is refused before a
     no_tls13.cipher_suites = &proto.CipherSuite.tls12;
     var no_groups = base;
     no_groups.named_groups = &.{};
-    var no_usable_group = base;
-    no_usable_group.named_groups = &.{ .x448, .secp521r1 };
-    for ([_]config.Server{ no_tls13, no_groups, no_usable_group }) |opt| {
+    var unknown_groups = base;
+    unknown_groups.named_groups = &.{ .x448, .ffdhe2048 };
+    for ([_]config.Server{ no_tls13, no_groups, unknown_groups }) |opt| {
         var input: Io.Reader = .fixed(&input_buffer);
         var discard: Io.Writer.Discarding = .init(&output_buffer);
         try testing.expectError(error.TlsInternalError, lib.server(&input, &discard.writer, opt));
@@ -1478,6 +1461,52 @@ test "a KeyUpdate request made while a reply is owed still reaches the peer" {
     try testing.expectEqual(2, conn.keyUpdatesReceived());
     try w.close();
     try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+    try peer.await(io);
+}
+
+test "a flush with nothing written sends the KeyUpdate reply a read left owing" {
+    // Native answers only with the next record it writes.
+    if (!libssl_build) return error.SkipZigTest;
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+
+    // The native peer asks for an update; libssl reads, then only
+    // flushes and hangs up without close_notify. The reply must have gone
+    // out with that flush.
+    const Peer = struct {
+        fn run(loopback: *testu.Loopback, p: *const Pki) !void {
+            var t: Transport = .{ .io = loopback.io, .stream = try loopback.accept() };
+            defer t.deinit();
+            t.setUp();
+            var conn = try native.server(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .auth = &p.server_ec, .now = valid_now });
+            defer conn.deinit();
+            var rbuf: [256]u8 = undefined;
+            var r = conn.reader(&rbuf);
+            var w = conn.writer(&.{});
+            try w.requestKeyUpdate();
+            try w.interface.writeAll("ping\n");
+            try w.interface.flush();
+            try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+            try testing.expectEqual(1, conn.keyUpdatesReceived());
+        }
+    };
+    var loopback = try testu.Loopback.init(io);
+    defer loopback.deinit();
+    var peer = try io.concurrent(Peer.run, .{ &loopback, &pki });
+    defer peer.cancel(io) catch {};
+
+    var t: Transport = .{ .io = io, .stream = try loopback.connect() };
+    defer t.deinit();
+    t.setUp();
+    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+    defer conn.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = conn.reader(&rbuf);
+    var w = conn.writer(&.{});
+    try testing.expectEqualStrings("ping", (try r.interface.takeDelimiter('\n')).?);
+    try w.interface.flush();
+    try t.stream.shutdown(io, .send);
     try peer.await(io);
 }
 

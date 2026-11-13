@@ -329,8 +329,9 @@ pub const Server = struct {
     /// default; any other is followed as given. At least one TLS 1.3
     /// suite.
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
-    /// In preference order; groups ztls has no key exchange for are
-    /// skipped. At least one it has.
+    /// In preference order, with at least one group ztls knows. Groups
+    /// the implementation has no key exchange for are passed over: the
+    /// native one has none for secp521r1.
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
     /// Sent in a CertificateRequest, and the only schemes a client
     /// certificate's key may sign with. Signatures inside the chain are

@@ -611,14 +611,11 @@ pub const Connection = struct {
         try conn.writeOp(.write, bytes);
     }
 
-    /// Sends everything encrypted. A KeyUpdate reply a read left owing
-    /// waits for the next record written, as in the native implementation.
+    /// Sends everything encrypted, and what libssl has queued: an empty
+    /// write sends a KeyUpdate reply a read left owing.
     fn flushWrite(conn: *Connection) WriteError!void {
         try conn.checkWritable();
-        lock(&conn.mutex);
-        const read_failure = conn.read_failure;
-        unlock(&conn.mutex);
-        if (read_failure) |err| return conn.takeReadFailure(err);
+        try conn.writeOp(.write, "");
         conn.sendWritten(true) catch return error.WriteFailed;
     }
 
@@ -792,7 +789,7 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Han
     const offers_tls13 = policy.offers(options, .tls_1_3);
     try setVersions(ssl, if (offers_tls12) c.TLS1_2_VERSION else c.TLS1_3_VERSION, if (offers_tls13) c.TLS1_3_VERSION else c.TLS1_2_VERSION);
     try setCipherSuites(ssl, options.cipher_suites);
-    try setPreferences(ssl, .client, options.named_groups, options.signing_schemes, options.verify_schemes);
+    try setPreferences(ssl, options.named_groups, options.signing_schemes, options.verify_schemes);
     // libssl holds every handshake message to this, but to no less than
     // 16 KiB.
     c.SSL_set_max_cert_list(ssl, options.max_handshake_message_len);
@@ -833,7 +830,7 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Han
     // The server speaks TLS 1.3 only, as the native one does.
     try setVersions(ssl, c.TLS1_3_VERSION, c.TLS1_3_VERSION);
     try setCipherSuites(ssl, options.cipher_suites);
-    try setPreferences(ssl, .server, options.named_groups, options.signing_schemes, options.verify_schemes);
+    try setPreferences(ssl, options.named_groups, options.signing_schemes, options.verify_schemes);
     // libssl holds every handshake message to this, but to no less than
     // 16 KiB.
     c.SSL_set_max_cert_list(ssl, options.max_handshake_message_len);
@@ -880,12 +877,9 @@ fn setCipherSuites(ssl: *c.SSL, suites: []const proto.CipherSuite) error{TlsInte
 }
 
 /// Groups and signature schemes in our order. libssl's own defaults
-/// differ: its client offers no Ed25519, for one. The server takes only
-/// the groups the native one has a key exchange for; a client may list
-/// secp521r1 for the curve of a TLS 1.2 server's certificate.
+/// differ: its client offers no Ed25519, for one.
 fn setPreferences(
     ssl: *c.SSL,
-    side: proto.Side,
     groups: []const proto.NamedGroup,
     signing: []const proto.SignatureScheme,
     verify: []const proto.SignatureScheme,
@@ -893,14 +887,14 @@ fn setPreferences(
     var nids: [16]c_int = undefined;
     var n: usize = 0;
     for (groups) |group| {
-        if (side == .server and !policy.groupSupported(group)) continue;
+        if (!policy.groupKnown(group)) continue;
         const nid: c_int = switch (group) {
             .x25519_ml_kem768 => c.NID_X25519MLKEM768,
             .x25519 => c.NID_X25519,
             .secp256r1 => c.NID_X9_62_prime256v1,
             .secp384r1 => c.NID_secp384r1,
             .secp521r1 => c.NID_secp521r1,
-            else => continue,
+            else => unreachable,
         };
         if (n == nids.len) return error.TlsInternalError;
         nids[n] = nid;

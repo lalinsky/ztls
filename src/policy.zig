@@ -64,7 +64,7 @@ pub fn sendsSni(host: []const u8) bool {
 pub fn checkServer(opt: config.Server) error{TlsInternalError}!void {
     if (opt.verify_schemes.len == 0 or opt.signing_schemes.len == 0) return error.TlsInternalError;
     for (opt.named_groups) |group| {
-        if (groupSupported(group)) break;
+        if (groupKnown(group)) break;
     } else return error.TlsInternalError;
     // The server speaks TLS 1.3 only, so it needs one of its suites.
     for (opt.cipher_suites) |suite| {
@@ -73,11 +73,11 @@ pub fn checkServer(opt: config.Server) error{TlsInternalError}!void {
     if (!schemesSupported(opt.verify_schemes) or !schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
 }
 
-/// Whether ztls can exchange keys on `group`. Others may still be listed
-/// in a client's `named_groups`, for the curves of TLS 1.2 certificates.
-pub fn groupSupported(group: proto.NamedGroup) bool {
+/// Whether `group` is one ztls has a key exchange for in either
+/// implementation; not every implementation has every one.
+pub fn groupKnown(group: proto.NamedGroup) bool {
     return switch (group) {
-        .x25519, .secp256r1, .secp384r1, .x25519_ml_kem768 => true,
+        .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1, .secp521r1 => true,
         else => false,
     };
 }
