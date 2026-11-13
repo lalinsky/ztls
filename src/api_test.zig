@@ -558,6 +558,23 @@ test "a server without a TLS 1.3 suite or a group ztls knows is refused before a
     }
 }
 
+test "a client without a group ztls knows is refused before anything is sent" {
+    var input_buffer: [lib.input_buffer_len]u8 = undefined;
+    var output_buffer: [lib.output_buffer_len]u8 = undefined;
+    const base: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = valid_now };
+    var no_groups = base;
+    no_groups.named_groups = &.{};
+    var unknown_groups = base;
+    unknown_groups.named_groups = &.{ .x448, .ffdhe2048 };
+    unknown_groups.key_shares = &.{.x448};
+    for ([_]config.Client{ no_groups, unknown_groups }) |opt| {
+        var input: Io.Reader = .fixed(&input_buffer);
+        var discard: Io.Writer.Discarding = .init(&output_buffer);
+        try testing.expectError(error.TlsInternalError, lib.client(&input, &discard.writer, opt));
+        try testing.expectEqual(0, discard.count + discard.writer.end);
+    }
+}
+
 test "signature scheme lists must be ones we implement, each once" {
     var input_buffer: [lib.input_buffer_len]u8 = undefined;
     var output_buffer: [lib.output_buffer_len]u8 = undefined;

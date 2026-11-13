@@ -20,7 +20,9 @@ pub fn checkClient(opt: config.Client) error{TlsInternalError}!void {
     if (opt.host.len > 255) return error.TlsInternalError;
     // AWS-LC would match any subdomain of a name that starts with a dot.
     if (opt.host.len > 0 and opt.host[0] == '.') return error.TlsInternalError;
-    if (opt.named_groups.len == 0) return error.TlsInternalError;
+    for (opt.named_groups) |group| {
+        if (groupKnown(group)) break;
+    } else return error.TlsInternalError;
     if (opt.verify_schemes.len == 0) return error.TlsInternalError;
     if (!schemesSupported(opt.verify_schemes) or !schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
     if (!proto.tls12_enabled) {

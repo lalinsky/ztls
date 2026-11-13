@@ -263,6 +263,7 @@ pub const Client = struct {
     /// instructions (`default_cipher_suites_chacha_first`), as does a list
     /// equal to it; any other list is offered as given.
     cipher_suites: []const proto.CipherSuite = &default_cipher_suites,
+    /// In preference order, with at least one group ztls knows.
     named_groups: []const proto.NamedGroup = &default_named_groups,
     /// Groups to send key shares for; each must be in `named_groups`, and
     /// listed once.
