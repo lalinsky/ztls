@@ -4,6 +4,8 @@
 const std = @import("std");
 
 pub const Version = enum(u16) {
+    tls_1_0 = 0x0301,
+    tls_1_1 = 0x0302,
     tls_1_2 = 0x0303,
     tls_1_3 = 0x0304,
     _,

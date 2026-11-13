@@ -12,12 +12,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         zig: [0.16.0, 0.17.0]
-        # Zig 0.16 keeps failing to fetch the nasm package there; see #45.
-        exclude:
-          - os: windows-latest
-            zig: 0.16.0
-        # The other targets AWS-LC's assembly is built for.
         include:
+          # Without AWS-LC's assembly, which needs NASM there: fetching
+          # the nasm package keeps failing in CI; see #45.
+          - os: windows-latest
+            build_flags: -Dasm=false
+          # The other targets AWS-LC's assembly is built for.
           - os: macos-15-intel
             zig: 0.17.0
           - os: windows-11-arm
@@ -31,9 +31,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ matrix.zig }}
-      - run: zig build test --summary all
+      - run: zig build test ${{ matrix.build_flags }} --summary all
       - name: Test with libssl
-        run: zig build test -Dimpl=libssl --summary all
+        run: zig build test -Dimpl=libssl ${{ matrix.build_flags }} --summary all
 
   bogo:
     runs-on: ubuntu-latest

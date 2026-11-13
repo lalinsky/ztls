@@ -11,6 +11,21 @@ wraps AWS-LC's libssl.
 
 Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system.
 
+## Features
+
+Both engines have the same API:
+
+- A client and a server, over any `std.Io.Reader` and `std.Io.Writer`.
+- One task can read a connection while another writes to it.
+- Server name indication. A server can choose its certificate by name, or
+  with a callback.
+- ALPN.
+- Client certificates.
+- Certificate verification with AWS-LC, against roots from PEM, DER, files
+  or the system store.
+- KeyUpdate and close_notify.
+- Versions, cipher suites, groups and signature schemes can be chosen.
+
 ## The native engine
 
 ztls was written for servers and clients on [zio](https://github.com/lalinsky/zio),
@@ -29,28 +44,29 @@ Records are decrypted directly into the reader's buffer, and can be
 encrypted in place in the transport's buffer. C code never waits for I/O.
 It also doesn't need a C++ runtime.
 
-## The libssl engine
-
-Build with `-Dimpl=libssl`, or pass `.impl = .libssl` to the dependency.
-This engine wraps libssl, AWS-LC's TLS implementation, which it shares with
-BoringSSL. It is a fallback for compatibility, and for when you prefer code
-with more real-world use.
-
-## Features
+It is newer, and speaks only the modern parts of TLS:
 
 - TLS 1.3 client and server ([RFC 9846](https://www.rfc-editor.org/rfc/rfc9846)).
 - TLS 1.2 client: ECDHE with AES-GCM or ChaCha20-Poly1305, extended master
-  secret, no renegotiation. Older versions are not supported.
+  secret, no renegotiation.
 - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305.
 - X25519MLKEM768, X25519, P-256 and P-384 key exchange, with
   HelloRetryRequest.
 - ECDSA (P-256, P-384, P-521), RSA-PSS and Ed25519 signatures.
-- Server name indication. A server can choose its certificate by name.
-- ALPN.
-- Client certificates.
-- Certificate verification with AWS-LC, against roots from PEM, DER, files
-  or the system store.
-- KeyUpdate and close_notify.
+
+## The libssl engine
+
+Build with `-Dimpl=libssl`, or pass `.impl = .libssl` to the dependency.
+This engine wraps libssl, AWS-LC's TLS implementation, which it shares with
+BoringSSL. It has much more real-world use behind it, and speaks the older
+versions and suites that some peers still need:
+
+- TLS 1.0 to 1.3, as client and server.
+- AWS-LC's cipher suites, CBC suites and RSA key exchange among them.
+- P-521 key exchange, besides the native engine's groups.
+
+It is a little slower than the native engine, because of the copies and the
+lock described above, and it needs a C++ runtime.
 
 ## Using it
 
@@ -189,7 +205,8 @@ The native engine is also tested with:
   the top 10,000 sites and on a random 5,000. About 10% of the servers that
   answered only support TLS 1.2, which is why the client supports it too.
   ztls connects to about 99% of the servers that answered. The rest need
-  CBC cipher suites or RSA key exchange, which ztls doesn't support.
+  CBC cipher suites or RSA key exchange, which only the libssl engine
+  supports.
 
 ## Development
 

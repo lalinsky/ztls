@@ -279,7 +279,7 @@ fn schemesFromIds(arena: std.mem.Allocator, ids: []const u16) ![]const ztls.prot
     var schemes: std.ArrayList(ztls.protocol.SignatureScheme) = .empty;
     for (ids) |id| {
         const scheme = fromWire(ztls.protocol.SignatureScheme, id) orelse unimplemented("signature scheme {x}", .{id});
-        if (std.mem.indexOfScalar(ztls.protocol.SignatureScheme, &ztls.config.default_signature_schemes, scheme) == null) unimplemented("signature scheme {x}", .{id});
+        if (std.mem.indexOfScalar(ztls.protocol.SignatureScheme, &ztls.config.known_signature_schemes, scheme) == null) unimplemented("signature scheme {x}", .{id});
         if (std.mem.indexOfScalar(ztls.protocol.SignatureScheme, schemes.items, scheme) != null) unimplemented("signature scheme {x} twice", .{id});
         try schemes.append(arena, scheme);
     }

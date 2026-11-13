@@ -65,7 +65,7 @@ pub fn run(h: *Handshake, opt: config.Client, client_random: *const [32]u8, hell
     msg = try h.nextMessage();
     var request: ?CertificateRequest = null;
     if (msg.handshake_type == .certificate_request) {
-        request = try parseCertificateRequest(msg.body, opt.auth, opt.signing_schemes);
+        request = try parseCertificateRequest(msg.body, opt.auth, opt.signing_schemes.?);
         try h.hashMessage(msg);
         msg = try h.nextMessage();
     }
@@ -212,7 +212,7 @@ fn parseServerKeyExchange(body: []const u8, opt: config.Client, public_key: *con
         .x25519, .secp256r1, .secp384r1 => {},
         else => return error.TlsIllegalParameter,
     }
-    if (std.mem.indexOfScalar(proto.SignatureScheme, opt.verify_schemes, scheme) == null) return error.TlsIllegalParameter;
+    if (std.mem.indexOfScalar(proto.SignatureScheme, opt.verify_schemes.?, scheme) == null) return error.TlsIllegalParameter;
     if (!policy.schemeSuits(scheme, public_key.key_type, .tls12)) return error.TlsIllegalParameter;
     const algorithm = policy.schemeAlgorithm(scheme, .tls12).?;
 
@@ -407,7 +407,7 @@ test "a ServerKeyExchange is signed over both randoms, with a group and scheme w
     const client_random: [32]u8 = @splat(1);
     const server_random: [32]u8 = @splat(2);
     const hello: Randoms = .{ .client = &client_random, .server = &server_random };
-    const opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true };
+    const opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .verify_schemes = &config.default_signature_schemes };
     var buf: [512]u8 = undefined;
 
     const body = try testServerKeyExchange(&buf, &pair, hello, 3, .x25519, .ecdsa_secp256r1_sha256);

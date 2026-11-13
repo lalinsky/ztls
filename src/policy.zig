@@ -23,9 +23,11 @@ pub fn checkClient(opt: config.Client) error{TlsInternalError}!void {
     for (opt.named_groups) |group| {
         if (groupKnown(group)) break;
     } else return error.TlsInternalError;
-    if (opt.verify_schemes.len == 0) return error.TlsInternalError;
+    if (opt.verify_schemes) |schemes| {
+        if (schemes.len == 0) return error.TlsInternalError;
+    }
     if (!schemesSupported(opt.verify_schemes) or !schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
-    if (!offers(opt, .tls_1_3) and !offers(opt, .tls_1_2)) return error.TlsInternalError;
+    try checkVersions(opt.min_version, opt.max_version);
     if (offers(opt, .tls_1_3)) {
         if (opt.key_shares.len == 0) return error.TlsInternalError;
         for (opt.key_shares, 0..) |group, i| {
@@ -36,19 +38,51 @@ pub fn checkClient(opt: config.Client) error{TlsInternalError}!void {
     }
 }
 
-/// The suites a client offers: the default list puts ChaCha20-Poly1305
-/// first without AES instructions, where software AES is several times
-/// slower, so that servers that follow the client's order pick it. Any
-/// other list is offered as given.
-pub fn offeredSuites(suites: []const proto.CipherSuite, aes_hardware: bool) []const proto.CipherSuite {
-    if (aes_hardware or !std.mem.eql(proto.CipherSuite, suites, &config.default_cipher_suites)) return suites;
+/// Refuses a version bound that is not a TLS version, or a range with
+/// nothing in it.
+fn checkVersions(min: ?proto.Version, max: ?proto.Version) error{TlsInternalError}!void {
+    if (min) |v| {
+        if (!versionKnown(v)) return error.TlsInternalError;
+    }
+    if (max) |v| {
+        if (!versionKnown(v)) return error.TlsInternalError;
+    }
+    if (min != null and max != null and @intFromEnum(min.?) > @intFromEnum(max.?)) return error.TlsInternalError;
+}
+
+fn versionKnown(version: proto.Version) bool {
+    return switch (version) {
+        .tls_1_0, .tls_1_1, .tls_1_2, .tls_1_3 => true,
+        _ => false,
+    };
+}
+
+/// Whether `version` is within `min` and `max`, each null for no bound.
+pub fn inRange(min: ?proto.Version, max: ?proto.Version, version: proto.Version) bool {
+    if (min) |v| {
+        if (@intFromEnum(version) < @intFromEnum(v)) return false;
+    }
+    if (max) |v| {
+        if (@intFromEnum(version) > @intFromEnum(v)) return false;
+    }
+    return true;
+}
+
+/// The suites a native client offers: the default list puts
+/// ChaCha20-Poly1305 first without AES instructions, where software AES is
+/// several times slower, so that servers that follow the client's order
+/// pick it. Any other list is offered as given.
+pub fn offeredSuites(suites: ?[]const proto.CipherSuite, aes_hardware: bool) []const proto.CipherSuite {
+    const list = suites orelse &config.default_cipher_suites;
+    if (aes_hardware or !std.mem.eql(proto.CipherSuite, list, &config.default_cipher_suites)) return list;
     return &config.default_cipher_suites_chacha_first;
 }
 
 /// The server's TLS 1.3 suite: the first of ours, TLS 1.2 ones passed
 /// over, that the client offers. `offered` is the ClientHello's
-/// cipher_suites as sent, two bytes each.
-pub fn chooseSuite(ours: []const proto.CipherSuite, offered: []const u8, aes_hardware: bool) ?proto.CipherSuite {
+/// cipher_suites as sent, two bytes each. Null `ours` is the default,
+/// TLS 1.3's suites.
+pub fn chooseSuite(ours: ?[]const proto.CipherSuite, offered: []const u8, aes_hardware: bool) ?proto.CipherSuite {
     const first = for (0..offered.len / 2) |i| {
         const suite = suiteAt(offered, i);
         if (suite.version() == .tls_1_3) break suite;
@@ -70,16 +104,19 @@ fn suiteAt(offered: []const u8, i: usize) proto.CipherSuite {
 /// ChaCha20-Poly1305 when either side lacks AES instructions, ours or the
 /// client's, which it tells by listing ChaCha20 first, as Go and BoringSSL
 /// servers have it. Any other list is followed as given.
-fn preferredSuites(suites: []const proto.CipherSuite, aes_hardware: bool, client_first: ?proto.CipherSuite) []const proto.CipherSuite {
+fn preferredSuites(ours: ?[]const proto.CipherSuite, aes_hardware: bool, client_first: ?proto.CipherSuite) []const proto.CipherSuite {
+    const suites = ours orelse &proto.CipherSuite.all;
     if (!std.mem.eql(proto.CipherSuite, suites, &proto.CipherSuite.all)) return suites;
     if (aes_hardware and client_first != .chacha20_poly1305_sha256) return suites;
     return &config.default_server_cipher_suites_chacha_first;
 }
 
-/// Whether `cipher_suites` offers `version`: it does with any of its
-/// suites.
+/// Whether the native client offers `version`: it does when the version
+/// is in range and one of its suites is listed. TLS 1.3's suites are the
+/// same for both implementations, so for it this holds under libssl too.
 pub fn offers(opt: config.Client, comptime version: proto.Version) bool {
-    for (opt.cipher_suites) |suite| {
+    if (!inRange(opt.min_version, opt.max_version, version)) return false;
+    for (opt.cipher_suites orelse &config.default_cipher_suites) |suite| {
         if (suite.version() == version) return true;
     }
     return false;
@@ -99,14 +136,16 @@ pub fn sendsSni(host: []const u8) bool {
 
 /// Refuses server options that make no sense, before anything is read.
 pub fn checkServer(opt: config.Server) error{TlsInternalError}!void {
-    if (opt.verify_schemes.len == 0 or opt.signing_schemes.len == 0) return error.TlsInternalError;
+    if (opt.verify_schemes) |schemes| {
+        if (schemes.len == 0) return error.TlsInternalError;
+    }
+    if (opt.signing_schemes) |schemes| {
+        if (schemes.len == 0) return error.TlsInternalError;
+    }
     for (opt.named_groups) |group| {
         if (groupKnown(group)) break;
     } else return error.TlsInternalError;
-    // The server speaks TLS 1.3 only, so it needs one of its suites.
-    for (opt.cipher_suites) |suite| {
-        if (suite.version() == .tls_1_3) break;
-    } else return error.TlsInternalError;
+    try checkVersions(opt.min_version, opt.max_version);
     if (!schemesSupported(opt.verify_schemes) or !schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
 }
 
@@ -121,8 +160,8 @@ pub fn groupKnown(group: proto.NamedGroup) bool {
 
 /// The algorithm a scheme stands for when it signs a handshake in
 /// `version`: a CertificateVerify, or in TLS 1.2 a ServerKeyExchange too.
-/// Null for one that may not: the rsa_pkcs1 ones in TLS 1.3 (§4.2.3), and
-/// any scheme we do not implement.
+/// Null for one that may not: the rsa_pkcs1 and SHA-1 ones in TLS 1.3
+/// (§4.2.3), and any scheme we do not implement.
 pub fn schemeAlgorithm(scheme: proto.SignatureScheme, version: Version) ?sig.Algorithm {
     return switch (scheme) {
         .ecdsa_secp256r1_sha256 => .ecdsa_sha256,
@@ -135,6 +174,8 @@ pub fn schemeAlgorithm(scheme: proto.SignatureScheme, version: Version) ?sig.Alg
         .rsa_pkcs1_sha256 => if (version == .tls12) .rsa_pkcs1_sha256 else null,
         .rsa_pkcs1_sha384 => if (version == .tls12) .rsa_pkcs1_sha384 else null,
         .rsa_pkcs1_sha512 => if (version == .tls12) .rsa_pkcs1_sha512 else null,
+        .rsa_pkcs1_sha1 => if (version == .tls12) .rsa_pkcs1_sha1 else null,
+        .ecdsa_sha1 => if (version == .tls12) .ecdsa_sha1 else null,
         else => null,
     };
 }
@@ -160,11 +201,13 @@ pub fn schemeSuits(scheme: proto.SignatureScheme, key_type: sig.KeyType, version
     };
 }
 
-/// Whether `schemes` are all ones we implement, none twice.
-pub fn schemesSupported(schemes: []const proto.SignatureScheme) bool {
-    for (schemes, 0..) |scheme, i| {
-        if (std.mem.indexOfScalar(proto.SignatureScheme, &config.default_signature_schemes, scheme) == null) return false;
-        if (std.mem.indexOfScalar(proto.SignatureScheme, schemes[0..i], scheme) != null) return false;
+/// Whether `schemes` are all ones we implement, none twice. Null is the
+/// implementation's default.
+pub fn schemesSupported(schemes: ?[]const proto.SignatureScheme) bool {
+    const list = schemes orelse return true;
+    for (list, 0..) |scheme, i| {
+        if (std.mem.indexOfScalar(proto.SignatureScheme, &config.known_signature_schemes, scheme) == null) return false;
+        if (std.mem.indexOfScalar(proto.SignatureScheme, list[0..i], scheme) != null) return false;
     }
     return true;
 }
@@ -245,7 +288,11 @@ test "TLS 1.2 schemes name the hash only, and take PKCS#1 v1.5" {
     try testing.expect(schemeSuits(.rsa_pss_rsae_sha512, .{ .rsa = 2048 }, .tls12));
     try testing.expect(!schemeSuits(.rsa_pkcs1_sha384, .{ .ecdsa = .p384 }, .tls12));
     try testing.expect(schemeSuits(.ed25519, .ed25519, .tls12));
-    try testing.expect(!schemeSuits(.rsa_pkcs1_sha1, .{ .rsa = 2048 }, .tls12));
+    // SHA-1, for peers that take nothing else; never in TLS 1.3.
+    try testing.expect(schemeSuits(.rsa_pkcs1_sha1, .{ .rsa = 2048 }, .tls12));
+    try testing.expect(schemeSuits(.ecdsa_sha1, .{ .ecdsa = .p256 }, .tls12));
+    try testing.expect(!schemeSuits(.rsa_pkcs1_sha1, .{ .rsa = 2048 }, .tls13));
+    try testing.expect(!schemeSuits(.ecdsa_sha1, .{ .ecdsa = .p256 }, .tls13));
     try testing.expectEqual(proto.SignatureScheme.rsa_pkcs1_sha256, selectScheme(&config.default_signature_schemes, .{ .rsa = 2048 }, &.{.rsa_pkcs1_sha256}, .tls12).?);
 }
 

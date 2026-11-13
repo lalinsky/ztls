@@ -20,6 +20,14 @@ pub fn run(conn: *Connection, options: config.Client) Error!void {
     try policy.checkClient(options);
     var opt = options;
     opt.cipher_suites = policy.offeredSuites(opt.cipher_suites, crypto.aead.hasAesHardware());
+    opt.verify_schemes = opt.verify_schemes orelse &config.default_signature_schemes;
+    opt.signing_schemes = opt.signing_schemes orelse &config.default_signature_schemes;
+    // Only the suites of TLS 1.3 and 1.2 that we implement, and one of
+    // those versions in range.
+    for (opt.cipher_suites.?) |suite| {
+        if (suite.version() == null) return error.TlsInternalError;
+    }
+    if (!policy.offers(opt, .tls_1_3) and !policy.offers(opt, .tls_1_2)) return error.TlsInternalError;
     var groups_buf: [max_groups]proto.NamedGroup = undefined;
     if (offeredGroups(opt, &groups_buf).len == 0) return error.TlsInternalError;
     var h = Handshake.init(conn, options.gpa, options.max_handshake_message_len);
@@ -105,7 +113,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     var shares: KeyShares = if (policy.offers(opt, .tls_1_3)) try KeyShares.generate(opt.key_shares) else .{};
     defer shares.deinit();
     // A TLS 1.2 client certificate signs the messages themselves.
-    if (policy.offers(opt, .tls_1_2) and opt.auth != null and opt.signing_schemes.len > 0) h.keepRawTranscript();
+    if (policy.offers(opt, .tls_1_2) and opt.auth != null and opt.signing_schemes.?.len > 0) h.keepRawTranscript();
     h.record_version = @enumFromInt(0x0301);
     try writeClientHello(h, opt, &random, session_id, &shares, opt.key_shares, null);
     h.record_version = .tls_1_2;
@@ -198,7 +206,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     msg = try h.nextMessage();
     var request: ?CertificateRequest = null;
     if (msg.handshake_type == .certificate_request) {
-        request = try parseCertificateRequest(msg.body, opt.auth, opt.signing_schemes);
+        request = try parseCertificateRequest(msg.body, opt.auth, opt.signing_schemes.?);
         try h.hashMessage(msg);
         msg = try h.nextMessage();
     }
@@ -215,7 +223,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
 
     msg = try h.nextMessage();
     try h.expect(msg, .certificate_verify);
-    try h.verifyCertificateVerify(msg.body, &peer.public_key, .server, opt.verify_schemes);
+    try h.verifyCertificateVerify(msg.body, &peer.public_key, .server, opt.verify_schemes.?);
     try h.hashMessage(msg);
 
     msg = try h.nextMessage();
@@ -280,7 +288,9 @@ fn build(
     try w.vector(u8, session_id);
     {
         const suites = try w.beginLength(u16);
-        for (opt.cipher_suites) |suite| try w.enumValue(suite);
+        for (opt.cipher_suites.?) |suite| {
+            if (policy.inRange(opt.min_version, opt.max_version, suite.version().?)) try w.enumValue(suite);
+        }
         // Secure renegotiation (RFC 5746 §3.4), which we never do: the
         // signal that we would refuse it safely.
         if (policy.offers(opt, .tls_1_2)) try w.enumValue(proto.CipherSuite.empty_renegotiation_info_scsv);
@@ -310,7 +320,7 @@ fn build(
     {
         try w.enumValue(proto.Extension.signature_algorithms);
         const ext = try w.beginLength(u16);
-        try w.enumList(opt.verify_schemes);
+        try w.enumList(opt.verify_schemes.?);
         try ext.end(w);
     }
     if (policy.offers(opt, .tls_1_3)) {
@@ -399,7 +409,7 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
     };
     if (!offered) return error.TlsProtocolVersion;
     // One of ours, and one of the version's.
-    if (std.mem.indexOfScalar(proto.CipherSuite, opt.cipher_suites, suite) == null) return error.TlsIllegalParameter;
+    if (std.mem.indexOfScalar(proto.CipherSuite, opt.cipher_suites.?, suite) == null) return error.TlsIllegalParameter;
     if (suite.version() != version) return error.TlsIllegalParameter;
 
     if (version == .tls_1_2) return .{ .tls12 = try parseServerHelloTls12(opt, random, session_id, echoed_session_id, suite, extensions) };

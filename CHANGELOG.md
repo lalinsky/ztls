@@ -7,6 +7,8 @@ All notable changes to this project will be documented in this file.
 - The `tls12` build option is gone; the TLS 1.2 client is always built in.
 - `config.Client` and `config.Server` take an `io`, which the libssl engine waits with; there, reads, writes and handshakes may fail with `Canceled`.
 - `now` is optional in `config.Client` and `config.Server`; by default the real clock is read through `io` when a certificate is checked.
+- `config.Client` and `config.Server` take `min_version` and `max_version`, and `cipher_suites` is optional; null leaves each to the engine. The libssl engine now speaks whatever AWS-LC does: TLS 1.0 to 1.3 on both sides, with AWS-LC's suites, CBC and RSA key exchange among them. The native engine refuses a suite it does not implement, and a range without a version it speaks.
+- `verify_schemes` and `signing_schemes` are optional too, and TLS 1.2's SHA-1 schemes, `ecdsa_sha1` and `rsa_pkcs1_sha1`, are supported. The libssl engine takes them by default, the native one when they are listed. `config.known_signature_schemes` lists every scheme ztls implements.
 
 ## [0.1.0] - 2026-11-11
 
