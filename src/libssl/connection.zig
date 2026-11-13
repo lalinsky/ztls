@@ -114,9 +114,6 @@ pub const Connection = struct {
     /// task and guards what they share, below. Held for one call at a
     /// time, never across transport I/O.
     mutex: Io.Mutex = .init,
-    /// A read ran since the last write, so libssl may hold a KeyUpdate
-    /// reply that only a write sends.
-    write_owed: bool = false,
     /// The read side's failure: the write side sends its alert, then fails
     /// with it too.
     read_failure: ?Failure = null,
@@ -465,7 +462,6 @@ pub const Connection = struct {
         while (true) {
             lock(&conn.mutex);
             const step: Result = if (conn.feed()) conn.call(.read, dest[0..len]) else |err| .{ .failed = err };
-            conn.write_owed = true;
             const failure: ?Failure = switch (step) {
                 .ok, .want_read, .closed => null,
                 // Neither can happen: a memory BIO takes all libssl writes,
@@ -588,9 +584,6 @@ pub const Connection = struct {
             }
             const step = conn.call(op, bytes);
             switch (step) {
-                .ok => if (op != .shutdown) {
-                    conn.write_owed = false;
-                },
                 .failed => |err| conn.ensureAlert(err),
                 else => {},
             }
@@ -615,16 +608,14 @@ pub const Connection = struct {
         try conn.writeOp(.write, bytes);
     }
 
-    /// Sends everything encrypted, and what libssl has queued: a KeyUpdate
-    /// reply goes out with an empty write.
+    /// Sends everything encrypted. A KeyUpdate reply a read left owing
+    /// waits for the next record written, as in the native implementation.
     fn flushWrite(conn: *Connection) WriteError!void {
         try conn.checkWritable();
         lock(&conn.mutex);
-        const owed = conn.write_owed;
         const read_failure = conn.read_failure;
         unlock(&conn.mutex);
         if (read_failure) |err| return conn.takeReadFailure(err);
-        if (owed) try conn.writeOp(.write, "");
         conn.sendWritten(true) catch return error.WriteFailed;
     }
 
