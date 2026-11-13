@@ -58,7 +58,7 @@ pub const input_buffer_len = api.input_buffer_len;
 pub const output_buffer_len = api.output_buffer_len;
 
 /// The most plaintext one SSL_write is given: one record's worth.
-const max_plaintext_len = 16 * 1024;
+const max_plaintext_len = api.max_plaintext_len;
 /// The most copies of a short repeated pattern gathered into one record.
 const splat_buffer_len = 1024;
 
@@ -342,8 +342,11 @@ pub const Connection = struct {
 
     // Handshake
 
-    /// Runs the handshake to its end, with both of the transport's sides.
-    fn runHandshake(conn: *Connection) HandshakeError!void {
+    /// Runs the handshake to its end, with both of the transport's sides,
+    /// with `options` there for the callbacks.
+    fn runHandshake(conn: *Connection, options: Options) HandshakeError!void {
+        conn.options = options;
+        defer conn.options = .none;
         defer conn.dropSigning();
         while (true) {
             lock(&conn.mutex);
@@ -591,8 +594,8 @@ pub const Connection = struct {
             switch (step) {
                 .ok => return,
                 // None can happen: a memory BIO takes all libssl writes,
-                // and none of these reads. libssl may hold half a write now, so the
-                // direction is over.
+                // and none of these reads. libssl may hold half a write
+                // now, so the direction is over.
                 .want_read, .want_write, .want_private_key, .closed => return conn.failWrite(error.TlsInternalError),
                 .failed => |err| {
                     conn.sendWritten(true) catch {};
@@ -666,16 +669,20 @@ pub const Connection = struct {
             return error.WriteFailed;
         }
 
-        /// Encrypts one record: from what is buffered when there is any,
-        /// else from the start of `data`. Takes from the buffer and from
-        /// `data` only what libssl took.
+        /// Encrypts what is buffered, a record at a time, or when nothing
+        /// is, one record from the start of `data`. Takes from the buffer
+        /// and from `data` only what libssl took.
         fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
             const self: *Writer = @fieldParentPtr("interface", w);
             const conn = self.conn;
             if (w.end > 0) {
-                const n = @min(w.end, max_plaintext_len);
-                conn.writeRecord(w.buffer[0..n]) catch |err| return self.fail(err);
-                _ = w.consume(n);
+                var done: usize = 0;
+                defer _ = w.consume(done);
+                while (done < w.end) {
+                    const n = @min(w.end - done, max_plaintext_len);
+                    conn.writeRecord(w.buffer[done..][0..n]) catch |err| return self.fail(err);
+                    done += n;
+                }
                 return 0;
             }
             for (data[0 .. data.len - 1]) |bytes| {
@@ -704,7 +711,7 @@ pub const Connection = struct {
         /// Encrypts what is buffered and sends everything encrypted.
         fn flush(w: *Io.Writer) Io.Writer.Error!void {
             const self: *Writer = @fieldParentPtr("interface", w);
-            while (w.end > 0) _ = try drain(w, &.{""}, 1);
+            _ = try drain(w, &.{""}, 1);
             self.conn.flushWrite() catch |err| return self.fail(err);
         }
 
@@ -773,6 +780,8 @@ fn reasonError(packed_error: u32) ?HandshakeError {
 /// Runs the client side of a handshake over `input` and `output`.
 pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) HandshakeError!Connection {
     try policy.checkClient(options);
+    // A failed setup call leaves its error on this thread's queue.
+    errdefer c.ERR_clear_error();
     const g = try globals();
     var conn = try Connection.init(g.client_ctx, input, output, .client);
     errdefer conn.deinit();
@@ -803,12 +812,7 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Han
     // The certificate is picked when the server asks for one.
     if (options.auth != null) c.SSL_set_cert_cb(ssl, clientCertificateCallback, null);
 
-    conn.options = .{ .client = &options };
-    conn.runHandshake() catch |err| {
-        conn.options = .none;
-        return err;
-    };
-    conn.options = .none;
+    try conn.runHandshake(.{ .client = &options });
     conn.alpn_protocol = selectedAlpn(ssl, options.alpn_protocols);
     conn.strict_close_notify = options.strict_close_notify;
     try conn.finishHandshake(options.gpa, options.keep_peer_certificates);
@@ -818,6 +822,8 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Han
 /// Runs the server side of a handshake over `input` and `output`.
 pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) HandshakeError!Connection {
     try policy.checkServer(options);
+    // A failed setup call leaves its error on this thread's queue.
+    errdefer c.ERR_clear_error();
     const g = try globals();
     var conn = try Connection.init(g.server_ctx, input, output, .server);
     errdefer conn.deinit();
@@ -839,12 +845,7 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Han
         c.SSL_set_custom_verify(ssl, mode, verifyCallback);
     }
 
-    conn.options = .{ .server = &options };
-    conn.runHandshake() catch |err| {
-        conn.options = .none;
-        return err;
-    };
-    conn.options = .none;
+    try conn.runHandshake(.{ .server = &options });
     conn.alpn_protocol = selectedAlpn(ssl, options.alpn_protocols);
     conn.strict_close_notify = options.strict_close_notify;
     if (c.SSL_get_servername(ssl, c.TLSEXT_NAMETYPE_host_name)) |name| conn.setServerName(std.mem.span(name));
@@ -1087,6 +1088,7 @@ fn signCallback(
         conn.callback_error = error.TlsInternalError;
         return c.ssl_private_key_failure;
     };
+    conn.dropSigning();
     const gpa = conn.optionsGpa();
     const job = gpa.create(Signing) catch {
         conn.callback_error = error.OutOfMemory;
@@ -1164,15 +1166,12 @@ fn alpnSelectCallback(
     const conn = connectionOf(ssl);
     const ours = conn.options.server.alpn_protocols;
     if (ours.len == 0) return c.SSL_TLSEXT_ERR_NOACK;
+    // libssl has checked the list's encoding.
     const offered = in[0..in_len];
     for (ours) |name| {
         var i: usize = 0;
         while (i < offered.len) {
             const len = offered[i];
-            if (len == 0 or i + 1 + len > offered.len) {
-                conn.callback_error = error.TlsIllegalParameter;
-                return c.SSL_TLSEXT_ERR_ALERT_FATAL;
-            }
             const candidate = offered[i + 1 ..][0..len];
             if (std.mem.eql(u8, candidate, name)) {
                 out.* = name.ptr;

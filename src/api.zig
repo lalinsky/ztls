@@ -46,7 +46,8 @@ pub const State = enum(u8) {
 };
 
 const header_len = 5;
-const max_plaintext_len = 1 << 14;
+/// The most plaintext one record carries.
+pub const max_plaintext_len = 1 << 14;
 
 /// The transport reader's buffer must hold one whole record: the header
 /// and the longest encrypted body a peer may send (RFC 9846 §5.2).
