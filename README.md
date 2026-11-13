@@ -189,6 +189,10 @@ signature algorithms, or with a `select_certificate` callback.
 - Client-server tests over loopback, for both engines.
 - Interoperability tests with OpenSSL's `s_server` and `s_client` and with
   Go's `crypto/tls`, as client and server, for both engines.
+- [tlsfuzzer](https://github.com/tlsfuzzer/tlsfuzzer)'s TLS 1.3 scripts, as
+  server, for both engines. Skipped scripts and probes are listed in
+  `tests/tlsfuzzer/run.sh`, and where the libssl engine differs, in
+  `tests/tlsfuzzer/libssl.sh`.
 
 The native engine is also tested with:
 
@@ -196,8 +200,6 @@ The native engine is also tested with:
   BoringSSL's test runner, as client and server. Tests for unsupported
   features, such as session resumption or 0-RTT, are disabled in
   `tests/bogo/config.json`.
-- [tlsfuzzer](https://github.com/tlsfuzzer/tlsfuzzer)'s TLS 1.3 scripts, as
-  server. Skipped scripts are listed in `tests/tlsfuzzer/run.sh`.
 - [TLS-Anvil](https://github.com/tls-attacker/TLS-Anvil), as server.
 - `tools/survey/run.sh`, which connects to sites from the
   [Chrome UX Report](https://github.com/zakird/crux-top-lists) top million
@@ -219,7 +221,8 @@ zig build test -fqemu -Dtarget=aarch64-linux-musl
 
 The OpenSSL and Go tests run if OpenSSL 1.1.1 or newer and Go are on the
 PATH. `tests/bogo/run.sh` runs BoGo and needs Go. `tests/tlsfuzzer/run.sh`
-runs tlsfuzzer and needs Python 3. Format with Zig 0.16's `zig fmt`,
+runs tlsfuzzer and needs Python 3; `IMPL=libssl` runs it against the libssl
+engine. Format with Zig 0.16's `zig fmt`,
 because 0.17's renames builtins that 0.16 doesn't accept.
 
 `-Dasm=false` builds AWS-LC's portable C code instead of its assembly. It

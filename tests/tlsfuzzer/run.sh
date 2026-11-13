@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs tlsfuzzer's TLS 1.3 scripts against ztls's server (server.zig).
+# Runs tlsfuzzer's TLS 1.3 scripts against ztls's server (server.zig),
+# built with the engine IMPL names: native (the default) or libssl.
 #
 # Needs Python 3 with venv. tlsfuzzer and its Python packages go under
 # .tlsfuzzer/ in the repository, made on the first run and reused.
@@ -11,6 +12,8 @@ cd "$(dirname "$0")/../.."
 
 : "${ZIG:=zig}"
 : "${PYTHON:=python3}"
+# The engine the server is built with: native or libssl.
+: "${IMPL:=native}"
 : "${PARALLEL:=4}"
 : "${TLSFUZZER:=.tlsfuzzer/tlsfuzzer}"
 # Pinned: the scripts and what they expect change.
@@ -35,13 +38,15 @@ if [ "$(cat "$venv/packages" 2>/dev/null)" != "${python_packages[*]}" ]; then
     echo "${python_packages[*]}" > "$venv/packages"
 fi
 
-"$ZIG" build tlsfuzzer-server
+"$ZIG" build tlsfuzzer-server -Dimpl="$IMPL"
 
 root=$PWD
 clients=$root/tests/tlsfuzzer
 pki=$root/src/testdata/pki
 # What the server takes in a client's CertificateVerify.
 sigalgs='ecdsa_secp256r1_sha256 ecdsa_secp384r1_sha384 ecdsa_secp521r1_sha512 ed25519 rsa_pss_rsae_sha256 rsa_pss_rsae_sha384 rsa_pss_rsae_sha512 rsa_pkcs1_sha256 rsa_pkcs1_sha384 rsa_pkcs1_sha512'
+# libssl's default takes TLS 1.2's SHA-1 ones too.
+if [ "$IMPL" = libssl ]; then sigalgs+=' ecdsa_sha1 rsa_pkcs1_sha1'; fi
 
 # Every probe of test-tls13-obsolete-curves.py with a key share for an
 # obsolete group that supported_groups does not list.
@@ -315,6 +320,16 @@ run() {
 export -f run
 export TLSFUZZER root out
 export python=$root/$venv/bin/python
+
+# What the libssl engine does differently; see libssl.sh.
+if [ "$IMPL" = libssl ]; then
+    source "$clients/libssl.sh"
+    for i in "${!tests[@]}"; do
+        name=${tests[$i]%%[[:space:]]*}
+        if [ -n "${libssl_replace[$name]:-}" ]; then tests[$i]=$name; fi
+        tests[$i]+=${libssl_args[$name]:-}
+    done
+fi
 
 selected=()
 for t in "${tests[@]}"; do
