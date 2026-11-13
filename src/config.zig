@@ -326,8 +326,11 @@ pub const Server = struct {
     /// here are skipped. The default prefers ChaCha20-Poly1305 when either
     /// side lacks AES instructions: this machine, or a client that lists
     /// it first among the TLS 1.3 suites. So does a list equal to the
-    /// default; any other is followed as given.
+    /// default; any other is followed as given. At least one TLS 1.3
+    /// suite.
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
+    /// In preference order; groups ztls has no key exchange for are
+    /// skipped. At least one it has.
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
     /// Sent in a CertificateRequest, and the only schemes a client
     /// certificate's key may sign with. Signatures inside the chain are

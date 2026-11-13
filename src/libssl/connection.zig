@@ -798,7 +798,7 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Han
     const offers_tls13 = policy.offers(options, .tls_1_3);
     try setVersions(ssl, if (offers_tls12) c.TLS1_2_VERSION else c.TLS1_3_VERSION, if (offers_tls13) c.TLS1_3_VERSION else c.TLS1_2_VERSION);
     try setCipherSuites(ssl, options.cipher_suites);
-    try setPreferences(ssl, options.named_groups, options.signing_schemes, options.verify_schemes);
+    try setPreferences(ssl, .client, options.named_groups, options.signing_schemes, options.verify_schemes);
     // libssl holds every handshake message to this, but to no less than
     // 16 KiB.
     c.SSL_set_max_cert_list(ssl, options.max_handshake_message_len);
@@ -833,7 +833,6 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Han
 /// Runs the server side of a handshake over `input` and `output`.
 pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) HandshakeError!Connection {
     try policy.checkServer(options);
-    if (options.auth == null and options.certificates.len == 0 and options.select_certificate == null) return error.TlsInternalError;
     const g = try globals();
     var conn = try Connection.init(g.server_ctx, input, output, .server);
     errdefer conn.deinit();
@@ -843,7 +842,7 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Han
     // The server speaks TLS 1.3 only, as the native one does.
     try setVersions(ssl, c.TLS1_3_VERSION, c.TLS1_3_VERSION);
     try setCipherSuites(ssl, options.cipher_suites);
-    try setPreferences(ssl, options.named_groups, options.signing_schemes, options.verify_schemes);
+    try setPreferences(ssl, .server, options.named_groups, options.signing_schemes, options.verify_schemes);
     // libssl holds every handshake message to this, but to no less than
     // 16 KiB.
     c.SSL_set_max_cert_list(ssl, options.max_handshake_message_len);
@@ -895,9 +894,12 @@ fn setCipherSuites(ssl: *c.SSL, suites: []const proto.CipherSuite) error{TlsInte
 }
 
 /// Groups and signature schemes in our order. libssl's own defaults
-/// differ: its client offers no Ed25519, for one.
+/// differ: its client offers no Ed25519, for one. The server takes only
+/// the groups the native one has a key exchange for; a client may list
+/// secp521r1 for the curve of a TLS 1.2 server's certificate.
 fn setPreferences(
     ssl: *c.SSL,
+    side: proto.Side,
     groups: []const proto.NamedGroup,
     signing: []const proto.SignatureScheme,
     verify: []const proto.SignatureScheme,
@@ -905,6 +907,7 @@ fn setPreferences(
     var nids: [16]c_int = undefined;
     var n: usize = 0;
     for (groups) |group| {
+        if (side == .server and !policy.groupSupported(group)) continue;
         const nid: c_int = switch (group) {
             .x25519_ml_kem768 => c.NID_X25519MLKEM768,
             .x25519 => c.NID_X25519,

@@ -29,13 +29,6 @@ pub const hello_retry_request_random = [32]u8{
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 };
 
-pub fn groupSupported(group: proto.NamedGroup) bool {
-    return switch (group) {
-        .x25519, .secp256r1, .secp384r1, .x25519_ml_kem768 => true,
-        else => false,
-    };
-}
-
 /// The key shares a side generates, one per group.
 pub const KeyShares = struct {
     x25519: ?kx.X25519 = null,

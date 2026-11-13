@@ -63,7 +63,23 @@ pub fn sendsSni(host: []const u8) bool {
 /// Refuses server options that make no sense, before anything is read.
 pub fn checkServer(opt: config.Server) error{TlsInternalError}!void {
     if (opt.verify_schemes.len == 0 or opt.signing_schemes.len == 0) return error.TlsInternalError;
+    for (opt.named_groups) |group| {
+        if (groupSupported(group)) break;
+    } else return error.TlsInternalError;
+    // The server speaks TLS 1.3 only, so it needs one of its suites.
+    for (opt.cipher_suites) |suite| {
+        if (suite.version() == .tls_1_3) break;
+    } else return error.TlsInternalError;
     if (!schemesSupported(opt.verify_schemes) or !schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
+}
+
+/// Whether ztls can exchange keys on `group`. Others may still be listed
+/// in a client's `named_groups`, for the curves of TLS 1.2 certificates.
+pub fn groupSupported(group: proto.NamedGroup) bool {
+    return switch (group) {
+        .x25519, .secp256r1, .secp384r1, .x25519_ml_kem768 => true,
+        else => false,
+    };
 }
 
 /// The algorithm a scheme stands for when it signs a handshake in

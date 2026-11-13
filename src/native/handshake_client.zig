@@ -124,7 +124,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
         var share_groups: []const proto.NamedGroup = opt.key_shares;
         if (hello.key_share) |ks| {
             if (std.mem.indexOfScalar(proto.NamedGroup, opt.named_groups, ks.group) == null) return error.TlsIllegalParameter;
-            if (!handshake.groupSupported(ks.group) or shares.has(ks.group)) return error.TlsIllegalParameter;
+            if (!policy.groupSupported(ks.group) or shares.has(ks.group)) return error.TlsIllegalParameter;
             retry_groups = .{ks.group};
             share_groups = &retry_groups;
             shares.deinit();

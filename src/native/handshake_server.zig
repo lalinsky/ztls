@@ -50,7 +50,7 @@ const ClientHello = struct {
     const max_groups = blk: {
         var n = 0;
         for (std.enums.values(proto.NamedGroup)) |group| {
-            if (handshake.groupSupported(group)) n += 1;
+            if (policy.groupSupported(group)) n += 1;
         }
         break :blk n;
     };
@@ -103,8 +103,6 @@ const Choices = struct {
 
 fn handshakeInner(h: *Handshake, opt: config.Server) Error!void {
     @setRuntimeSafety(true);
-    if (opt.cipher_suites.len == 0 or opt.named_groups.len == 0) return error.TlsInternalError;
-
     var msg = try h.nextMessage();
     try h.expect(msg, .client_hello);
     h.ccs_allowed = true;
@@ -245,9 +243,9 @@ fn choose(hello: *const ClientHello, opt: config.Server, auth: *const config.Cer
     // Of the groups the client sent shares for, our favourite; failing
     // that, our favourite among the ones it supports, via a retry.
     const group = for (opt.named_groups) |group| {
-        if (handshake.groupSupported(group) and hello.shareFor(group) != null) break group;
+        if (policy.groupSupported(group) and hello.shareFor(group) != null) break group;
     } else for (opt.named_groups) |group| {
-        if (handshake.groupSupported(group) and hello.supportsGroup(group)) break group;
+        if (policy.groupSupported(group) and hello.supportsGroup(group)) break group;
     } else return error.TlsHandshakeFailure;
 
     const schemes = hello.schemes[0..hello.schemes_len.?];
@@ -329,7 +327,7 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                     const group = try list.decode(proto.NamedGroup);
                     const share = try list.vectorBytes(u16);
                     hello.key_shares_offered += 1;
-                    if (!handshake.groupSupported(group)) continue;
+                    if (!policy.groupSupported(group)) continue;
                     if (hello.shareFor(group) != null) return error.TlsIllegalParameter;
                     hello.key_shares[hello.key_shares_len] = .{ .group = group, .share = share };
                     hello.key_shares_len += 1;
@@ -341,7 +339,7 @@ fn parseClientHello(body: []const u8) Error!ClientHello {
                 if (list.eof()) return error.TlsDecodeError;
                 while (!list.eof()) {
                     const group = try list.decode(proto.NamedGroup);
-                    if (!handshake.groupSupported(group) or hello.supportsGroup(group)) continue;
+                    if (!policy.groupSupported(group) or hello.supportsGroup(group)) continue;
                     hello.groups[hello.groups_len] = group;
                     hello.groups_len += 1;
                 }

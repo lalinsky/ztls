@@ -305,6 +305,27 @@ test "a HelloRetryRequest when the client sent no share the server takes" {
     try testing.expectEqual(proto.NamedGroup.secp256r1, seen.group.?);
 }
 
+test "the server passes over groups it has no key exchange for" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    var run: Run(lib) = .{};
+    try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{ .secp521r1, .x25519 } });
+    const seen = try clientOnce(lib, &run.loopback, .{
+        .gpa = testing.allocator,
+        .host = "localhost",
+        .root_ca = &pki.ca,
+        .now = valid_now,
+        .named_groups = &.{ .secp256r1, .secp521r1, .x25519 },
+        .key_shares = &.{.secp256r1},
+    });
+    const outcome = try run.finish(io);
+    try outcome.handshake;
+    try outcome.echo;
+    try testing.expect(seen.retried);
+    try testing.expectEqual(proto.NamedGroup.x25519, seen.group.?);
+}
+
 test "client certificates: none, requested, required" {
     const io = testing.io;
     var pki = try Pki.init();
@@ -534,6 +555,26 @@ test "signature scheme lists decide what each side signs with and accepts" {
     try testing.expectError(error.TlsCertificateRequired, outcome.handshake);
 }
 
+test "a server without a TLS 1.3 suite or a group it can use is refused before anything is read" {
+    var pki = try Pki.init();
+    defer pki.deinit();
+    var input_buffer: [lib.input_buffer_len]u8 = undefined;
+    var output_buffer: [lib.output_buffer_len]u8 = undefined;
+    const base: config.Server = .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now };
+    var no_tls13 = base;
+    no_tls13.cipher_suites = &proto.CipherSuite.tls12;
+    var no_groups = base;
+    no_groups.named_groups = &.{};
+    var no_usable_group = base;
+    no_usable_group.named_groups = &.{ .x448, .secp521r1 };
+    for ([_]config.Server{ no_tls13, no_groups, no_usable_group }) |opt| {
+        var input: Io.Reader = .fixed(&input_buffer);
+        var discard: Io.Writer.Discarding = .init(&output_buffer);
+        try testing.expectError(error.TlsInternalError, lib.server(&input, &discard.writer, opt));
+        try testing.expectEqual(0, discard.count + discard.writer.end);
+    }
+}
+
 test "signature scheme lists must be ones we implement, each once" {
     var input_buffer: [lib.input_buffer_len]u8 = undefined;
     var output_buffer: [lib.output_buffer_len]u8 = undefined;
@@ -633,6 +674,18 @@ test "the server picks its certificate by server name" {
     }));
     const outcome = try run.finish(io);
     try testing.expectError(error.TlsUnrecognizedName, outcome.handshake);
+
+    // Nor does a server with no certificate at all take any name.
+    var bare: Run(lib) = .{};
+    try bare.start(io, .{ .gpa = testing.allocator, .auth = null, .now = valid_now });
+    try testing.expectError(error.TlsAlertUnrecognizedName, clientOnce(lib, &bare.loopback, .{
+        .gpa = testing.allocator,
+        .host = "localhost",
+        .root_ca = &pki.ca,
+        .now = valid_now,
+    }));
+    const bare_outcome = try bare.finish(io);
+    try testing.expectError(error.TlsUnrecognizedName, bare_outcome.handshake);
 }
 
 test "a Certificate message longer than max_handshake_message_len is refused" {
