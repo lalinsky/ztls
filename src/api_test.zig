@@ -197,6 +197,7 @@ fn Run(comptime L: type) type {
         loopback: testu.Loopback = undefined,
         outcome: ServerOutcome = .{},
         task: Io.Future(anyerror!void) = undefined,
+        joined: bool = false,
 
         const Self = @This();
 
@@ -210,7 +211,17 @@ fn Run(comptime L: type) type {
             return serveOnce(L, loopback, options, outcome);
         }
 
+        /// Stops the server task when the test ends before `finish`, so
+        /// that it no longer uses `loopback` and `outcome`.
+        fn deinit(r: *Self, io: Io) void {
+            if (r.joined) return;
+            r.joined = true;
+            r.task.cancel(io) catch {};
+            r.loopback.deinit();
+        }
+
         fn finish(r: *Self, io: Io) !*ServerOutcome {
+            r.joined = true;
             defer r.loopback.deinit();
             try r.task.await(io);
             return &r.outcome;
@@ -230,6 +241,7 @@ test "client and server handshake with every suite, group and certificate type" 
             for (pairs) |pair| {
                 var run: Run(lib) = .{};
                 try run.start(io, .{ .gpa = testing.allocator, .auth = pair, .now = valid_now, .alpn_protocols = &.{ "h2", "http/1.1" } });
+                defer run.deinit(io);
                 const seen = try clientOnce(lib, &run.loopback, .{
                     .gpa = testing.allocator,
                     .host = "localhost",
@@ -269,6 +281,7 @@ test "a default server takes ChaCha20-Poly1305 from a client that lists it first
     }) |offered| {
         var run: Run(lib) = .{};
         try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
+        defer run.deinit(io);
         const seen = try clientOnce(lib, &run.loopback, .{
             .gpa = testing.allocator,
             .host = "localhost",
@@ -294,6 +307,7 @@ test "the server follows its own suite order over the client's" {
     }) |ours| {
         var run: Run(lib) = .{};
         try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .cipher_suites = &ours });
+        defer run.deinit(io);
         const seen = try clientOnce(lib, &run.loopback, .{
             .gpa = testing.allocator,
             .host = "localhost",
@@ -307,12 +321,33 @@ test "the server follows its own suite order over the client's" {
     }
 }
 
+test "the server follows its own group order over the client's" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    var run: Run(lib) = .{};
+    try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{ .secp256r1, .x25519 } });
+    defer run.deinit(io);
+    const seen = try clientOnce(lib, &run.loopback, .{
+        .gpa = testing.allocator,
+        .host = "localhost",
+        .root_ca = &pki.ca,
+        .now = valid_now,
+        .named_groups = &.{ .x25519, .secp256r1 },
+        .key_shares = &.{ .x25519, .secp256r1 },
+    });
+    const outcome = try run.finish(io);
+    try outcome.handshake;
+    try testing.expectEqual(proto.NamedGroup.secp256r1, seen.group.?);
+}
+
 test "a group listed twice is offered once" {
     const io = testing.io;
     var pki = try Pki.init();
     defer pki.deinit();
     var run: Run(lib) = .{};
     try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{ .secp256r1, .secp256r1 } });
+    defer run.deinit(io);
     const seen = try clientOnce(lib, &run.loopback, .{
         .gpa = testing.allocator,
         .host = "localhost",
@@ -332,6 +367,7 @@ test "a HelloRetryRequest when the client sent no share the server takes" {
     defer pki.deinit();
     var run: Run(lib) = .{};
     try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{.secp256r1} });
+    defer run.deinit(io);
     const seen = try clientOnce(lib, &run.loopback, .{
         .gpa = testing.allocator,
         .host = "localhost",
@@ -368,6 +404,7 @@ test "client certificates: none, requested, required" {
             .now = valid_now,
             .client_auth = .{ .root_ca = &pki.ca, .auth_type = case.auth_type },
         });
+        defer run.deinit(io);
         const result = clientOnce(lib, &run.loopback, .{
             .gpa = testing.allocator,
             .host = "localhost",
@@ -415,6 +452,7 @@ test "a signer hook signs CertificateVerify, once per side that presents a certi
         .now = valid_now,
         .client_auth = .{ .root_ca = &pki.ca, .auth_type = .require },
     });
+    defer run.deinit(io);
     _ = try clientOnce(lib, &run.loopback, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now, .auth = &client_pair });
     var outcome = try run.finish(io);
     try outcome.handshake;
@@ -425,6 +463,7 @@ test "a signer hook signs CertificateVerify, once per side that presents a certi
     // No client certificate asked for: the client's hook stays unused.
     var run2: Run(lib) = .{};
     try run2.start(io, .{ .gpa = testing.allocator, .auth = &server_pair, .now = valid_now });
+    defer run2.deinit(io);
     _ = try clientOnce(lib, &run2.loopback, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now, .auth = &client_pair });
     outcome = try run2.finish(io);
     try outcome.handshake;
@@ -441,6 +480,7 @@ test "a signer hook signs CertificateVerify, once per side that presents a certi
     server_pair.signer = .{ .sign = Failing.sign };
     var run3: Run(lib) = .{};
     try run3.start(io, .{ .gpa = testing.allocator, .auth = &server_pair, .now = valid_now });
+    defer run3.deinit(io);
     try testing.expectError(error.TlsAlertInternalError, clientOnce(lib, &run3.loopback, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now }));
     outcome = try run3.finish(io);
     try testing.expectError(error.TlsInternalError, outcome.handshake);
@@ -463,6 +503,7 @@ test "the client refuses a certificate it cannot trust, and tells the server" {
     for (cases) |case| {
         var run: Run(lib) = .{};
         try run.start(io, .{ .gpa = testing.allocator, .auth = case.server_pair, .now = valid_now });
+        defer run.deinit(io);
         const result = clientOnce(lib, &run.loopback, .{
             .gpa = testing.allocator,
             .host = case.host,
@@ -515,6 +556,7 @@ test "no common ALPN protocol, suite or group ends the handshake" {
     for (cases) |case| {
         var run: Run(lib) = .{};
         try run.start(io, case.server);
+        defer run.deinit(io);
         try testing.expectError(case.client_err, clientOnce(lib, &run.loopback, case.client));
         const outcome = try run.finish(io);
         try testing.expectError(case.server_err, outcome.handshake);
@@ -542,6 +584,7 @@ test "signature scheme lists decide what each side signs with and accepts" {
     for (cases) |case| {
         var run: Run(lib) = .{};
         try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_rsa, .now = valid_now, .signing_schemes = case.server_signing });
+        defer run.deinit(io);
         const result = clientOnce(lib, &run.loopback, .{
             .gpa = testing.allocator,
             .host = "localhost",
@@ -569,6 +612,7 @@ test "signature scheme lists decide what each side signs with and accepts" {
         .client_auth = .{ .root_ca = &pki.ca, .auth_type = .require },
         .verify_schemes = &.{.ed25519},
     });
+    defer run.deinit(io);
     try testing.expectError(error.TlsAlertCertificateRequired, clientOnce(lib, &run.loopback, .{
         .gpa = testing.allocator,
         .host = "localhost",
@@ -706,6 +750,7 @@ test "the server picks its certificate by server name" {
             .select_certificate = .{ .context = &picker, .callback = Picker.pick },
             .now = valid_now,
         });
+        defer run.deinit(io);
         const seen = try clientOnce(lib, &run.loopback, .{
             .gpa = testing.allocator,
             .host = case.host,
@@ -722,6 +767,7 @@ test "the server picks its certificate by server name" {
     // With no fallback, an unknown name is refused.
     var run: Run(lib) = .{};
     try run.start(io, .{ .gpa = testing.allocator, .auth = null, .certificates = &.{&pki.server_ec}, .now = valid_now });
+    defer run.deinit(io);
     try testing.expectError(error.TlsAlertUnrecognizedName, clientOnce(lib, &run.loopback, .{
         .gpa = testing.allocator,
         .host = "nomatch.invalid",
@@ -734,6 +780,7 @@ test "the server picks its certificate by server name" {
     // Nor does a server with no certificate at all take any name.
     var bare: Run(lib) = .{};
     try bare.start(io, .{ .gpa = testing.allocator, .auth = null, .now = valid_now });
+    defer bare.deinit(io);
     try testing.expectError(error.TlsAlertUnrecognizedName, clientOnce(lib, &bare.loopback, .{
         .gpa = testing.allocator,
         .host = "localhost",
@@ -767,6 +814,7 @@ test "select_certificate sees the client's schemes that ztls knows, rsa_pkcs1 on
         .now = valid_now,
         .select_certificate = .{ .context = &recorder, .callback = Recorder.pick },
     });
+    defer run.deinit(io);
     const offered = [_]proto.SignatureScheme{ .rsa_pkcs1_sha256, .ecdsa_secp256r1_sha256 };
     _ = try clientOnce(lib, &run.loopback, .{
         .gpa = testing.allocator,
@@ -799,6 +847,7 @@ test "a Certificate message longer than max_handshake_message_len is refused" {
     {
         var run: Run(lib) = .{};
         try run.start(io, .{ .gpa = testing.allocator, .auth = &big, .now = valid_now });
+        defer run.deinit(io);
         try testing.expectError(error.TlsIllegalParameter, clientOnce(lib, &run.loopback, .{
             .gpa = testing.allocator,
             .host = "localhost",
@@ -812,6 +861,7 @@ test "a Certificate message longer than max_handshake_message_len is refused" {
     {
         var run: Run(lib) = .{};
         try run.start(io, .{ .gpa = testing.allocator, .auth = &big, .now = valid_now });
+        defer run.deinit(io);
         _ = try clientOnce(lib, &run.loopback, .{
             .gpa = testing.allocator,
             .host = "localhost",
@@ -847,6 +897,7 @@ test "a client held to TLS 1.2 is refused by the TLS 1.3 server" {
     defer pki.deinit();
     var run: Run(lib) = .{};
     try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
+    defer run.deinit(io);
     try testing.expectError(error.TlsAlertProtocolVersion, clientOnce(lib, &run.loopback, .{
         .gpa = testing.allocator,
         .host = "localhost",
@@ -875,6 +926,7 @@ test "change_cipher_spec before the ClientHello or between its fragments is refu
     for (cases) |bytes| {
         var run: Run(lib) = .{};
         try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
+        defer run.deinit(io);
         {
             var t: Transport = .{ .io = io, .stream = try run.loopback.connect() };
             defer t.deinit();
@@ -922,6 +974,7 @@ test "close_notify in place of the ClientHello is the end of the stream, with no
     defer pki.deinit();
     var run: Run(lib) = .{};
     try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
+    defer run.deinit(io);
     {
         var t: Transport = .{ .io = io, .stream = try run.loopback.connect() };
         defer t.deinit();
@@ -1592,6 +1645,7 @@ test "libssl and native talk to each other, each as client and as server" {
     {
         var run: Run(native) = .{};
         try run.start(io, server_options);
+        defer run.deinit(io);
         const seen = try clientOnce(lib, &run.loopback, client_options);
         const outcome = try run.finish(io);
         try outcome.handshake;
@@ -1601,6 +1655,7 @@ test "libssl and native talk to each other, each as client and as server" {
     {
         var run: Run(lib) = .{};
         try run.start(io, server_options);
+        defer run.deinit(io);
         const seen = try clientOnce(native, &run.loopback, client_options);
         const outcome = try run.finish(io);
         try outcome.handshake;
@@ -1611,6 +1666,7 @@ test "libssl and native talk to each other, each as client and as server" {
     {
         var run: Run(native) = .{};
         try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.selfsigned, .now = valid_now });
+        defer run.deinit(io);
         try testing.expectError(error.CertificateIssuerNotFound, clientOnce(lib, &run.loopback, client_options));
         const outcome = try run.finish(io);
         try testing.expectError(error.TlsAlertUnknownCa, outcome.handshake);
@@ -1618,6 +1674,7 @@ test "libssl and native talk to each other, each as client and as server" {
     {
         var run: Run(lib) = .{};
         try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.selfsigned, .now = valid_now });
+        defer run.deinit(io);
         try testing.expectError(error.CertificateIssuerNotFound, clientOnce(native, &run.loopback, client_options));
         const outcome = try run.finish(io);
         try testing.expectError(error.TlsAlertUnknownCa, outcome.handshake);

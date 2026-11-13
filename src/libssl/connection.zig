@@ -848,6 +848,9 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Han
     errdefer conn.deinit();
     const ssl = conn.ssl;
     c.SSL_set_accept_state(ssl);
+    // Our order of groups over the client's; the suite is chosen in
+    // `selectSuiteCallback`.
+    _ = c.SSL_set_options(ssl, c.SSL_OP_CIPHER_SERVER_PREFERENCE);
 
     // The server speaks TLS 1.3 only, as the native one does.
     try setVersions(ssl, c.TLS1_3_VERSION, c.TLS1_3_VERSION);

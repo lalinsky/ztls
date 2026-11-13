@@ -272,7 +272,8 @@ pub const Client = struct {
     /// Not used under `-Dimpl=libssl`, where AWS-LC picks the shares: one
     /// for the first of `named_groups`, and one for the first group after
     /// it of the other kind, post-quantum or classical. With the default
-    /// `named_groups`, those are the default key shares.
+    /// `named_groups`, those are the default key shares. The rules above
+    /// are checked all the same.
     key_shares: []const proto.NamedGroup = &default_key_shares,
     /// Sent as signature_algorithms, and the only schemes the server may
     /// sign the handshake with: its CertificateVerify, or in TLS 1.2 its
@@ -331,9 +332,14 @@ pub const Server = struct {
     /// So does a list equal to the default; any other is followed as
     /// given. At least one TLS 1.3 suite.
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
-    /// In preference order, with at least one group ztls knows. Groups
-    /// the implementation has no key exchange for are passed over: the
-    /// native one has none for secp521r1.
+    /// In preference order, followed over the client's, with at least one
+    /// group ztls knows. Groups the implementation has no key exchange for
+    /// are passed over: the native one has none for secp521r1. The native
+    /// server takes its favourite of the groups the client sent a key
+    /// share for, and asks for another with a HelloRetryRequest only when
+    /// it can use none of them. Under `-Dimpl=libssl`, AWS-LC takes its
+    /// favourite of all the groups the client supports, asking for that
+    /// one's share when it was not sent.
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
     /// Sent in a CertificateRequest, and the only schemes a client
     /// certificate's key may sign with. Signatures inside the chain are
