@@ -35,6 +35,8 @@ jobs:
       - name: Test without TLS 1.2
         if: matrix.os == 'ubuntu-latest'
         run: zig build test -Dtls12=false --summary all
+      - name: Test with libssl
+        run: zig build test -Dimpl=libssl --summary all
 
   bogo:
     runs-on: ubuntu-latest
