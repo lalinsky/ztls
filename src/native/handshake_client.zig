@@ -19,7 +19,7 @@ const tls12 = @import("handshake_client_tls12.zig");
 pub fn run(conn: *Connection, options: config.Client) Error!void {
     try policy.checkClient(options);
     var opt = options;
-    opt.cipher_suites = offeredSuites(opt.cipher_suites, crypto.aead.hasAesHardware());
+    opt.cipher_suites = policy.offeredSuites(opt.cipher_suites, crypto.aead.hasAesHardware());
     var groups_buf: [max_groups]proto.NamedGroup = undefined;
     if (offeredGroups(opt, &groups_buf).len == 0) return error.TlsInternalError;
     var h = Handshake.init(conn, options.gpa, options.max_handshake_message_len);
@@ -29,14 +29,6 @@ pub fn run(conn: *Connection, options: config.Client) Error!void {
         h.sendAlert(err);
         return err;
     };
-}
-
-/// The suites to offer: the default list puts ChaCha20-Poly1305 first
-/// without AES instructions, where software AES is several times slower,
-/// so that servers that follow the client's order pick it.
-fn offeredSuites(suites: []const proto.CipherSuite, aes_hardware: bool) []const proto.CipherSuite {
-    if (aes_hardware or !std.mem.eql(proto.CipherSuite, suites, &config.default_cipher_suites)) return suites;
-    return &config.default_cipher_suites_chacha_first;
 }
 
 /// Room for every group we have a key exchange for.
@@ -729,20 +721,4 @@ test "only groups with a key exchange are offered" {
     try testing.expectEqualSlices(proto.NamedGroup, &.{ .x25519, .secp256r1 }, offeredGroups(opt, &buf));
     opt.named_groups = &.{ .secp521r1, .x25519_ml_kem768 };
     try testing.expectEqual(0, offeredGroups(opt, &buf).len);
-}
-
-test "the default suites put ChaCha20-Poly1305 first without AES hardware" {
-    const default: []const proto.CipherSuite = &config.default_cipher_suites;
-    try testing.expectEqual(default, offeredSuites(default, true));
-    const chacha = offeredSuites(default, false);
-    try testing.expectEqual(proto.CipherSuite.chacha20_poly1305_sha256, chacha[0]);
-    // The same suites, in an order of the same versions.
-    try testing.expectEqual(default.len, chacha.len);
-    for (default, chacha) |a, b| {
-        try testing.expect(std.mem.indexOfScalar(proto.CipherSuite, chacha, a) != null);
-        try testing.expectEqual(a.version(), b.version());
-    }
-    // A list of one's own is offered as given.
-    const own = [_]proto.CipherSuite{ .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
-    try testing.expectEqual(@as([]const proto.CipherSuite, &own), offeredSuites(&own, false));
 }

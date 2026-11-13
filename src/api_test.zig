@@ -284,6 +284,29 @@ test "a default server takes ChaCha20-Poly1305 from a client that lists it first
     }
 }
 
+test "the server follows its own suite order over the client's" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    for ([_][2]proto.CipherSuite{
+        .{ .aes_256_gcm_sha384, .aes_128_gcm_sha256 },
+        .{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 },
+    }) |ours| {
+        var run: Run(lib) = .{};
+        try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .cipher_suites = &ours });
+        const seen = try clientOnce(lib, &run.loopback, .{
+            .gpa = testing.allocator,
+            .host = "localhost",
+            .root_ca = &pki.ca,
+            .now = valid_now,
+            .cipher_suites = &.{ ours[1], ours[0] },
+        });
+        const outcome = try run.finish(io);
+        try outcome.handshake;
+        try testing.expectEqual(ours[0], seen.suite.?);
+    }
+}
+
 test "a HelloRetryRequest when the client sent no share the server takes" {
     const io = testing.io;
     var pki = try Pki.init();

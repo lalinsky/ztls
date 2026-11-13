@@ -807,7 +807,7 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Han
     const offers_tls12 = policy.offers(options, .tls_1_2);
     const offers_tls13 = policy.offers(options, .tls_1_3);
     try setVersions(ssl, if (offers_tls12) c.TLS1_2_VERSION else c.TLS1_3_VERSION, if (offers_tls13) c.TLS1_3_VERSION else c.TLS1_2_VERSION);
-    try setCipherSuites(ssl, options.cipher_suites);
+    try setCipherSuites(ssl, policy.offeredSuites(options.cipher_suites, crypto.aead.hasAesHardware()));
     try setPreferences(ssl, options.named_groups, options.signing_schemes, options.verify_schemes);
     // libssl holds every handshake message to this, but to no less than
     // 16 KiB.
@@ -1198,6 +1198,22 @@ fn alpnSelectCallback(
     return c.SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
+/// Picks the TLS 1.3 suite as the native server does, in our order. libssl
+/// would follow the client's, ours only filtering it, so it is left our
+/// choice alone. Called first thing for a ClientHello.
+fn selectSuiteCallback(hello: ?*const c.SSL_CLIENT_HELLO) callconv(.c) c.enum_ssl_select_cert_result_t {
+    const h = hello.?;
+    const conn = connectionOf(h.ssl);
+    const offered: []const u8 = if (h.cipher_suites_len == 0) &.{} else h.cipher_suites[0..h.cipher_suites_len];
+    // With none in common, libssl finds none either and says so.
+    const suite = policy.chooseSuite(conn.options.server.cipher_suites, offered, crypto.aead.hasAesHardware()) orelse return c.ssl_select_cert_success;
+    setCipherSuites(h.ssl.?, &.{suite}) catch |err| {
+        conn.callback_error = err;
+        return c.ssl_select_cert_error;
+    };
+    return c.ssl_select_cert_success;
+}
+
 /// Picks the server's certificate as the native server picks it: the
 /// application's choice, else the first of `certificates` for the
 /// client's server name that it can verify, else `auth`. libssl calls
@@ -1347,6 +1363,7 @@ fn globals() error{OutOfMemory}!Globals {
     // No resumption yet, as in the native implementation: no tickets.
     if (c.SSL_CTX_set_num_tickets(server_ctx, 0) != 1) return error.OutOfMemory;
     c.SSL_CTX_set_alpn_select_cb(server_ctx, alpnSelectCallback, null);
+    c.SSL_CTX_set_select_certificate_cb(server_ctx, selectSuiteCallback);
     if (c.SSL_CTX_set_tlsext_servername_callback(server_ctx, serverNameCallback) != 1) return error.OutOfMemory;
 
     const index = c.SSL_get_ex_new_index(0, null, null, null, null);

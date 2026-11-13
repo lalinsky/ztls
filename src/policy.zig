@@ -36,6 +36,46 @@ pub fn checkClient(opt: config.Client) error{TlsInternalError}!void {
     }
 }
 
+/// The suites a client offers: the default list puts ChaCha20-Poly1305
+/// first without AES instructions, where software AES is several times
+/// slower, so that servers that follow the client's order pick it. Any
+/// other list is offered as given.
+pub fn offeredSuites(suites: []const proto.CipherSuite, aes_hardware: bool) []const proto.CipherSuite {
+    if (aes_hardware or !std.mem.eql(proto.CipherSuite, suites, &config.default_cipher_suites)) return suites;
+    return &config.default_cipher_suites_chacha_first;
+}
+
+/// The server's TLS 1.3 suite: the first of ours, TLS 1.2 ones passed
+/// over, that the client offers. `offered` is the ClientHello's
+/// cipher_suites as sent, two bytes each.
+pub fn chooseSuite(ours: []const proto.CipherSuite, offered: []const u8, aes_hardware: bool) ?proto.CipherSuite {
+    const first = for (0..offered.len / 2) |i| {
+        const suite = suiteAt(offered, i);
+        if (suite.version() == .tls_1_3) break suite;
+    } else null;
+    for (preferredSuites(ours, aes_hardware, first)) |suite| {
+        if (suite.version() != .tls_1_3) continue;
+        for (0..offered.len / 2) |i| {
+            if (suiteAt(offered, i) == suite) return suite;
+        }
+    }
+    return null;
+}
+
+fn suiteAt(offered: []const u8, i: usize) proto.CipherSuite {
+    return @enumFromInt(std.mem.readInt(u16, offered[2 * i ..][0..2], .big));
+}
+
+/// Our suites in preference order: the default list prefers
+/// ChaCha20-Poly1305 when either side lacks AES instructions, ours or the
+/// client's, which it tells by listing ChaCha20 first, as Go and BoringSSL
+/// servers have it. Any other list is followed as given.
+fn preferredSuites(suites: []const proto.CipherSuite, aes_hardware: bool, client_first: ?proto.CipherSuite) []const proto.CipherSuite {
+    if (!std.mem.eql(proto.CipherSuite, suites, &proto.CipherSuite.all)) return suites;
+    if (aes_hardware and client_first != .chacha20_poly1305_sha256) return suites;
+    return &config.default_server_cipher_suites_chacha_first;
+}
+
 /// Whether `cipher_suites` offers `version`: it does with any of its
 /// suites.
 pub fn offers(opt: config.Client, comptime version: proto.Version) bool {
@@ -220,4 +260,34 @@ test "a key share for a group listed twice is a misconfiguration" {
         .key_shares = &.{ .secp256r1, .secp256r1 },
     };
     try testing.expectError(error.TlsInternalError, checkClient(opt));
+}
+
+test "the default suites put ChaCha20-Poly1305 first without AES hardware" {
+    const default: []const proto.CipherSuite = &config.default_cipher_suites;
+    try testing.expectEqual(default, offeredSuites(default, true));
+    const chacha = offeredSuites(default, false);
+    try testing.expectEqual(proto.CipherSuite.chacha20_poly1305_sha256, chacha[0]);
+    // The same suites, in an order of the same versions.
+    try testing.expectEqual(default.len, chacha.len);
+    for (default, chacha) |a, b| {
+        try testing.expect(std.mem.indexOfScalar(proto.CipherSuite, chacha, a) != null);
+        try testing.expectEqual(a.version(), b.version());
+    }
+    // A list of one's own is offered as given.
+    const own = [_]proto.CipherSuite{ .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
+    try testing.expectEqual(@as([]const proto.CipherSuite, &own), offeredSuites(&own, false));
+}
+
+test "the default suites prefer ChaCha20-Poly1305 when either side lacks AES hardware" {
+    const default: []const proto.CipherSuite = &proto.CipherSuite.all;
+    try testing.expectEqual(default, preferredSuites(default, true, .aes_128_gcm_sha256));
+    try testing.expectEqual(default, preferredSuites(default, true, null));
+    for ([_]struct { bool, ?proto.CipherSuite }{ .{ false, .aes_128_gcm_sha256 }, .{ true, .chacha20_poly1305_sha256 } }) |case| {
+        const ours = preferredSuites(default, case[0], case[1]);
+        try testing.expectEqual(proto.CipherSuite.chacha20_poly1305_sha256, ours[0]);
+        try testing.expectEqual(default.len, ours.len);
+    }
+    // A list of one's own is followed as given.
+    const own = [_]proto.CipherSuite{.aes_128_gcm_sha256};
+    try testing.expectEqual(@as([]const proto.CipherSuite, &own), preferredSuites(&own, false, .chacha20_poly1305_sha256));
 }
