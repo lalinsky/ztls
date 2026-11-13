@@ -240,9 +240,10 @@ test "client and server handshake with every suite, group and certificate type" 
         for (groups) |group| {
             for (pairs) |pair| {
                 var run: Run(lib) = .{};
-                try run.start(io, .{ .gpa = testing.allocator, .auth = pair, .now = valid_now, .alpn_protocols = &.{ "h2", "http/1.1" } });
+                try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = pair, .now = valid_now, .alpn_protocols = &.{ "h2", "http/1.1" } });
                 defer run.deinit(io);
                 const seen = try clientOnce(lib, &run.loopback, .{
+                    .io = testing.io,
                     .gpa = testing.allocator,
                     .host = "localhost",
                     .root_ca = &pki.ca,
@@ -280,9 +281,10 @@ test "a default server takes ChaCha20-Poly1305 from a client that lists it first
         &.{ .aes_128_gcm_sha256, .chacha20_poly1305_sha256 },
     }) |offered| {
         var run: Run(lib) = .{};
-        try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
+        try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
         defer run.deinit(io);
         const seen = try clientOnce(lib, &run.loopback, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &pki.ca,
@@ -306,9 +308,10 @@ test "the server follows its own suite order over the client's" {
         .{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 },
     }) |ours| {
         var run: Run(lib) = .{};
-        try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .cipher_suites = &ours });
+        try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .cipher_suites = &ours });
         defer run.deinit(io);
         const seen = try clientOnce(lib, &run.loopback, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &pki.ca,
@@ -326,9 +329,10 @@ test "the server follows its own group order over the client's" {
     var pki = try Pki.init();
     defer pki.deinit();
     var run: Run(lib) = .{};
-    try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{ .secp256r1, .x25519 } });
+    try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{ .secp256r1, .x25519 } });
     defer run.deinit(io);
     const seen = try clientOnce(lib, &run.loopback, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .host = "localhost",
         .root_ca = &pki.ca,
@@ -346,9 +350,10 @@ test "a group listed twice is offered once" {
     var pki = try Pki.init();
     defer pki.deinit();
     var run: Run(lib) = .{};
-    try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{ .secp256r1, .secp256r1 } });
+    try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{ .secp256r1, .secp256r1 } });
     defer run.deinit(io);
     const seen = try clientOnce(lib, &run.loopback, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .host = "localhost",
         .root_ca = &pki.ca,
@@ -366,9 +371,10 @@ test "a HelloRetryRequest when the client sent no share the server takes" {
     var pki = try Pki.init();
     defer pki.deinit();
     var run: Run(lib) = .{};
-    try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{.secp256r1} });
+    try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{.secp256r1} });
     defer run.deinit(io);
     const seen = try clientOnce(lib, &run.loopback, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .host = "localhost",
         .root_ca = &pki.ca,
@@ -399,6 +405,7 @@ test "client certificates: none, requested, required" {
     for (cases) |case| {
         var run: Run(lib) = .{};
         try run.start(io, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .auth = &pki.server_ec,
             .now = valid_now,
@@ -406,6 +413,7 @@ test "client certificates: none, requested, required" {
         });
         defer run.deinit(io);
         const result = clientOnce(lib, &run.loopback, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &pki.ca,
@@ -447,13 +455,14 @@ test "a signer hook signs CertificateVerify, once per side that presents a certi
     // Mutual authentication: each side signs once, through its hook.
     var run: Run(lib) = .{};
     try run.start(io, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .auth = &server_pair,
         .now = valid_now,
         .client_auth = .{ .root_ca = &pki.ca, .auth_type = .require },
     });
     defer run.deinit(io);
-    _ = try clientOnce(lib, &run.loopback, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now, .auth = &client_pair });
+    _ = try clientOnce(lib, &run.loopback, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now, .auth = &client_pair });
     var outcome = try run.finish(io);
     try outcome.handshake;
     try outcome.echo;
@@ -462,9 +471,9 @@ test "a signer hook signs CertificateVerify, once per side that presents a certi
 
     // No client certificate asked for: the client's hook stays unused.
     var run2: Run(lib) = .{};
-    try run2.start(io, .{ .gpa = testing.allocator, .auth = &server_pair, .now = valid_now });
+    try run2.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &server_pair, .now = valid_now });
     defer run2.deinit(io);
-    _ = try clientOnce(lib, &run2.loopback, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now, .auth = &client_pair });
+    _ = try clientOnce(lib, &run2.loopback, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now, .auth = &client_pair });
     outcome = try run2.finish(io);
     try outcome.handshake;
     try outcome.echo;
@@ -479,9 +488,9 @@ test "a signer hook signs CertificateVerify, once per side that presents a certi
     };
     server_pair.signer = .{ .sign = Failing.sign };
     var run3: Run(lib) = .{};
-    try run3.start(io, .{ .gpa = testing.allocator, .auth = &server_pair, .now = valid_now });
+    try run3.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &server_pair, .now = valid_now });
     defer run3.deinit(io);
-    try testing.expectError(error.TlsAlertInternalError, clientOnce(lib, &run3.loopback, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now }));
+    try testing.expectError(error.TlsAlertInternalError, clientOnce(lib, &run3.loopback, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now }));
     outcome = try run3.finish(io);
     try testing.expectError(error.TlsInternalError, outcome.handshake);
 }
@@ -502,9 +511,10 @@ test "the client refuses a certificate it cannot trust, and tells the server" {
     };
     for (cases) |case| {
         var run: Run(lib) = .{};
-        try run.start(io, .{ .gpa = testing.allocator, .auth = case.server_pair, .now = valid_now });
+        try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = case.server_pair, .now = valid_now });
         defer run.deinit(io);
         const result = clientOnce(lib, &run.loopback, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .host = case.host,
             .root_ca = &pki.ca,
@@ -529,8 +539,8 @@ test "no common ALPN protocol, suite or group ends the handshake" {
     defer pki.deinit();
 
     const Case = struct { server: config.Server, client: config.Client, client_err: anyerror, server_err: anyerror };
-    const base_server: config.Server = .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now };
-    const base_client: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now };
+    const base_server: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now };
+    const base_client: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now };
     var alpn_server = base_server;
     alpn_server.alpn_protocols = &.{"h2"};
     var alpn_client = base_client;
@@ -583,9 +593,10 @@ test "signature scheme lists decide what each side signs with and accepts" {
     };
     for (cases) |case| {
         var run: Run(lib) = .{};
-        try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_rsa, .now = valid_now, .signing_schemes = case.server_signing });
+        try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_rsa, .now = valid_now, .signing_schemes = case.server_signing });
         defer run.deinit(io);
         const result = clientOnce(lib, &run.loopback, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &pki.ca,
@@ -606,6 +617,7 @@ test "signature scheme lists decide what each side signs with and accepts" {
     // A client certificate the server would not take is left out.
     var run: Run(lib) = .{};
     try run.start(io, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .auth = &pki.server_ec,
         .now = valid_now,
@@ -614,6 +626,7 @@ test "signature scheme lists decide what each side signs with and accepts" {
     });
     defer run.deinit(io);
     try testing.expectError(error.TlsAlertCertificateRequired, clientOnce(lib, &run.loopback, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .host = "localhost",
         .root_ca = &pki.ca,
@@ -629,7 +642,7 @@ test "a server without a TLS 1.3 suite or a group ztls knows is refused before a
     defer pki.deinit();
     var input_buffer: [lib.input_buffer_len]u8 = undefined;
     var output_buffer: [lib.output_buffer_len]u8 = undefined;
-    const base: config.Server = .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now };
+    const base: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now };
     var no_tls13 = base;
     no_tls13.cipher_suites = &proto.CipherSuite.tls12;
     var no_groups = base;
@@ -647,7 +660,7 @@ test "a server without a TLS 1.3 suite or a group ztls knows is refused before a
 test "a client without a group ztls knows is refused before anything is sent" {
     var input_buffer: [lib.input_buffer_len]u8 = undefined;
     var output_buffer: [lib.output_buffer_len]u8 = undefined;
-    const base: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = valid_now };
+    const base: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = valid_now };
     var no_groups = base;
     no_groups.named_groups = &.{};
     var unknown_groups = base;
@@ -665,7 +678,7 @@ test "the native client is refused without a group it has a key exchange for" {
     if (libssl_build) return error.SkipZigTest;
     var input_buffer: [lib.input_buffer_len]u8 = undefined;
     var output_buffer: [lib.output_buffer_len]u8 = undefined;
-    var opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = valid_now };
+    var opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = valid_now };
     opt.named_groups = &.{.secp521r1};
     opt.key_shares = &.{};
     opt.cipher_suites = &proto.CipherSuite.tls12;
@@ -692,6 +705,7 @@ test "signature scheme lists must be ones we implement, each once" {
             var discard: Io.Writer.Discarding = .init(&output_buffer);
             const result = switch (side) {
                 .client_verify, .client_signing => lib.client(&input, &discard.writer, .{
+                    .io = testing.io,
                     .gpa = testing.allocator,
                     .host = "localhost",
                     .insecure_skip_verify = true,
@@ -700,6 +714,7 @@ test "signature scheme lists must be ones we implement, each once" {
                     .signing_schemes = if (side == .client_signing) schemes else &config.default_signature_schemes,
                 }),
                 .server_verify, .server_signing => lib.server(&input, &discard.writer, .{
+                    .io = testing.io,
                     .gpa = testing.allocator,
                     .auth = null,
                     .now = valid_now,
@@ -744,6 +759,7 @@ test "the server picks its certificate by server name" {
     for (cases) |case| {
         var run: Run(lib) = .{};
         try run.start(io, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .auth = &pki.server_ed25519,
             .certificates = &.{ &pki.server_chain, &pki.server_ec },
@@ -752,6 +768,7 @@ test "the server picks its certificate by server name" {
         });
         defer run.deinit(io);
         const seen = try clientOnce(lib, &run.loopback, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .host = case.host,
             .root_ca = &pki.ca,
@@ -766,9 +783,10 @@ test "the server picks its certificate by server name" {
 
     // With no fallback, an unknown name is refused.
     var run: Run(lib) = .{};
-    try run.start(io, .{ .gpa = testing.allocator, .auth = null, .certificates = &.{&pki.server_ec}, .now = valid_now });
+    try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .certificates = &.{&pki.server_ec}, .now = valid_now });
     defer run.deinit(io);
     try testing.expectError(error.TlsAlertUnrecognizedName, clientOnce(lib, &run.loopback, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .host = "nomatch.invalid",
         .root_ca = &pki.ca,
@@ -779,9 +797,10 @@ test "the server picks its certificate by server name" {
 
     // Nor does a server with no certificate at all take any name.
     var bare: Run(lib) = .{};
-    try bare.start(io, .{ .gpa = testing.allocator, .auth = null, .now = valid_now });
+    try bare.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .now = valid_now });
     defer bare.deinit(io);
     try testing.expectError(error.TlsAlertUnrecognizedName, clientOnce(lib, &bare.loopback, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .host = "localhost",
         .root_ca = &pki.ca,
@@ -809,6 +828,7 @@ test "select_certificate sees the client's schemes that ztls knows, rsa_pkcs1 on
     var recorder: Recorder = .{};
     var run: Run(lib) = .{};
     try run.start(io, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .auth = &pki.server_ec,
         .now = valid_now,
@@ -817,6 +837,7 @@ test "select_certificate sees the client's schemes that ztls knows, rsa_pkcs1 on
     defer run.deinit(io);
     const offered = [_]proto.SignatureScheme{ .rsa_pkcs1_sha256, .ecdsa_secp256r1_sha256 };
     _ = try clientOnce(lib, &run.loopback, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .host = "localhost",
         .root_ca = &pki.ca,
@@ -846,9 +867,10 @@ test "a Certificate message longer than max_handshake_message_len is refused" {
 
     {
         var run: Run(lib) = .{};
-        try run.start(io, .{ .gpa = testing.allocator, .auth = &big, .now = valid_now });
+        try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &big, .now = valid_now });
         defer run.deinit(io);
         try testing.expectError(error.TlsIllegalParameter, clientOnce(lib, &run.loopback, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &pki.ca,
@@ -860,9 +882,10 @@ test "a Certificate message longer than max_handshake_message_len is refused" {
     }
     {
         var run: Run(lib) = .{};
-        try run.start(io, .{ .gpa = testing.allocator, .auth = &big, .now = valid_now });
+        try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &big, .now = valid_now });
         defer run.deinit(io);
         _ = try clientOnce(lib, &run.loopback, .{
+            .io = testing.io,
             .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &pki.ca,
@@ -883,6 +906,7 @@ test "an empty host is a misconfiguration unless verification is off" {
     var input: Io.Reader = .fixed(&input_buffer);
     var discard: Io.Writer.Discarding = .init(&output_buffer);
     try testing.expectError(error.TlsInternalError, lib.client(&input, &discard.writer, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .host = "",
         .root_ca = &pki.ca,
@@ -896,9 +920,10 @@ test "a client held to TLS 1.2 is refused by the TLS 1.3 server" {
     var pki = try Pki.init();
     defer pki.deinit();
     var run: Run(lib) = .{};
-    try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
+    try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
     defer run.deinit(io);
     try testing.expectError(error.TlsAlertProtocolVersion, clientOnce(lib, &run.loopback, .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .host = "localhost",
         .root_ca = &pki.ca,
@@ -925,7 +950,7 @@ test "change_cipher_spec before the ClientHello or between its fragments is refu
     const cases = [_][]const u8{ &(ccs ++ hello), &split };
     for (cases) |bytes| {
         var run: Run(lib) = .{};
-        try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
+        try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
         defer run.deinit(io);
         {
             var t: Transport = .{ .io = io, .stream = try run.loopback.connect() };
@@ -964,7 +989,7 @@ test "a peer that hangs up during the handshake" {
     var t: Transport = .{ .io = io, .stream = try loopback.connect() };
     defer t.deinit();
     t.setUp();
-    try testing.expectError(error.EndOfStream, lib.client(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now }));
+    try testing.expectError(error.EndOfStream, lib.client(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now }));
     try rude.await(io);
 }
 
@@ -973,7 +998,7 @@ test "close_notify in place of the ClientHello is the end of the stream, with no
     var pki = try Pki.init();
     defer pki.deinit();
     var run: Run(lib) = .{};
-    try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
+    try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now });
     defer run.deinit(io);
     {
         var t: Transport = .{ .io = io, .stream = try run.loopback.connect() };
@@ -999,7 +1024,7 @@ test "a large transfer with key updates both ways" {
             var t: Transport = .{ .io = loopback.io, .stream = try loopback.accept() };
             defer t.deinit();
             t.setUp();
-            var conn = try lib.server(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .auth = auth, .now = valid_now });
+            var conn = try lib.server(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .auth = auth, .now = valid_now });
             defer conn.deinit();
             var rbuf: [4096]u8 = undefined;
             var wbuf: [64]u8 = undefined;
@@ -1029,7 +1054,7 @@ test "a large transfer with key updates both ways" {
     var t: Transport = .{ .io = io, .stream = try loopback.connect() };
     defer t.deinit();
     t.setUp();
-    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
     defer conn.deinit();
     var wbuf: [8192]u8 = undefined;
     var w = conn.writer(&wbuf);
@@ -1061,7 +1086,7 @@ test "one task reads while another writes, with key updates from both sides" {
             var t: Transport = .{ .io = loopback.io, .stream = try loopback.accept() };
             defer t.deinit();
             t.setUp();
-            var conn = try lib.server(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .auth = auth, .now = valid_now });
+            var conn = try lib.server(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .auth = auth, .now = valid_now });
             defer conn.deinit();
             var rbuf: [1024]u8 = undefined;
             var wbuf: [1024]u8 = undefined;
@@ -1097,7 +1122,7 @@ test "one task reads while another writes, with key updates from both sides" {
     var t: Transport = .{ .io = io, .stream = try loopback.connect() };
     defer t.deinit();
     t.setUp();
-    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
     defer conn.deinit();
     var reading = try io.concurrent(Reading.run, .{&conn});
     defer reading.cancel(io) catch {};
@@ -1177,7 +1202,7 @@ test "writes, flushes, key updates and close may be retried after the transport 
             var t: Transport = .{ .io = loopback.io, .stream = try loopback.accept() };
             defer t.deinit();
             t.setUp();
-            var conn = try lib.server(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .auth = context.auth, .now = valid_now, .strict_close_notify = true });
+            var conn = try lib.server(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .auth = context.auth, .now = valid_now, .strict_close_notify = true });
             defer conn.deinit();
             var rbuf: [4096]u8 = undefined;
             var r = conn.reader(&rbuf);
@@ -1203,7 +1228,7 @@ test "writes, flushes, key updates and close may be retried after the transport 
     t.setUp();
     var flaky_buffer: [lib.output_buffer_len]u8 = undefined;
     var flaky: Flaky = .init(&t.output.interface, &flaky_buffer);
-    var conn = try lib.client(&t.input.interface, &flaky.interface, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+    var conn = try lib.client(&t.input.interface, &flaky.interface, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
     defer conn.deinit();
     flaky.fail_every = 3;
 
@@ -1257,7 +1282,7 @@ test "a record that fails to open ends the read side, and the write side sends t
             var t: Transport = .{ .io = loopback.io, .stream = try loopback.accept() };
             defer t.deinit();
             t.setUp();
-            var conn = try lib.server(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .auth = context.auth, .now = valid_now });
+            var conn = try lib.server(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .auth = context.auth, .now = valid_now });
             defer conn.deinit();
             var rbuf: [64]u8 = undefined;
             var wbuf: [64]u8 = undefined;
@@ -1290,7 +1315,7 @@ test "a record that fails to open ends the read side, and the write side sends t
         var t: Transport = .{ .io = io, .stream = try loopback.connect() };
         defer t.deinit();
         t.setUp();
-        var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+        var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
         defer conn.deinit();
         try t.sendRaw(&garbage);
         var rbuf: [64]u8 = undefined;
@@ -1318,6 +1343,7 @@ test "the transport ending: inside a record, between records, and without close_
             defer t.deinit();
             t.setUp();
             var conn = try lib.server(&t.input.interface, &t.output.interface, .{
+                .io = testing.io,
                 .gpa = testing.allocator,
                 .auth = context.auth,
                 .now = valid_now,
@@ -1356,7 +1382,7 @@ test "the transport ending: inside a record, between records, and without close_
         var t: Transport = .{ .io = io, .stream = try loopback.connect() };
         defer t.deinit();
         t.setUp();
-        var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+        var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
         defer conn.deinit();
         try t.sendRaw(case.raw);
         t.lingerClose();
@@ -1398,9 +1424,9 @@ fn expectVerdict(io: Io, pki: *const Pki, side: proto.Side, misdeeds: []const Mi
             const in = &t.input.interface;
             const out = &t.output.interface;
             var conn = if (peer_side == .server)
-                try native.server(in, out, .{ .gpa = testing.allocator, .auth = &p.server_ec, .now = valid_now })
+                try native.server(in, out, .{ .io = testing.io, .gpa = testing.allocator, .auth = &p.server_ec, .now = valid_now })
             else
-                try native.client(in, out, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &p.ca, .now = valid_now });
+                try native.client(in, out, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &p.ca, .now = valid_now });
             defer conn.deinit();
             for (m) |misdeed| switch (misdeed) {
                 .sealed => |record| {
@@ -1439,9 +1465,9 @@ fn expectVerdict(io: Io, pki: *const Pki, side: proto.Side, misdeeds: []const Mi
     const in = &t.input.interface;
     const out = &t.output.interface;
     var conn = if (side == .server)
-        try lib.server(in, out, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now })
+        try lib.server(in, out, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now })
     else
-        try lib.client(in, out, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+        try lib.client(in, out, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
     defer conn.deinit();
     var rbuf: [256]u8 = undefined;
     var r = conn.reader(&rbuf);
@@ -1547,7 +1573,7 @@ test "a KeyUpdate request made while a reply is owed still reaches the peer" {
             var t: Transport = .{ .io = loopback.io, .stream = try loopback.accept() };
             defer t.deinit();
             t.setUp();
-            var conn = try native.server(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .auth = &p.server_ec, .now = valid_now });
+            var conn = try native.server(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .auth = &p.server_ec, .now = valid_now });
             defer conn.deinit();
             var rbuf: [256]u8 = undefined;
             var r = conn.reader(&rbuf);
@@ -1572,7 +1598,7 @@ test "a KeyUpdate request made while a reply is owed still reaches the peer" {
     var t: Transport = .{ .io = io, .stream = try loopback.connect() };
     defer t.deinit();
     t.setUp();
-    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
     defer conn.deinit();
     var rbuf: [256]u8 = undefined;
     var r = conn.reader(&rbuf);
@@ -1604,7 +1630,7 @@ test "a flush with nothing written sends the KeyUpdate reply a read left owing" 
             var t: Transport = .{ .io = loopback.io, .stream = try loopback.accept() };
             defer t.deinit();
             t.setUp();
-            var conn = try native.server(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .auth = &p.server_ec, .now = valid_now });
+            var conn = try native.server(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .auth = &p.server_ec, .now = valid_now });
             defer conn.deinit();
             var rbuf: [256]u8 = undefined;
             var r = conn.reader(&rbuf);
@@ -1624,7 +1650,7 @@ test "a flush with nothing written sends the KeyUpdate reply a read left owing" 
     var t: Transport = .{ .io = io, .stream = try loopback.connect() };
     defer t.deinit();
     t.setUp();
-    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
     defer conn.deinit();
     var rbuf: [256]u8 = undefined;
     var r = conn.reader(&rbuf);
@@ -1635,13 +1661,66 @@ test "a flush with nothing written sends the KeyUpdate reply a read left owing" 
     try peer.await(io);
 }
 
+test "a task canceled while the other holds the connection's lock may read again" {
+    // Only libssl's directions share a lock.
+    if (!libssl_build) return error.SkipZigTest;
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+
+    const Peer = struct {
+        fn run(loopback: *testu.Loopback, p: *const Pki) !void {
+            var t: Transport = .{ .io = loopback.io, .stream = try loopback.accept() };
+            defer t.deinit();
+            t.setUp();
+            var conn = try native.server(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .auth = &p.server_ec, .now = valid_now });
+            defer conn.deinit();
+            var rbuf: [256]u8 = undefined;
+            var r = conn.reader(&rbuf);
+            var w = conn.writer(&.{});
+            try w.interface.writeAll("ping\n");
+            try w.interface.flush();
+            try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+        }
+    };
+    var loopback = try testu.Loopback.init(io);
+    defer loopback.deinit();
+    var peer = try io.concurrent(Peer.run, .{ &loopback, &pki });
+    defer peer.cancel(io) catch {};
+
+    var t: Transport = .{ .io = io, .stream = try loopback.connect() };
+    defer t.deinit();
+    t.setUp();
+    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+    defer conn.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = conn.reader(&rbuf);
+
+    // The writing task's turn, held while the reading task is canceled.
+    const Reading = struct {
+        fn run(reader: *lib.Connection.Reader) ?api.ReadError {
+            _ = reader.interface.takeDelimiter('\n') catch return reader.err;
+            return null;
+        }
+    };
+    try conn.mutex.lock(io);
+    var reading = try io.concurrent(Reading.run, .{&r});
+    const err = reading.cancel(io);
+    conn.mutex.unlock(io);
+    try testing.expectEqual(error.Canceled, err.?);
+
+    try testing.expectEqualStrings("ping", (try r.interface.takeDelimiter('\n')).?);
+    try conn.close();
+    try peer.await(io);
+}
+
 test "libssl and native talk to each other, each as client and as server" {
     if (!libssl_build) return error.SkipZigTest;
     const io = testing.io;
     var pki = try Pki.init();
     defer pki.deinit();
-    const server_options: config.Server = .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .alpn_protocols = &.{"h2"} };
-    const client_options: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now, .alpn_protocols = &.{"h2"} };
+    const server_options: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .alpn_protocols = &.{"h2"} };
+    const client_options: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now, .alpn_protocols = &.{"h2"} };
     {
         var run: Run(native) = .{};
         try run.start(io, server_options);
@@ -1665,7 +1744,7 @@ test "libssl and native talk to each other, each as client and as server" {
     // A refusal says the same across the two.
     {
         var run: Run(native) = .{};
-        try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.selfsigned, .now = valid_now });
+        try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.selfsigned, .now = valid_now });
         defer run.deinit(io);
         try testing.expectError(error.CertificateIssuerNotFound, clientOnce(lib, &run.loopback, client_options));
         const outcome = try run.finish(io);
@@ -1673,7 +1752,7 @@ test "libssl and native talk to each other, each as client and as server" {
     }
     {
         var run: Run(lib) = .{};
-        try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.selfsigned, .now = valid_now });
+        try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = &pki.selfsigned, .now = valid_now });
         defer run.deinit(io);
         try testing.expectError(error.CertificateIssuerNotFound, clientOnce(native, &run.loopback, client_options));
         const outcome = try run.finish(io);

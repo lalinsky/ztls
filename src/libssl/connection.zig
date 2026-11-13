@@ -31,11 +31,13 @@
 //! - Each libssl call's result becomes a `Result`, and every place that
 //!   makes a call switches over all of it, with no catch-all.
 //! - One libssl object serves both directions, so the reading and the
-//!   writing task take turns at it under `mutex`. Nothing under the mutex
-//!   waits: it covers one libssl call, which only computes, and our
-//!   callbacks, which only compute too. AWS-LC's error queue is
-//!   thread-local, so it is read and cleared under the mutex as well,
-//!   before the fiber can move.
+//!   writing task take turns at it under `mutex`, an `Io.Mutex`: a task
+//!   that waits for it parks, and leaves its thread to others. Nothing
+//!   under the mutex waits: it covers one libssl call, which only
+//!   computes, and our callbacks, which only compute too. Taking it is the
+//!   only point where a task may be canceled, before anything was done.
+//!   AWS-LC's error queue is thread-local, so it is read and cleared under
+//!   the mutex as well, before the fiber can move.
 //!
 //! As in the native implementation, the read side never writes to the
 //! transport. libssl queues a KeyUpdate reply for the next write; the alert
@@ -122,6 +124,8 @@ pub const Connection = struct {
     /// task and guards what they share, below. Held for one call at a
     /// time, never across transport I/O.
     mutex: Io.Mutex = .init,
+    /// What `mutex` waits with: the options' `io`.
+    io: Io,
     /// What the BIO may touch in the current call: the transport reader,
     /// and the transport writer.
     may_read: bool = false,
@@ -176,7 +180,7 @@ pub const Connection = struct {
     strict_close_notify: bool = false,
     side: proto.Side,
 
-    fn init(g: Globals, input: *Io.Reader, output: *Io.Writer, side: proto.Side) error{OutOfMemory}!Connection {
+    fn init(g: Globals, io: Io, input: *Io.Reader, output: *Io.Writer, side: proto.Side) error{OutOfMemory}!Connection {
         if (input.buffer.len < input_buffer_len) @panic("ztls: the transport reader's buffer is shorter than input_buffer_len");
         if (output.buffer.len < output_buffer_len) @panic("ztls: the transport writer's buffer is shorter than output_buffer_len");
         const spill = c.BIO_new(c.BIO_s_mem()) orelse return error.OutOfMemory;
@@ -198,7 +202,7 @@ pub const Connection = struct {
         // Everything is set on the SSL, not the shared SSL_CTX, and none of
         // it is needed once the handshake is done.
         c.SSL_set_shed_handshake_config(ssl, 1);
-        return .{ .input = input, .output = output, .ssl = ssl, .transport_bio = bio, .spill = spill, .side = side };
+        return .{ .input = input, .output = output, .ssl = ssl, .transport_bio = bio, .spill = spill, .io = io, .side = side };
     }
 
     /// Frees libssl's state. Sends nothing; both tasks must be done.
@@ -236,6 +240,16 @@ pub const Connection = struct {
         const len = @min(n.len, conn.server_name_buf.len);
         @memcpy(conn.server_name_buf[0..len], n[0..len]);
         conn.server_name_len = @intCast(len);
+    }
+
+    /// Waits for the other task's turn at libssl to end. Canceled, it
+    /// returns before anything was done.
+    fn lock(conn: *Connection) Io.Cancelable!void {
+        try conn.mutex.lock(conn.io);
+    }
+
+    fn unlock(conn: *Connection) void {
+        conn.mutex.unlock(conn.io);
     }
 
     // libssl calls, all with `mutex` held
@@ -331,16 +345,16 @@ pub const Connection = struct {
 
     /// Moves what libssl wrote from `spill` into the transport writer,
     /// flushing that whenever it fills, and at the end too when `flush` is
-    /// set. A transport failure leaves what was not sent where it is, for
-    /// the next time.
-    fn sendWritten(conn: *Connection, flush: bool) error{WriteFailed}!void {
+    /// set. A transport failure or a cancellation leaves what was not sent
+    /// where it is, for the next time.
+    fn sendWritten(conn: *Connection, flush: bool) error{ WriteFailed, Canceled }!void {
         while (true) {
-            lock(&conn.mutex);
+            try conn.lock();
             const space = conn.output.unusedCapacitySlice();
             const want = @min(c.BIO_pending(conn.spill), space.len, std.math.maxInt(c_int));
             const got = if (want == 0) 0 else c.BIO_read(conn.spill, space.ptr, @intCast(want));
             const left = c.BIO_pending(conn.spill);
-            unlock(&conn.mutex);
+            conn.unlock();
             // A memory BIO hands over what it holds.
             if (got != @as(c_int, @intCast(want))) @panic("ztls: a memory BIO failed to hand over its contents");
             conn.output.advance(want);
@@ -364,13 +378,13 @@ pub const Connection = struct {
         defer conn.options = .none;
         defer conn.dropSigning();
         while (true) {
-            lock(&conn.mutex);
+            try conn.lock();
             const step = conn.call(.handshake, "");
             switch (step) {
                 .failed => |err| conn.ensureAlert(err),
                 else => {},
             }
-            unlock(&conn.mutex);
+            conn.unlock();
             switch (step) {
                 .ok => return conn.sendWritten(true),
                 .want_read => {
@@ -467,7 +481,7 @@ pub const Connection = struct {
         }
         const len = @min(dest.len, std.math.maxInt(c_int));
         while (true) {
-            lock(&conn.mutex);
+            try conn.lock();
             const step = conn.call(.read, dest[0..len]);
             const failure: ?Failure = switch (step) {
                 .ok, .want_read, .closed => null,
@@ -476,7 +490,7 @@ pub const Connection = struct {
                 .failed => |err| asFailure(err),
             };
             if (failure) |err| conn.failRead(err);
-            unlock(&conn.mutex);
+            conn.unlock();
 
             switch (step) {
                 .ok => |n| return n,
@@ -498,9 +512,9 @@ pub const Connection = struct {
                             conn.read_state = .closed;
                             return error.EndOfStream;
                         }
-                        lock(&conn.mutex);
+                        try conn.lock();
                         conn.failRead(error.TlsConnectionTruncated);
-                        unlock(&conn.mutex);
+                        conn.unlock();
                         return error.TlsConnectionTruncated;
                     },
                 },
@@ -513,10 +527,11 @@ pub const Connection = struct {
     pub const Reader = struct {
         conn: *Connection,
         interface: Io.Reader,
-        /// Why the last read failed: a `Failure` of the connection, or
+        /// Why the last read failed: a `Failure` of the connection,
         /// `ReadFailed` when the transport reader failed and its own error
-        /// says how; that one does not end the connection, and the read
-        /// may be retried.
+        /// says how, or `Canceled` when the task was canceled while it
+        /// waited for the writing task's turn at libssl. Those two do not
+        /// end the connection, and the read may be retried.
         err: ?ReadError = null,
 
         fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
@@ -581,19 +596,19 @@ pub const Connection = struct {
         // The sealed record, and a KeyUpdate reply that may go ahead of it.
         const room = bytes.len + (output_buffer_len - max_plaintext_len);
         while (true) {
-            lock(&conn.mutex);
+            try conn.lock();
             if (conn.read_failure) |err| {
-                unlock(&conn.mutex);
+                conn.unlock();
                 return conn.takeReadFailure(err);
             }
             if (conn.writtenPending()) {
-                unlock(&conn.mutex);
+                conn.unlock();
                 try conn.sendWritten(false);
                 continue;
             }
             // Only this task writes to the transport, so the room stays.
             if (conn.output.end > 0 and conn.output.unusedCapacitySlice().len < room) {
-                unlock(&conn.mutex);
+                conn.unlock();
                 conn.output.flush() catch return error.WriteFailed;
                 continue;
             }
@@ -602,7 +617,7 @@ pub const Connection = struct {
                 .failed => |err| conn.ensureAlert(err),
                 else => {},
             }
-            unlock(&conn.mutex);
+            conn.unlock();
             switch (step) {
                 .ok => return,
                 // None can happen: none of these reads, and no key
@@ -629,7 +644,7 @@ pub const Connection = struct {
     fn flushWrite(conn: *Connection) WriteError!void {
         try conn.checkWritable();
         try conn.writeOp(.write, "");
-        conn.sendWritten(true) catch return error.WriteFailed;
+        try conn.sendWritten(true);
     }
 
     /// Asks the peer to update its keys, updating ours, and sends the
@@ -640,7 +655,7 @@ pub const Connection = struct {
         try conn.checkWritable();
         if (conn.version != .tls_1_3) return;
         try conn.writeOp(.key_update, "");
-        conn.sendWritten(true) catch return error.WriteFailed;
+        try conn.sendWritten(true);
     }
 
     /// Sends close_notify and closes the write direction; later writes
@@ -659,7 +674,7 @@ pub const Connection = struct {
             .closed => return,
             .failed => return error.TlsConnectionFailed,
         }
-        conn.sendWritten(true) catch return error.WriteFailed;
+        try conn.sendWritten(true);
         conn.write_state = .closed;
     }
 
@@ -667,11 +682,13 @@ pub const Connection = struct {
         conn: *Connection,
         interface: Io.Writer,
         /// Why the last write failed: a `Failure` of the connection, the
-        /// read side's included since its alert goes out this way, or
+        /// read side's included since its alert goes out this way,
         /// `WriteFailed` when the transport writer failed and its own
-        /// error says how. That one does not end the connection: what was
-        /// encrypted waits for the next flush, and what was not is still
-        /// in this writer, or was not taken from the caller.
+        /// error says how, or `Canceled` when the task was canceled while
+        /// it waited for the reading task's turn at libssl. Those two do
+        /// not end the connection: what was encrypted waits for the next
+        /// flush, and what was not is still in this writer, or was not
+        /// taken from the caller.
         err: ?WriteError = null,
 
         fn fail(self: *Writer, err: WriteError) Io.Writer.Error {
@@ -792,8 +809,8 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Han
     try policy.checkClient(options);
     // A failed setup call leaves its error on this thread's queue.
     errdefer c.ERR_clear_error();
-    const g = try globals();
-    var conn = try Connection.init(g, input, output, .client);
+    const g = try globals(options.io);
+    var conn = try Connection.init(g, options.io, input, output, .client);
     errdefer conn.deinit();
     const ssl = conn.ssl;
     c.SSL_set_connect_state(ssl);
@@ -834,8 +851,8 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Han
     try policy.checkServer(options);
     // A failed setup call leaves its error on this thread's queue.
     errdefer c.ERR_clear_error();
-    const g = try globals();
-    var conn = try Connection.init(g, input, output, .server);
+    const g = try globals(options.io);
+    var conn = try Connection.init(g, options.io, input, output, .server);
     errdefer conn.deinit();
     const ssl = conn.ssl;
     c.SSL_set_accept_state(ssl);
@@ -1363,9 +1380,9 @@ const Globals = struct {
 var globals_mutex: Io.Mutex = .init;
 var globals_value: ?Globals = null;
 
-fn globals() error{OutOfMemory}!Globals {
-    lock(&globals_mutex);
-    defer unlock(&globals_mutex);
+fn globals(io: Io) error{ OutOfMemory, Canceled }!Globals {
+    try globals_mutex.lock(io);
+    defer globals_mutex.unlock(io);
     if (globals_value) |g| return g;
     defer c.ERR_clear_error();
 
@@ -1399,21 +1416,6 @@ fn newCtx() error{OutOfMemory}!*c.SSL_CTX {
 }
 
 // Helpers
-
-/// `std.Io.Threaded`'s mutex, which blocks the thread, not the fiber: what
-/// it guards never waits, so a holder never yields and the wait is short.
-/// Zig 0.17 made the plain lock cancelable.
-fn lock(m: *Io.Mutex) void {
-    if (@hasDecl(Io.Threaded, "mutexLockUncancelable")) {
-        Io.Threaded.mutexLockUncancelable(m);
-    } else {
-        Io.Threaded.mutexLock(m);
-    }
-}
-
-fn unlock(m: *Io.Mutex) void {
-    Io.Threaded.mutexUnlock(m);
-}
 
 /// A failure of the handshake as one of a connection's, for those that can
 /// only come after it.

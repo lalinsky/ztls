@@ -76,6 +76,7 @@ var input = stream.reader(io, &input_buffer);
 var output = stream.writer(io, &output_buffer);
 
 var conn = try ztls.server(&input.interface, &output.interface, .{
+    .io = io,
     .gpa = gpa,
     .auth = &pair,
     .alpn_protocols = &.{ "h2", "http/1.1" },
@@ -103,6 +104,7 @@ defer trust.deinit();
 try trust.addSystemBundle(gpa, io); // or addPem(gpa, ca_pem)
 
 var conn = try ztls.client(&input.interface, &output.interface, .{
+    .io = io,
     .gpa = gpa,
     .host = "example.com", // sent as SNI, and checked against the certificate
     .root_ca = &trust,

@@ -7,12 +7,14 @@ const proto = @import("protocol.zig");
 
 /// What a handshake can fail with. `EndOfStream` is the peer going away
 /// before it was done; `ReadFailed`/`WriteFailed` are the transport's,
-/// whose own error says why.
+/// whose own error says why. `Canceled` is the task's cancellation while
+/// it waited for the connection's lock, under `-Dimpl=libssl`.
 pub const Error = proto.LocalError || proto.Alert.Error || error{
     ReadFailed,
     WriteFailed,
     EndOfStream,
     OutOfMemory,
+    Canceled,
 };
 
 /// What a read or write can fail with: the transport's own failure,
@@ -29,13 +31,18 @@ pub const Failure = error{
     TlsNoRenegotiation,
     TlsProtocolVersion,
 } || proto.Alert.Error;
-/// What a read can fail with: the transport reader's failure, which does
-/// not end the connection, or a `Failure`, which does.
-pub const ReadError = error{ReadFailed} || Failure;
-/// What a write can fail with: the transport writer's failure or a
+/// What a read can fail with: the transport reader's failure or the
+/// task's cancellation, neither of which ends the connection, or a
+/// `Failure`, which does. `Canceled` comes only under `-Dimpl=libssl`, when
+/// the task was canceled while it waited for the writing task's turn at
+/// libssl; nothing was read, and the read may be retried.
+pub const ReadError = error{ ReadFailed, Canceled } || Failure;
+/// What a write can fail with: the transport writer's failure or the
+/// task's cancellation, neither of which ends the connection, or a
 /// `Failure`, the read side's included, since that is where its alert
-/// goes out.
-pub const WriteError = error{WriteFailed} || Failure;
+/// goes out. `Canceled` is as in `ReadError`: what was not encrypted is
+/// still in the writer, or was not taken from the caller.
+pub const WriteError = error{ WriteFailed, Canceled } || Failure;
 
 pub const State = enum(u8) {
     open,

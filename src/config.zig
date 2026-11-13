@@ -236,6 +236,11 @@ pub const default_signature_schemes = [_]proto.SignatureScheme{
 };
 
 pub const Client = struct {
+    /// What the connection waits with: under `-Dimpl=libssl`, the reading
+    /// and the writing task take turns at libssl's state under a lock that
+    /// parks the waiting task rather than its thread. The native engine
+    /// does not use it.
+    io: std.Io,
     /// For the handshake's working memory, such as the peer's messages
     /// while they are reassembled. Nothing is kept after the handshake unless
     /// `keep_peer_certificates` is set; then it must stay valid until
@@ -307,6 +312,11 @@ pub const Client = struct {
 };
 
 pub const Server = struct {
+    /// What the connection waits with: under `-Dimpl=libssl`, the reading
+    /// and the writing task take turns at libssl's state under a lock that
+    /// parks the waiting task rather than its thread. The native engine
+    /// does not use it.
+    io: std.Io,
     /// For the handshake's working memory, such as the peer's messages
     /// while they are reassembled. Nothing is kept after the handshake unless
     /// `keep_peer_certificates` is set; then it must stay valid until

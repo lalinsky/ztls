@@ -403,6 +403,7 @@ pub fn main(init: std.process.Init) !void {
     var conn = (if (o.server) blk: {
         const auth = if (pair) |*p| p else fail("a server needs -cert-file and -key-file", .{});
         var options: ztls.config.Server = .{
+            .io = io,
             .gpa = gpa,
             .auth = auth,
             .alpn_protocols = alpn_protocols,
@@ -420,6 +421,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk ztls.server(&tcp_reader.interface, &tcp_writer.interface, options);
     } else blk: {
         var options: ztls.config.Client = .{
+            .io = io,
             .gpa = gpa,
             .keep_peer_certificates = true,
             // No -host-name means no SNI, which an IP literal gives us.

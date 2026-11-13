@@ -245,13 +245,14 @@ test "TLS 1.2 schemes name the hash only, and take PKCS#1 v1.5" {
 
 test "a host longer than 255 bytes, or starting with a dot, is a misconfiguration" {
     const long: [256]u8 = @splat('a');
-    try checkClient(.{ .gpa = testing.allocator, .host = long[0..255], .insecure_skip_verify = true, .now = undefined });
-    try testing.expectError(error.TlsInternalError, checkClient(.{ .gpa = testing.allocator, .host = &long, .insecure_skip_verify = true, .now = undefined }));
-    try testing.expectError(error.TlsInternalError, checkClient(.{ .gpa = testing.allocator, .host = ".example.com", .insecure_skip_verify = true, .now = undefined }));
+    try checkClient(.{ .io = testing.io, .gpa = testing.allocator, .host = long[0..255], .insecure_skip_verify = true, .now = undefined });
+    try testing.expectError(error.TlsInternalError, checkClient(.{ .io = testing.io, .gpa = testing.allocator, .host = &long, .insecure_skip_verify = true, .now = undefined }));
+    try testing.expectError(error.TlsInternalError, checkClient(.{ .io = testing.io, .gpa = testing.allocator, .host = ".example.com", .insecure_skip_verify = true, .now = undefined }));
 }
 
 test "a key share for a group listed twice is a misconfiguration" {
     const opt: config.Client = .{
+        .io = testing.io,
         .gpa = testing.allocator,
         .host = "localhost",
         .insecure_skip_verify = true,

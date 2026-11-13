@@ -66,6 +66,7 @@ fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, groups
     var output = stream.writer(io, &output_buffer);
 
     var options: ztls.config.Client = .{
+        .io = io,
         .gpa = gpa,
         .host = host,
         .root_ca = &trust,

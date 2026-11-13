@@ -407,7 +407,7 @@ test "a ServerKeyExchange is signed over both randoms, with a group and scheme w
     const client_random: [32]u8 = @splat(1);
     const server_random: [32]u8 = @splat(2);
     const hello: Randoms = .{ .client = &client_random, .server = &server_random };
-    const opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined };
+    const opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined };
     var buf: [512]u8 = undefined;
 
     const body = try testServerKeyExchange(&buf, &pair, hello, 3, .x25519, .ecdsa_secp256r1_sha256);
