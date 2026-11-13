@@ -18,8 +18,6 @@ const testu = @import("testu.zig");
 
 const testing = std.testing;
 const pki = "src/testdata/pki/";
-/// Within the test PKI's validity (2027-01-15).
-const valid_now: Io.Timestamp = .{ .nanoseconds = 1_800_000_000 * std.time.ns_per_s };
 /// A stuck exchange is killed after this long, so a bug fails a test
 /// rather than hanging it.
 const watchdog_seconds = 60;
@@ -305,7 +303,6 @@ test "our client against openssl s_server" {
             .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &trust,
-            .now = valid_now,
             .alpn_protocols = case.client_alpn,
             .auth = if (case.client_cert) &client_pair else null,
             .cipher_suites = case.suites,
@@ -433,7 +430,6 @@ test "openssl s_client against our server" {
             .io = testing.io,
             .gpa = testing.allocator,
             .auth = case.cert,
-            .now = valid_now,
             .alpn_protocols = case.server_alpn,
             .client_auth = case.client_auth,
             .cipher_suites = case.suites,
@@ -562,7 +558,6 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
             .gpa = testing.allocator,
             .host = "localhost",
             .root_ca = &trust,
-            .now = valid_now,
             .named_groups = case.groups,
             .key_shares = case.groups,
             .alpn_protocols = &.{"h2"},
@@ -619,7 +614,6 @@ test "Go's crypto/tls against our server, with X25519MLKEM768" {
             .io = testing.io,
             .gpa = testing.allocator,
             .auth = &ec,
-            .now = valid_now,
             .alpn_protocols = &.{"h2"},
             .named_groups = case.groups,
             .client_auth = if (case.client_cert) .{ .root_ca = &trust, .auth_type = .require } else null,

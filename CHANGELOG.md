@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 - The `tls12` build option is gone; the TLS 1.2 client is always built in.
 - `config.Client` and `config.Server` take an `io`, which the libssl engine waits with; there, reads, writes and handshakes may fail with `Canceled`.
+- `now` is optional in `config.Client` and `config.Server`; by default the real clock is read through `io` when a certificate is checked.
 
 ## [0.1.0] - 2026-11-11
 

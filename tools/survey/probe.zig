@@ -71,7 +71,6 @@ fn probe(gpa: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, groups
         .host = host,
         .root_ca = &trust,
         .alpn_protocols = &.{"http/1.1"},
-        .now = std.Io.Clock.real.now(io),
     };
     if (!tls12) options.cipher_suites = &ztls.protocol.CipherSuite.all;
     if (groups.len > 0) {

@@ -209,7 +209,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     defer peer.deinit();
     h.conn.peer_key_type = peer.public_key.key_type;
     if (!opt.insecure_skip_verify) {
-        try h.verifyChain(&peer, opt.root_ca.?, .server, opt.host, opt.now.toSeconds());
+        try h.verifyChain(&peer, opt.root_ca.?, .server, opt.host, policy.verifyTime(opt.io, opt.now));
     }
     try h.hashMessage(msg);
 
@@ -587,7 +587,7 @@ fn parseCertificateRequest(body: []const u8, auth: ?*const config.CertKeyPair, s
 const testing = std.testing;
 
 test "a ServerHello must echo the session id and name TLS 1.3" {
-    const opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
+    const opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all };
     var session_id: [32]u8 = @splat(7);
     var buf: [256]u8 = undefined;
     var w = codec.Writer.init(&buf);
@@ -637,8 +637,8 @@ fn testServerHello(buf: []u8, version: proto.Version, random: *const [32]u8, ses
 
 test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
     const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
-    const opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
-    const only13: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };
+    const opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &both };
+    const only13: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all };
     const ours: [32]u8 = @splat(7);
     const theirs: [32]u8 = @splat(9);
     var random: [32]u8 = @splat(0x5a);
@@ -670,7 +670,7 @@ test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
 
     // The downgrade sentinels, since we offered TLS 1.3 too, but not when
     // we offered TLS 1.2 alone.
-    const tls12_only: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &proto.CipherSuite.tls12 };
+    const tls12_only: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.tls12 };
     for ([_]*const [8]u8{ downgrade_tls12, downgrade_tls11 }) |sentinel| {
         random[24..].* = sentinel.*;
         try testing.expectError(error.TlsIllegalParameter, parseServerHello(try testServerHello(&buf, .tls_1_2, &random, &theirs, suite, null), opt, &ours));
@@ -715,7 +715,7 @@ test "a CertificateRequest needs a non-empty signature_algorithms" {
 
 test "only groups with a key exchange are offered" {
     var buf: [max_groups]proto.NamedGroup = undefined;
-    var opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .named_groups = &.{ .secp521r1, .x25519_ml_kem768, .x25519, .secp256r1 } };
+    var opt: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .named_groups = &.{ .secp521r1, .x25519_ml_kem768, .x25519, .secp256r1 } };
     try testing.expectEqualSlices(proto.NamedGroup, &.{ .x25519_ml_kem768, .x25519, .secp256r1 }, offeredGroups(opt, &buf));
     opt.cipher_suites = &proto.CipherSuite.tls12;
     try testing.expectEqualSlices(proto.NamedGroup, &.{ .x25519, .secp256r1 }, offeredGroups(opt, &buf));

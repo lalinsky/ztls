@@ -1188,8 +1188,8 @@ fn verifyPeer(conn: *Connection) HandshakeError!void {
     _ = keyType(&certs[0]) orelse return error.TlsUnsupportedCertificate;
     switch (conn.options) {
         .none => unreachable,
-        .client => |opt| try policy.verifyChain(certs[0..n], opt.root_ca.?, .server, opt.host, opt.now.toSeconds()),
-        .server => |opt| try policy.verifyChain(certs[0..n], opt.client_auth.?.root_ca, .client, null, opt.now.toSeconds()),
+        .client => |opt| try policy.verifyChain(certs[0..n], opt.root_ca.?, .server, opt.host, policy.verifyTime(opt.io, opt.now)),
+        .server => |opt| try policy.verifyChain(certs[0..n], opt.client_auth.?.root_ca, .client, null, policy.verifyTime(opt.io, opt.now)),
     }
 }
 
