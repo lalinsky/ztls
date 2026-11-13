@@ -266,6 +266,11 @@ pub const Client = struct {
     named_groups: []const proto.NamedGroup = &default_named_groups,
     /// Groups to send key shares for; each must be in `named_groups`, and
     /// listed once.
+    ///
+    /// Not used under `-Dimpl=libssl`, where AWS-LC picks the shares: one
+    /// for the first of `named_groups`, and one for the first group after
+    /// it of the other kind, post-quantum or classical. With the default
+    /// `named_groups`, those are the default key shares.
     key_shares: []const proto.NamedGroup = &default_key_shares,
     /// Sent as signature_algorithms, and the only schemes the server may
     /// sign the handshake with: its CertificateVerify, or in TLS 1.2 its
@@ -289,6 +294,9 @@ pub const Client = struct {
     /// The longest Certificate or CertificateRequest message accepted
     /// from the peer. Other handshake messages are held to 16 KiB, or to
     /// this if it is less.
+    ///
+    /// Under `-Dimpl=libssl` every handshake message is held to this, but
+    /// to no less than 16 KiB.
     max_handshake_message_len: usize = 64 * 1024,
     /// Keep a copy of the server's certificate chain in
     /// `Connection.peer_certificates`, allocated through `gpa`.
@@ -342,6 +350,9 @@ pub const Server = struct {
     /// The longest client Certificate message accepted. Other handshake
     /// messages, and all of them without `client_auth`, are held to
     /// 16 KiB, or to this if it is less.
+    ///
+    /// Under `-Dimpl=libssl`, with `client_auth` every handshake message is
+    /// held to this, but to no less than 16 KiB; without it, to 16 KiB.
     max_handshake_message_len: usize = 64 * 1024,
     /// Keep a copy of the client's certificate chain, if it sent one, in
     /// `Connection.peer_certificates`, allocated through `gpa`.

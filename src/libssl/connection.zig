@@ -126,6 +126,15 @@ pub const Connection = struct {
     /// A failure one of our callbacks decided in the current call, which
     /// says more than the alert that goes out for it.
     callback_error: ?HandshakeError = null,
+    /// Why the server found no certificate to present, kept from libssl's
+    /// certificate callback, which can only send handshake_failure, to its
+    /// server name callback, which runs next in the same call and sends
+    /// the alert the native server sends.
+    selection_error: ?HandshakeError = null,
+    /// KeyUpdates sent and received, counted by libssl's message callback.
+    /// Atomic so either task may read them while the other's call runs.
+    key_updates_sent: std.atomic.Value(u64) = .init(0),
+    key_updates_received: std.atomic.Value(u64) = .init(0),
     options: Options = .none,
     /// The certificate presented, while the handshake runs, and the
     /// signing its hook was asked for.
@@ -176,6 +185,7 @@ pub const Connection = struct {
         // The SSL takes both, and frees them with itself.
         c.SSL_set_bio(ssl, rbio, wbio);
         c.SSL_set_info_callback(ssl, infoCallback);
+        c.SSL_set_msg_callback(ssl, messageCallback);
         // Everything is set on the SSL, not the shared SSL_CTX, and none of
         // it is needed once the handshake is done.
         c.SSL_set_shed_handshake_config(ssl, 1);
@@ -198,6 +208,18 @@ pub const Connection = struct {
         return if (conn.server_name_len == 0) null else conn.server_name_buf[0..conn.server_name_len];
     }
 
+    /// KeyUpdates sent so far, our requests and our answers alike. An
+    /// answer counts once libssl queues it, which may be before the
+    /// writing task sends it.
+    pub fn keyUpdatesSent(conn: *const Connection) u64 {
+        return conn.key_updates_sent.load(.monotonic);
+    }
+
+    /// KeyUpdates received so far.
+    pub fn keyUpdatesReceived(conn: *const Connection) u64 {
+        return conn.key_updates_received.load(.monotonic);
+    }
+
     fn setServerName(conn: *Connection, name: ?[]const u8) void {
         const n = name orelse "";
         // libssl refuses longer names.
@@ -212,6 +234,7 @@ pub const Connection = struct {
     /// write.
     fn call(conn: *Connection, op: Op, buf: []const u8) Result {
         conn.callback_error = null;
+        conn.selection_error = null;
         conn.alert_sent = null;
         conn.alert_received = null;
         conn.bind();
@@ -755,6 +778,7 @@ fn reasonError(packed_error: u32) ?HandshakeError {
         c.SSL_R_ENCRYPTED_LENGTH_TOO_LONG, c.SSL_R_DATA_LENGTH_TOO_LONG => error.TlsRecordOverflow,
         c.SSL_R_UNEXPECTED_RECORD => error.TlsUnexpectedMessage,
         c.SSL_R_NO_RENEGOTIATION => error.TlsNoRenegotiation,
+        c.SSL_R_EXCESSIVE_MESSAGE_SIZE => error.TlsIllegalParameter,
         else => null,
     };
 }
@@ -775,6 +799,9 @@ pub fn client(input: *Io.Reader, output: *Io.Writer, options: config.Client) Han
     try setVersions(ssl, if (offers_tls12) c.TLS1_2_VERSION else c.TLS1_3_VERSION, if (offers_tls13) c.TLS1_3_VERSION else c.TLS1_2_VERSION);
     try setCipherSuites(ssl, options.cipher_suites);
     try setPreferences(ssl, options.named_groups, options.signing_schemes, options.verify_schemes);
+    // libssl holds every handshake message to this, but to no less than
+    // 16 KiB.
+    c.SSL_set_max_cert_list(ssl, options.max_handshake_message_len);
 
     var name_buf: [256]u8 = undefined;
     if (policy.sendsSni(options.host)) {
@@ -817,6 +844,9 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Han
     try setVersions(ssl, c.TLS1_3_VERSION, c.TLS1_3_VERSION);
     try setCipherSuites(ssl, options.cipher_suites);
     try setPreferences(ssl, options.named_groups, options.signing_schemes, options.verify_schemes);
+    // libssl holds every handshake message to this, but to no less than
+    // 16 KiB.
+    c.SSL_set_max_cert_list(ssl, options.max_handshake_message_len);
     if (options.client_auth) |auth| {
         const mode: c_int = switch (auth.auth_type) {
             .request => c.SSL_VERIFY_PEER,
@@ -1014,6 +1044,22 @@ fn infoCallback(ssl: ?*const c.SSL, kind: c_int, value: c_int) callconv(.c) void
     if (read_alert) conn.alert_received = alert else conn.alert_sent = alert;
 }
 
+/// Counts KeyUpdates. libssl reports each whole handshake message it reads
+/// or writes, and each record header.
+fn messageCallback(write_p: c_int, version: c_int, content_type: c_int, buf: ?*const anyopaque, len: usize, ssl: ?*c.SSL, arg: ?*anyopaque) callconv(.c) void {
+    _ = version;
+    _ = arg;
+    if (content_type != c.SSL3_RT_HANDSHAKE or len != 5) return;
+    const bytes: *const [5]u8 = @ptrCast(buf.?);
+    // Only a well-formed one, as the native side counts: libssl reports a
+    // message it reads before it checks it.
+    if (bytes[0] != @intFromEnum(proto.HandshakeType.key_update)) return;
+    if (!std.mem.eql(u8, bytes[1..4], &.{ 0, 0, 1 }) or bytes[4] > 1) return;
+    const conn = connectionOf(ssl);
+    const counter = if (write_p != 0) &conn.key_updates_sent else &conn.key_updates_received;
+    _ = counter.fetchAdd(1, .monotonic);
+}
+
 /// The server asked for a certificate: ours goes out if our key can sign
 /// under one of the schemes the server takes, and none goes out otherwise,
 /// as in the native client.
@@ -1159,14 +1205,28 @@ fn selectCertificateCallback(hello: [*c]const c.SSL_CLIENT_HELLO) callconv(.c) c
     const ssl = hello.*.ssl.?;
     const conn = connectionOf(ssl);
     const pair = selectCertificate(hello, ssl, conn.options.server.*) catch |err| {
-        conn.callback_error = err;
-        return c.ssl_select_cert_error;
+        conn.selection_error = err;
+        return c.ssl_select_cert_success;
     };
     setCertificate(conn, pair) catch |err| {
-        conn.callback_error = err;
-        return c.ssl_select_cert_error;
+        conn.selection_error = err;
+        return c.ssl_select_cert_success;
     };
     return c.ssl_select_cert_success;
+}
+
+/// Fails the handshake for a certificate selection that failed, with the
+/// native server's alert. Otherwise acknowledges no server name, as the
+/// native server does not.
+fn serverNameCallback(ssl: ?*c.SSL, alert: ?*c_int, arg: ?*anyopaque) callconv(.c) c_int {
+    _ = arg;
+    const conn = connectionOf(ssl.?);
+    const err = conn.selection_error orelse return c.SSL_TLSEXT_ERR_NOACK;
+    conn.selection_error = null;
+    conn.callback_error = err;
+    const native = proto.Alert.forLocalError(err) orelse .internal_error;
+    alert.?.* = @intFromEnum(native);
+    return c.SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
 const max_schemes = 64;
@@ -1243,6 +1303,7 @@ fn globals() error{OutOfMemory}!Globals {
     if (c.SSL_CTX_set_num_tickets(server_ctx, 0) != 1) return error.OutOfMemory;
     c.SSL_CTX_set_alpn_select_cb(server_ctx, alpnSelectCallback, null);
     c.SSL_CTX_set_select_certificate_cb(server_ctx, selectCertificateCallback);
+    if (c.SSL_CTX_set_tlsext_servername_callback(server_ctx, serverNameCallback) != 1) return error.OutOfMemory;
 
     const index = c.SSL_get_ex_new_index(0, null, null, null, null);
     if (index < 0) return error.OutOfMemory;

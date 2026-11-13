@@ -227,6 +227,7 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     h.conn.alpn_protocol = alpn;
     try h.conn.setServerName(if (policy.sendsSni(opt.host)) opt.host else null);
     h.conn.strict_close_notify = opt.strict_close_notify;
+    h.conn.max_ticket_message_len = @intCast(@min(@max(16 * 1024, opt.max_handshake_message_len), std.math.maxInt(u24)));
 }
 
 fn writeClientHello(

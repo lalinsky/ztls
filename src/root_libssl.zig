@@ -41,4 +41,5 @@ pub const server = connection.server;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("api_test.zig");
+    _ = @import("interop_test.zig");
 }

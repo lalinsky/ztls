@@ -18,6 +18,7 @@ const proto = lib.protocol;
 const CertKeyPair = lib.CertKeyPair;
 const TrustStore = lib.TrustStore;
 const testu = @import("testu.zig");
+const api = @import("api.zig");
 
 /// The test PKI, loaded.
 const Pki = struct {
@@ -621,12 +622,10 @@ test "the server picks its certificate by server name" {
     }
     try testing.expectEqual(cases.len, picker.calls);
 
-    // With no fallback, an unknown name is refused. libssl sends
-    // handshake_failure for it where the native server sends
-    // unrecognized_name.
+    // With no fallback, an unknown name is refused.
     var run: Run(lib) = .{};
     try run.start(io, .{ .gpa = testing.allocator, .auth = null, .certificates = &.{&pki.server_ec}, .now = valid_now });
-    try testing.expectError(if (libssl_build) error.TlsAlertHandshakeFailure else error.TlsAlertUnrecognizedName, clientOnce(lib, &run.loopback, .{
+    try testing.expectError(error.TlsAlertUnrecognizedName, clientOnce(lib, &run.loopback, .{
         .gpa = testing.allocator,
         .host = "nomatch.invalid",
         .root_ca = &pki.ca,
@@ -634,6 +633,50 @@ test "the server picks its certificate by server name" {
     }));
     const outcome = try run.finish(io);
     try testing.expectError(error.TlsUnrecognizedName, outcome.handshake);
+}
+
+test "a Certificate message longer than max_handshake_message_len is refused" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    // The leaf, then copies of another certificate the client ignores: a
+    // Certificate message of more than 20 KiB. libssl holds every
+    // handshake message to at least 16 KiB, so the limit is above that.
+    var chain: [40][]const u8 = undefined;
+    chain[0] = pki.server_ec.chain[0];
+    for (chain[1..]) |*der| der.* = pki.server_rsa.chain[0];
+    var big = pki.server_ec;
+    big.chain = &chain;
+    var len: usize = 0;
+    for (chain) |der| len += der.len;
+    try testing.expect(len > 20 * 1024);
+
+    {
+        var run: Run(lib) = .{};
+        try run.start(io, .{ .gpa = testing.allocator, .auth = &big, .now = valid_now });
+        try testing.expectError(error.TlsIllegalParameter, clientOnce(lib, &run.loopback, .{
+            .gpa = testing.allocator,
+            .host = "localhost",
+            .root_ca = &pki.ca,
+            .now = valid_now,
+            .max_handshake_message_len = 20 * 1024,
+        }));
+        const outcome = try run.finish(io);
+        try testing.expectError(error.TlsAlertIllegalParameter, outcome.handshake);
+    }
+    {
+        var run: Run(lib) = .{};
+        try run.start(io, .{ .gpa = testing.allocator, .auth = &big, .now = valid_now });
+        _ = try clientOnce(lib, &run.loopback, .{
+            .gpa = testing.allocator,
+            .host = "localhost",
+            .root_ca = &pki.ca,
+            .now = valid_now,
+            .max_handshake_message_len = 64 * 1024,
+        });
+        const outcome = try run.finish(io);
+        try outcome.handshake;
+    }
 }
 
 test "an empty host is a misconfiguration unless verification is off" {
@@ -1122,6 +1165,231 @@ test "the transport ending: inside a record, between records, and without close_
         t.lingerClose();
         try task.await(io);
     }
+}
+
+/// What a misbehaving native peer sends once its handshake is done: a
+/// record sealed with its keys, or bytes as they are.
+const Misdeed = union(enum) {
+    sealed: struct { content_type: proto.ContentType = .handshake, payload: []const u8 },
+    raw: []const u8,
+};
+
+/// How the end under test must take a peer's misdeeds.
+const Verdict = union(enum) {
+    /// Its reader fails with this, and its writer sends the alert for it
+    /// and fails the same way.
+    refused: api.Failure,
+    /// It reads these lines, then the end of the stream, and closes.
+    accepted: []const []const u8,
+};
+
+/// `native` or `libssl` as the implementation under test refuses it:
+/// where AWS-LC's libssl picks another alert than the native code, which
+/// the wrapper cannot change.
+fn refusedAs(native_err: api.Failure, libssl_err: api.Failure) Verdict {
+    return .{ .refused = if (libssl_build) libssl_err else native_err };
+}
+
+/// Runs the end under test as `side` against a native peer, which
+/// completes the handshake, sends `misdeeds`, then nothing more.
+fn expectVerdict(io: Io, pki: *const Pki, side: proto.Side, misdeeds: []const Misdeed, verdict: Verdict) !void {
+    const Peer = struct {
+        fn run(loopback: *testu.Loopback, p: *const Pki, peer_side: proto.Side, m: []const Misdeed, v: Verdict) !void {
+            var t: Transport = .{ .io = loopback.io, .stream = if (peer_side == .server) try loopback.accept() else try loopback.connect() };
+            defer t.deinit();
+            t.setUp();
+            const in = &t.input.interface;
+            const out = &t.output.interface;
+            var conn = if (peer_side == .server)
+                try native.server(in, out, .{ .gpa = testing.allocator, .auth = &p.server_ec, .now = valid_now })
+            else
+                try native.client(in, out, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &p.ca, .now = valid_now });
+            defer conn.deinit();
+            for (m) |misdeed| switch (misdeed) {
+                .sealed => |record| {
+                    const keys = &conn.write.keys.?;
+                    const len = keys.sealedLen(record.payload.len);
+                    const buf = try out.writableSliceGreedy(len);
+                    @memcpy(buf[keys.payloadOffset()..][0..record.payload.len], record.payload);
+                    try keys.seal(buf[0..len], record.content_type, record.payload.len);
+                    out.advance(len);
+                },
+                .raw => |bytes| try out.writeAll(bytes),
+            };
+            try out.flush();
+            // Nothing follows: an end that waits for more sees the
+            // transport end rather than hanging the test.
+            try t.stream.shutdown(t.io, .send);
+            var rbuf: [256]u8 = undefined;
+            var r = conn.reader(&rbuf);
+            switch (v) {
+                .refused => |err| {
+                    try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+                    try testing.expectEqual(proto.Alert.forLocalError(err).?.toError().?, r.err.?);
+                },
+                .accepted => try testing.expectEqual(null, try r.interface.takeDelimiter('\n')),
+            }
+        }
+    };
+    var loopback = try testu.Loopback.init(io);
+    defer loopback.deinit();
+    var peer = try io.concurrent(Peer.run, .{ &loopback, pki, if (side == .client) proto.Side.server else .client, misdeeds, verdict });
+    defer peer.cancel(io) catch {};
+
+    var t: Transport = .{ .io = io, .stream = if (side == .server) try loopback.accept() else try loopback.connect() };
+    defer t.deinit();
+    t.setUp();
+    const in = &t.input.interface;
+    const out = &t.output.interface;
+    var conn = if (side == .server)
+        try lib.server(in, out, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now })
+    else
+        try lib.client(in, out, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+    defer conn.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = conn.reader(&rbuf);
+    var w = conn.writer(&.{});
+    switch (verdict) {
+        .refused => |err| {
+            try testing.expectError(error.ReadFailed, r.interface.takeDelimiter('\n'));
+            try testing.expectEqual(err, r.err.?);
+            try testing.expectError(error.WriteFailed, w.interface.writeAll("x"));
+            try testing.expectEqual(err, w.err.?);
+        },
+        .accepted => |lines| {
+            for (lines) |line| try testing.expectEqualStrings(line, (try r.interface.takeDelimiter('\n')).?);
+            try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+            try w.close();
+        },
+    }
+    try peer.await(io);
+}
+
+const nst = @intFromEnum(proto.HandshakeType.new_session_ticket);
+const ku = @intFromEnum(proto.HandshakeType.key_update);
+
+test "malformed post-handshake messages" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    const Case = struct { side: proto.Side = .client, misdeeds: []const Misdeed, verdict: Verdict };
+    const cases = [_]Case{
+        // A KeyUpdate with a two-byte body.
+        .{ .misdeeds = &.{.{ .sealed = .{ .payload = &.{ ku, 0, 0, 2, 0, 0 } } }}, .verdict = .{ .refused = error.TlsDecodeError } },
+        // A KeyUpdate that does not end its record.
+        .{ .misdeeds = &.{.{ .sealed = .{ .payload = &.{ ku, 0, 0, 1, 0, nst } } }}, .verdict = .{ .refused = error.TlsUnexpectedMessage } },
+        // A request that is neither. RFC 8446 §4.6.3 calls for
+        // illegal_parameter; AWS-LC sends decode_error.
+        .{ .misdeeds = &.{.{ .sealed = .{ .payload = &.{ ku, 0, 0, 1, 2 } } }}, .verdict = refusedAs(error.TlsIllegalParameter, error.TlsDecodeError) },
+        // A ticket longer than a handshake message may be.
+        .{ .misdeeds = &.{.{ .sealed = .{ .payload = &.{ nst, 0xff, 0xff, 0xff } } }}, .verdict = .{ .refused = error.TlsIllegalParameter } },
+        // A ticket shorter than any can be.
+        .{ .misdeeds = &.{.{ .sealed = .{ .payload = &([_]u8{ nst, 0, 0, 13 } ++ @as([13]u8, @splat(0))) } }}, .verdict = .{ .refused = error.TlsDecodeError } },
+        // A message only a handshake has.
+        .{ .misdeeds = &.{.{ .sealed = .{ .payload = &.{ @intFromEnum(proto.HandshakeType.finished), 0, 0, 0 } } }}, .verdict = .{ .refused = error.TlsUnexpectedMessage } },
+        // Application data between a message's pieces.
+        .{ .misdeeds = &.{ .{ .sealed = .{ .payload = &.{ nst, 0, 0, 14, 0 } } }, .{ .sealed = .{ .content_type = .application_data, .payload = "x" } } }, .verdict = .{ .refused = error.TlsUnexpectedMessage } },
+        // A ticket sent to a server.
+        .{ .side = .server, .misdeeds = &.{.{ .sealed = .{ .payload = &.{ nst, 0, 0, 0 } } }}, .verdict = .{ .refused = error.TlsUnexpectedMessage } },
+    };
+    for (cases) |case| try expectVerdict(io, &pki, case.side, case.misdeeds, case.verdict);
+}
+
+test "an empty handshake record, and an end inside a post-handshake message, are taken as BoringSSL takes them" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    // A peer must not send an empty handshake record (RFC 8446 §5.1), but
+    // it changes nothing.
+    try expectVerdict(io, &pki, .client, &.{
+        .{ .sealed = .{ .payload = &.{} } },
+        .{ .sealed = .{ .content_type = .application_data, .payload = "hi\n" } },
+    }, .{ .accepted = &.{"hi"} });
+    // What close_notify or the transport's end cuts off carries no data
+    // and changes no keys.
+    try expectVerdict(io, &pki, .client, &.{
+        .{ .sealed = .{ .payload = &.{ ku, 0 } } },
+        .{ .sealed = .{ .content_type = .alert, .payload = &.{ 1, 0 } } },
+    }, .{ .accepted = &.{} });
+    try expectVerdict(io, &pki, .client, &.{
+        .{ .sealed = .{ .payload = &.{ ku, 0 } } },
+    }, .{ .accepted = &.{} });
+}
+
+test "records that cannot come after the handshake" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    const handshake = @intFromEnum(proto.ContentType.handshake);
+    const ccs = @intFromEnum(proto.ContentType.change_cipher_spec);
+    const Case = struct { bytes: []const u8, verdict: Verdict };
+    const cases = [_]Case{
+        // Not a content type. AWS-LC looks at the version field first.
+        .{ .bytes = &.{ 0x80, 0x2e, 0x01, 0x03, 0x03 }, .verdict = refusedAs(error.TlsUnexpectedMessage, error.TlsProtocolVersion) },
+        // A handshake record or change_cipher_spec in the clear, which
+        // RFC 8446 §5 refuses with unexpected_message. AWS-LC opens every
+        // record after the handshake before it looks at the type.
+        .{ .bytes = &([_]u8{ handshake, 3, 3, 0, 32 } ++ @as([32]u8, @splat(0xaa))), .verdict = refusedAs(error.TlsUnexpectedMessage, error.TlsBadRecordMac) },
+        .{ .bytes = &.{ ccs, 3, 3, 0, 1, 1 }, .verdict = refusedAs(error.TlsUnexpectedMessage, error.TlsBadRecordMac) },
+        // Longer than any protected record: refused from the header.
+        .{ .bytes = &.{ @intFromEnum(proto.ContentType.application_data), 3, 3, 0x41, 0x41 }, .verdict = .{ .refused = error.TlsRecordOverflow } },
+    };
+    for (cases) |case| try expectVerdict(io, &pki, .client, &.{.{ .raw = case.bytes }}, case.verdict);
+}
+
+test "a KeyUpdate request made while a reply is owed still reaches the peer" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+
+    // The native peer asks for an update, so the end under test owes a
+    // reply when it asks for one in turn: both must reach the peer, which
+    // answers the request with an update of its own.
+    const Peer = struct {
+        fn run(loopback: *testu.Loopback, p: *const Pki) !void {
+            var t: Transport = .{ .io = loopback.io, .stream = try loopback.accept() };
+            defer t.deinit();
+            t.setUp();
+            var conn = try native.server(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .auth = &p.server_ec, .now = valid_now });
+            defer conn.deinit();
+            var rbuf: [256]u8 = undefined;
+            var r = conn.reader(&rbuf);
+            var w = conn.writer(&.{});
+            try w.requestKeyUpdate();
+            try w.interface.writeAll("ping\n");
+            try w.interface.flush();
+            try testing.expectEqualStrings("pong", (try r.interface.takeDelimiter('\n')).?);
+            try testing.expectEqual(2, conn.keyUpdatesReceived());
+            try w.interface.writeAll("done\n");
+            try w.interface.flush();
+            try testing.expectEqual(2, conn.keyUpdatesSent());
+            try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+            try w.close();
+        }
+    };
+    var loopback = try testu.Loopback.init(io);
+    defer loopback.deinit();
+    var peer = try io.concurrent(Peer.run, .{ &loopback, &pki });
+    defer peer.cancel(io) catch {};
+
+    var t: Transport = .{ .io = io, .stream = try loopback.connect() };
+    defer t.deinit();
+    t.setUp();
+    var conn = try lib.client(&t.input.interface, &t.output.interface, .{ .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca, .now = valid_now });
+    defer conn.deinit();
+    var rbuf: [256]u8 = undefined;
+    var r = conn.reader(&rbuf);
+    var w = conn.writer(&.{});
+    try testing.expectEqualStrings("ping", (try r.interface.takeDelimiter('\n')).?);
+    try w.requestKeyUpdate();
+    try w.interface.writeAll("pong\n");
+    try w.interface.flush();
+    try testing.expectEqual(2, conn.keyUpdatesSent());
+    try testing.expectEqualStrings("done", (try r.interface.takeDelimiter('\n')).?);
+    try testing.expectEqual(2, conn.keyUpdatesReceived());
+    try w.close();
+    try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+    try peer.await(io);
 }
 
 test "libssl and native talk to each other, each as client and as server" {

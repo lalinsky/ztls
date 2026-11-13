@@ -62,6 +62,6 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Err
 test {
     std.testing.refAllDecls(@This());
     _ = @import("api_test.zig");
-    _ = @import("native/interop_test.zig");
+    _ = @import("interop_test.zig");
     _ = @import("native/handshake_client_tls12.zig");
 }
