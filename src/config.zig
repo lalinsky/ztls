@@ -255,9 +255,10 @@ pub const Client = struct {
     auth: ?*const CertKeyPair = null,
     /// Offered in this order. Any of `CipherSuite.tls12` among them offers
     /// TLS 1.2 too, after TLS 1.3; with only those, TLS 1.2 alone.
-    /// `CipherSuite.all` offers TLS 1.3 alone. The default puts ChaCha20-Poly1305 first on a machine without AES
-    /// instructions (`default_cipher_suites_chacha_first`), as does a list
-    /// equal to it; any other list is offered as given.
+    /// `CipherSuite.all` offers TLS 1.3 alone. The default puts
+    /// ChaCha20-Poly1305 first on a machine without AES instructions
+    /// (`default_cipher_suites_chacha_first`), as does a list equal to it;
+    /// any other list is offered as given.
     cipher_suites: []const proto.CipherSuite = &default_cipher_suites,
     /// In preference order, with at least one group ztls knows. Groups
     /// the implementation has no key exchange for are not offered: the

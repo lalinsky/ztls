@@ -307,6 +307,25 @@ test "the server follows its own suite order over the client's" {
     }
 }
 
+test "a group listed twice is offered once" {
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+    var run: Run(lib) = .{};
+    try run.start(io, .{ .gpa = testing.allocator, .auth = &pki.server_ec, .now = valid_now, .named_groups = &.{ .secp256r1, .secp256r1 } });
+    const seen = try clientOnce(lib, &run.loopback, .{
+        .gpa = testing.allocator,
+        .host = "localhost",
+        .root_ca = &pki.ca,
+        .now = valid_now,
+        .named_groups = &.{ .x25519, .x25519, .secp256r1 },
+        .key_shares = &.{.x25519},
+    });
+    const outcome = try run.finish(io);
+    try outcome.handshake;
+    try testing.expectEqual(proto.NamedGroup.secp256r1, seen.group.?);
+}
+
 test "a HelloRetryRequest when the client sent no share the server takes" {
     const io = testing.io;
     var pki = try Pki.init();

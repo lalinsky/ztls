@@ -906,7 +906,8 @@ fn setPreferences(
     signing: []const proto.SignatureScheme,
     verify: []const proto.SignatureScheme,
 ) error{TlsInternalError}!void {
-    var nids: [16]c_int = undefined;
+    // Room for each group ztls knows: the switch below.
+    var nids: [5]c_int = undefined;
     var n: usize = 0;
     for (groups) |group| {
         if (!policy.groupKnown(group)) continue;
@@ -918,7 +919,8 @@ fn setPreferences(
             .secp521r1 => c.NID_secp521r1,
             else => unreachable,
         };
-        if (n == nids.len) return error.TlsInternalError;
+        // Each once, as the native client offers them.
+        if (std.mem.indexOfScalar(c_int, nids[0..n], nid) != null) continue;
         nids[n] = nid;
         n += 1;
     }
