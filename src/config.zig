@@ -264,7 +264,7 @@ pub const Client = struct {
     /// the implementation has no key exchange for are not offered: the
     /// native one has none for secp521r1, and refuses a list with nothing
     /// else. In TLS 1.2 this also limits the curve of the server's ECDSA
-    /// certificate.
+    /// certificate; there a P-521 one is taken when secp521r1 is listed.
     named_groups: []const proto.NamedGroup = &default_named_groups,
     /// Groups to send key shares for; each must be in `named_groups`, and
     /// listed once. The native implementation refuses secp521r1 here too.

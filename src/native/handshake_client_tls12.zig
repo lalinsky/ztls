@@ -153,8 +153,9 @@ fn suiteAuthentication(suite: proto.CipherSuite) Authentication {
 /// covers Ed25519, RFC 8422 §2.3), as AWS-LC checks, and must be allowed
 /// to sign: BoringSSL (and so Chrome) holds RSA leaves to that too, so a
 /// keyEncipherment-only one is refused. An ECDSA key must be on a curve
-/// we offered in supported_groups (RFC 8422 §5.1), which leaves out one
-/// we have no key exchange for.
+/// in `named_groups` (RFC 8422 §5.1), as AWS-LC checks against its own
+/// list: P-521 is accepted when listed, although we offer no key
+/// exchange on it.
 fn checkLeaf(peer: *const handshake.PeerCertificate, suite: proto.CipherSuite, named_groups: []const proto.NamedGroup) Error!void {
     const key_type = peer.public_key.key_type;
     switch (suiteAuthentication(suite)) {
@@ -167,7 +168,7 @@ fn checkLeaf(peer: *const handshake.PeerCertificate, suite: proto.CipherSuite, n
                         .p384 => .secp384r1,
                         .p521 => .secp521r1,
                     };
-                    if (!handshake.groupSupported(group) or std.mem.indexOfScalar(proto.NamedGroup, named_groups, group) == null) return error.TlsIllegalParameter;
+                    if (std.mem.indexOfScalar(proto.NamedGroup, named_groups, group) == null) return error.TlsIllegalParameter;
                 },
                 .ed25519 => {},
                 .rsa => return error.TlsIllegalParameter,
@@ -388,8 +389,8 @@ fn testServerKeyExchange(buf: []u8, pair: *const config.CertKeyPair, randoms: Ra
     return w.written();
 }
 
-test "an ECDSA leaf must be on a curve we offered" {
-    const named_groups: []const proto.NamedGroup = &.{ .secp521r1, .secp384r1 };
+test "an ECDSA leaf must be on a curve in named_groups" {
+    const named_groups: []const proto.NamedGroup = &.{ .secp384r1, .x25519 };
     const suite: proto.CipherSuite = .ecdhe_ecdsa_with_aes_128_gcm_sha256;
     // Refused before the chain is looked at.
     for ([_]crypto.sig.Curve{ .p521, .p256 }) |curve| {
