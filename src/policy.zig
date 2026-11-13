@@ -278,6 +278,17 @@ test "the default suites put ChaCha20-Poly1305 first without AES hardware" {
     try testing.expectEqual(@as([]const proto.CipherSuite, &own), offeredSuites(&own, false));
 }
 
+test "the server's suite is the first of ours the client offers" {
+    // GREASE, a TLS 1.2 suite, then the client's first TLS 1.3 one.
+    const offered = [_]u8{ 0x0a, 0x0a, 0xc0, 0x2b, 0x13, 0x03, 0x13, 0x01, 0x13, 0x02 };
+    try testing.expectEqual(proto.CipherSuite.aes_256_gcm_sha384, chooseSuite(&(.{.ecdhe_ecdsa_with_aes_128_gcm_sha256} ++ .{ .aes_256_gcm_sha384, .aes_128_gcm_sha256 }), &offered, true));
+    // The default list, with the client listing ChaCha20 first: it lacks
+    // AES instructions.
+    try testing.expectEqual(proto.CipherSuite.chacha20_poly1305_sha256, chooseSuite(&proto.CipherSuite.all, &offered, true));
+    try testing.expectEqual(proto.CipherSuite.aes_128_gcm_sha256, chooseSuite(&proto.CipherSuite.all, offered[6..], true));
+    try testing.expectEqual(null, chooseSuite(&.{.aes_256_gcm_sha384}, offered[0..8], true));
+}
+
 test "the default suites prefer ChaCha20-Poly1305 when either side lacks AES hardware" {
     const default: []const proto.CipherSuite = &proto.CipherSuite.all;
     try testing.expectEqual(default, preferredSuites(default, true, .aes_128_gcm_sha256));

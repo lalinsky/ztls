@@ -324,11 +324,11 @@ pub const Server = struct {
     select_certificate: ?SelectCertificate = null,
     client_auth: ?ClientAuth = null,
     /// In preference order, followed over the client's. The server speaks
-    /// TLS 1.3 only; TLS 1.2 suites here are skipped. The default prefers ChaCha20-Poly1305 when either
-    /// side lacks AES instructions: this machine, or a client that lists
-    /// it first among the TLS 1.3 suites. So does a list equal to the
-    /// default; any other is followed as given. At least one TLS 1.3
-    /// suite.
+    /// TLS 1.3 only; TLS 1.2 suites here are skipped. The default prefers
+    /// ChaCha20-Poly1305 when either side lacks AES instructions: this
+    /// machine, or a client that lists it first among the TLS 1.3 suites.
+    /// So does a list equal to the default; any other is followed as
+    /// given. At least one TLS 1.3 suite.
     cipher_suites: []const proto.CipherSuite = &proto.CipherSuite.all,
     /// In preference order, with at least one group ztls knows. Groups
     /// the implementation has no key exchange for are passed over: the

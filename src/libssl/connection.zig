@@ -1201,9 +1201,11 @@ fn alpnSelectCallback(
     return c.SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
-/// Picks the TLS 1.3 suite as the native server does, in our order. libssl
-/// would follow the client's, ours only filtering it, so it is left our
-/// choice alone. Called first thing for a ClientHello.
+/// Picks the TLS 1.3 suite as the native server does, in our order, and
+/// leaves libssl only that one: left to itself, libssl follows the
+/// client's order and uses ours as a filter. Runs for the first
+/// ClientHello only; after a HelloRetryRequest libssl keeps the suite it
+/// chose.
 fn selectSuiteCallback(hello: ?*const c.SSL_CLIENT_HELLO) callconv(.c) c.enum_ssl_select_cert_result_t {
     const h = hello.?;
     const conn = connectionOf(h.ssl);
