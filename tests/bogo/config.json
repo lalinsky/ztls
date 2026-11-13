@@ -17,6 +17,7 @@
     "WrongMessageType-NewSessionTicket-TLS": "the TLS 1.2 client asks for no ticket, so the runner sends none to get wrong",
     "TrailingMessageData-NewSessionTicket-TLS": "the TLS 1.2 client asks for no ticket, so the runner sends none to get wrong",
     "Client-Sign-RSA_PKCS1_*-TLS13": "a client certificate with no scheme the server takes is left out, not a handshake failure",
+    "Client-Sign-ECDSA_SHA1-TLS13": "a client certificate with no scheme the server takes is left out, not a handshake failure",
     "NoCommonAlgorithms*": "a client certificate with no scheme the server takes is left out, not a handshake failure",
     "*EarlyData*": "no 0-RTT",
     "*0RTT*": "no 0-RTT",
