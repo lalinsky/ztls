@@ -786,7 +786,6 @@ test "an empty host is a misconfiguration unless verification is off" {
 }
 
 test "a client held to TLS 1.2 is refused by the TLS 1.3 server" {
-    if (!proto.tls12_enabled) return error.SkipZigTest;
     const io = testing.io;
     var pki = try Pki.init();
     defer pki.deinit();

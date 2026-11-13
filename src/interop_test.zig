@@ -268,7 +268,6 @@ test "our client against openssl s_server" {
     defer client_pair.deinit(testing.allocator);
 
     for (cases) |case| {
-        if (case.tls12 and !proto.tls12_enabled) continue;
         const port = try freePort(io);
         var port_buf: [32]u8 = undefined;
         const accept = try std.fmt.bufPrint(&port_buf, "127.0.0.1:{d}", .{port});
@@ -532,7 +531,6 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
         .{ .groups = &.{.secp256r1}, .transfer = 1 << 20 },
     };
     for (cases) |case| {
-        if (case.tls12 and !proto.tls12_enabled) continue;
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(testing.allocator);
         try argv.appendSlice(testing.allocator, &.{

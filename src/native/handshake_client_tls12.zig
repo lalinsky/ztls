@@ -388,7 +388,6 @@ fn testServerKeyExchange(buf: []u8, pair: *const config.CertKeyPair, randoms: Ra
 }
 
 test "a ServerKeyExchange is signed over both randoms, with a group and scheme we offered" {
-    if (!proto.tls12_enabled) return error.SkipZigTest;
     var pair = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("../testdata/pki/server-ec.pem"), @embedFile("../testdata/pki/server-ec.key"));
     defer pair.deinit(testing.allocator);
     var public = try pair.leaf.publicKey();
@@ -423,7 +422,6 @@ test "a ServerKeyExchange is signed over both randoms, with a group and scheme w
 }
 
 test "a CertificateRequest picks our key's scheme, curve first, if its types allow the key" {
-    if (!proto.tls12_enabled) return error.SkipZigTest;
     var ec = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("../testdata/pki/client.pem"), @embedFile("../testdata/pki/client.key"));
     defer ec.deinit(testing.allocator);
     var rsa = try config.CertKeyPair.fromSlice(testing.allocator, @embedFile("../testdata/pki/server-rsa.pem"), @embedFile("../testdata/pki/server-rsa.key"));

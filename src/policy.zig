@@ -25,9 +25,6 @@ pub fn checkClient(opt: config.Client) error{TlsInternalError}!void {
     } else return error.TlsInternalError;
     if (opt.verify_schemes.len == 0) return error.TlsInternalError;
     if (!schemesSupported(opt.verify_schemes) or !schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
-    if (!proto.tls12_enabled) {
-        for (opt.cipher_suites) |suite| if (suite.version() == .tls_1_2) return error.TlsInternalError;
-    }
     if (!offers(opt, .tls_1_3) and !offers(opt, .tls_1_2)) return error.TlsInternalError;
     if (offers(opt, .tls_1_3)) {
         if (opt.key_shares.len == 0) return error.TlsInternalError;
@@ -40,10 +37,8 @@ pub fn checkClient(opt: config.Client) error{TlsInternalError}!void {
 }
 
 /// Whether `cipher_suites` offers `version`: it does with any of its
-/// suites. Never TLS 1.2 in a build without it, which is known at compile
-/// time, so the code behind it is left out.
+/// suites.
 pub fn offers(opt: config.Client, comptime version: proto.Version) bool {
-    if (version == .tls_1_2 and !proto.tls12_enabled) return false;
     for (opt.cipher_suites) |suite| {
         if (suite.version() == version) return true;
     }
@@ -97,9 +92,9 @@ pub fn schemeAlgorithm(scheme: proto.SignatureScheme, version: Version) ?sig.Alg
         .rsa_pss_rsae_sha256 => .rsa_pss_sha256,
         .rsa_pss_rsae_sha384 => .rsa_pss_sha384,
         .rsa_pss_rsae_sha512 => .rsa_pss_sha512,
-        .rsa_pkcs1_sha256 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha256 else null,
-        .rsa_pkcs1_sha384 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha384 else null,
-        .rsa_pkcs1_sha512 => if (proto.tls12_enabled and version == .tls12) .rsa_pkcs1_sha512 else null,
+        .rsa_pkcs1_sha256 => if (version == .tls12) .rsa_pkcs1_sha256 else null,
+        .rsa_pkcs1_sha384 => if (version == .tls12) .rsa_pkcs1_sha384 else null,
+        .rsa_pkcs1_sha512 => if (version == .tls12) .rsa_pkcs1_sha512 else null,
         else => null,
     };
 }
@@ -197,7 +192,6 @@ test "TLS 1.3 binds each ECDSA scheme to a curve" {
 }
 
 test "TLS 1.2 schemes name the hash only, and take PKCS#1 v1.5" {
-    if (!proto.tls12_enabled) return error.SkipZigTest;
     try testing.expect(schemeSuits(.ecdsa_secp256r1_sha256, .{ .ecdsa = .p384 }, .tls12));
     try testing.expect(schemeSuits(.ecdsa_secp521r1_sha512, .{ .ecdsa = .p256 }, .tls12));
     try testing.expect(!schemeSuits(.ecdsa_secp256r1_sha256, .{ .rsa = 2048 }, .tls12));
@@ -226,15 +220,4 @@ test "a key share for a group listed twice is a misconfiguration" {
         .key_shares = &.{ .secp256r1, .secp256r1 },
     };
     try testing.expectError(error.TlsInternalError, checkClient(opt));
-}
-
-test "TLS 1.2 suites are refused in a build without TLS 1.2" {
-    const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
-    const opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
-    if (proto.tls12_enabled) {
-        try checkClient(opt);
-    } else {
-        try testing.expectError(error.TlsInternalError, checkClient(opt));
-        try checkClient(.{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined });
-    }
 }

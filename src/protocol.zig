@@ -37,10 +37,6 @@ pub const HandshakeType = enum(u8) {
     _,
 };
 
-/// Whether the TLS 1.2 client is built in: the `tls12` build option,
-/// true unless `-Dtls12=false`. Without it the code is left out.
-pub const tls12_enabled = @import("build_options").tls12;
-
 pub const CipherSuite = enum(u16) {
     aes_128_gcm_sha256 = 0x1301,
     aes_256_gcm_sha384 = 0x1302,
@@ -59,8 +55,7 @@ pub const CipherSuite = enum(u16) {
     /// The TLS 1.3 suites.
     pub const all = [_]CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 };
     /// The TLS 1.2 suites a client may offer, in preference order. Listing
-    /// any of them in a client's `cipher_suites` offers TLS 1.2, in a
-    /// build with `tls12_enabled`.
+    /// any of them in a client's `cipher_suites` offers TLS 1.2.
     pub const tls12 = [_]CipherSuite{
         .ecdhe_ecdsa_with_aes_128_gcm_sha256,
         .ecdhe_rsa_with_aes_128_gcm_sha256,

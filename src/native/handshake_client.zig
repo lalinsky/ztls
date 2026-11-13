@@ -100,7 +100,6 @@ fn handshakeInner(h: *Handshake, opt: config.Client) Error!void {
     var hello = switch (try parseServerHello(msg.body, opt, session_id)) {
         .tls13 => |hello| hello,
         .tls12 => |hello| {
-            if (!proto.tls12_enabled) unreachable;
             h.setSuite(hello.suite);
             try h.hashMessage(msg);
             try tls12.run(h, opt, &random, hello);
@@ -385,7 +384,7 @@ fn parseServerHello(body: []const u8, opt: config.Client, session_id: []const u8
     if (std.mem.indexOfScalar(proto.CipherSuite, opt.cipher_suites, suite) == null) return error.TlsIllegalParameter;
     if (suite.version() != version) return error.TlsIllegalParameter;
 
-    if (version == .tls_1_2) return if (!proto.tls12_enabled) unreachable else .{ .tls12 = try parseServerHelloTls12(opt, random, session_id, echoed_session_id, suite, extensions) };
+    if (version == .tls_1_2) return .{ .tls12 = try parseServerHelloTls12(opt, random, session_id, echoed_session_id, suite, extensions) };
 
     const is_retry = std.mem.eql(u8, &random, &handshake.hello_retry_request_random);
     if (!std.mem.eql(u8, echoed_session_id, session_id)) return error.TlsIllegalParameter;
@@ -619,7 +618,6 @@ fn testServerHello(buf: []u8, version: proto.Version, random: *const [32]u8, ses
 }
 
 test "a TLS 1.2 ServerHello, when TLS 1.2 is offered" {
-    if (!proto.tls12_enabled) return error.SkipZigTest;
     const both = proto.CipherSuite.all ++ proto.CipherSuite.tls12;
     const opt: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .now = undefined, .cipher_suites = &both };
     const only13: config.Client = .{ .gpa = testing.allocator, .host = "localhost", .insecure_skip_verify = true, .cipher_suites = &proto.CipherSuite.all, .now = undefined };

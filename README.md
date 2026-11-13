@@ -39,8 +39,7 @@ with more real-world use.
 
 - TLS 1.3 client and server ([RFC 9846](https://www.rfc-editor.org/rfc/rfc9846)).
 - TLS 1.2 client: ECDHE with AES-GCM or ChaCha20-Poly1305, extended master
-  secret, no renegotiation. Build with `-Dtls12=false` to leave it out.
-  Older versions are not supported.
+  secret, no renegotiation. Older versions are not supported.
 - AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305.
 - X25519MLKEM768, X25519, P-256 and P-384 key exchange, with
   HelloRetryRequest.

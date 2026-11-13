@@ -125,7 +125,6 @@ pub const Keys = struct {
     /// (`tls12FixedIvLen` bytes). The record sequence number starts at 0
     /// and is also the AES-GCM explicit nonce, as AWS-LC and s2n do.
     pub fn initTls12(algorithm: aead.Algorithm, key: []const u8, fixed_iv: []const u8) crypto.err.Error!Keys {
-        if (!proto.tls12_enabled) unreachable;
         assert(fixed_iv.len == tls12FixedIvLen(algorithm));
         var keys: Keys = .{
             .version = .tls12,
@@ -280,7 +279,6 @@ pub const Keys = struct {
                 keys.ctx.seal(&n, record[0..header_len], inner, inner, tag);
             },
             .tls12 => {
-                if (!proto.tls12_enabled) unreachable;
                 const explicit = keys.explicitNonceLen();
                 record[0..header_len].* = headerOf(content_type, explicit + len + aead.tag_length);
                 @memcpy(record[header_len..][0..explicit], n[aead.nonce_length - explicit ..]);
@@ -315,7 +313,7 @@ pub const Keys = struct {
         if (keys.seq == std.math.maxInt(u64)) return error.TlsInternalError;
         return switch (keys.version) {
             .tls13 => keys.openTls13(record, out),
-            .tls12 => if (!proto.tls12_enabled) unreachable else keys.openTls12(record, out),
+            .tls12 => keys.openTls12(record, out),
         };
     }
 
@@ -517,7 +515,6 @@ fn tls12Pair(algorithm: aead.Algorithm) ![2]Keys {
 }
 
 test "TLS 1.2 records: layout, nonce and additional data" {
-    if (!proto.tls12_enabled) return error.SkipZigTest;
     for ([_]aead.Algorithm{ .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305 }) |algorithm| {
         var pair = try tls12Pair(algorithm);
         defer for (&pair) |*k| k.deinit();
@@ -580,7 +577,6 @@ test "TLS 1.2 records: layout, nonce and additional data" {
 }
 
 test "TLS 1.2 round trips: empty, full and in place" {
-    if (!proto.tls12_enabled) return error.SkipZigTest;
     for ([_]aead.Algorithm{ .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305 }) |algorithm| {
         var pair = try tls12Pair(algorithm);
         defer for (&pair) |*k| k.deinit();
@@ -610,7 +606,6 @@ test "TLS 1.2 round trips: empty, full and in place" {
 }
 
 test "TLS 1.2 keys run to the end of the sequence numbers" {
-    if (!proto.tls12_enabled) return error.SkipZigTest;
     var pair = try tls12Pair(.aes_128_gcm);
     defer for (&pair) |*k| k.deinit();
     const sender = &pair[0];

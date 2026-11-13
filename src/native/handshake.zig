@@ -386,7 +386,6 @@ pub const Handshake = struct {
     /// `raw_transcript` is on.
     fn addTranscript(h: *Handshake, bytes: []const u8) Error!void {
         h.transcript.update(bytes);
-        if (!proto.tls12_enabled) return;
         if (h.raw_transcript) |*raw| try raw.appendSlice(h.gpa, bytes);
     }
 
