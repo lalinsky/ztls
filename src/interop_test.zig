@@ -613,8 +613,12 @@ fn sClientOnce(io: Io, options: config.Server, args: []const []const u8) !struct
     peer.child.stdin = null;
     while (stdout.interface.takeDelimiter('\n') catch null) |_| {}
     peer_running = false;
-    // s_client fails with the handshake; the outcome says how.
-    peer.finish() catch {};
+    // s_client fails with the handshake; the outcome says how. One that
+    // failed before connecting would leave the server waiting to accept:
+    // a connection that closes at once fails its handshake instead.
+    peer.finish() catch {
+        if (loopback.connect()) |stream| stream.close(io) else |_| {}
+    };
     try task.await(io);
     return .{ .outcome = outcome, .echoed = echoed };
 }
@@ -776,10 +780,18 @@ test "the libssl server picks a certificate older clients can use, and keeps a s
     signed.signer = .{ .context = &signer, .sign = CountingSigner.sign };
     const tls11: []const []const u8 = &.{ "-tls1_1", "-cipher", "ECDHE-RSA-AES128-SHA:@SECLEVEL=0" };
 
-    // Before TLS 1.2: not the Ed25519 certificate, nor one with a signer.
-    var result = try sClientOnce(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .certificates = &.{ &ed, &signed, &rsa } }, tls11);
+    var ec = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
+    defer ec.deinit(testing.allocator);
+
+    // Before TLS 1.2: not the Ed25519 certificate, nor one with a signer,
+    // nor an ECDSA one for a client that offers RSA suites only.
+    var result = try sClientOnce(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .certificates = &.{ &ed, &signed, &ec, &rsa } }, tls11);
     try result.outcome.handshake;
     try testing.expectEqual(0, signer.calls);
+    // So in TLS 1.2, for a client that takes ECDSA signatures.
+    result = try sClientOnce(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .certificates = &.{ &ec, &rsa } }, &.{ "-tls1_2", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256" });
+    try result.outcome.handshake;
+    try testing.expectEqual(proto.CipherSuite.ecdhe_rsa_with_aes_128_gcm_sha256, result.outcome.suite.?);
 
     // The application's choice, told what the client can verify.
     const Picker = struct {
@@ -792,7 +804,7 @@ test "the libssl server picks a certificate older clients can use, and keeps a s
             return null;
         }
     };
-    var picker: Picker = .{ .offered = &.{ &ed, &rsa } };
+    var picker: Picker = .{ .offered = &.{ &ed, &ec, &rsa } };
     const picking: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .select_certificate = .{ .context = &picker, .callback = Picker.pick } };
     result = try sClientOnce(io, picking, tls11);
     try result.outcome.handshake;

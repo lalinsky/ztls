@@ -139,6 +139,9 @@ pub const Connection = struct {
     /// A failure one of our callbacks decided in the current call, which
     /// says more than the alert that goes out for it.
     callback_error: ?HandshakeError = null,
+    /// What the suites before TLS 1.3 that both the client and we offer
+    /// authenticate with, for picking the server's certificate.
+    legacy_auth: LegacyAuth = .{},
     /// KeyUpdates sent and received, counted by libssl's message callback.
     /// Atomic so either task may read them while the other's call runs.
     key_updates_sent: std.atomic.Value(u64) = .init(0),
@@ -1129,6 +1132,7 @@ fn clientCertificateCallback(ssl: ?*c.SSL, arg: ?*anyopaque) callconv(.c) c_int 
     const len = c.SSL_get0_peer_verify_algorithms(ssl, &algs);
     const theirs: []const proto.SignatureScheme = if (len == 0) &.{} else @ptrCast(algs[0..len]);
     if (!pairSigns(ssl.?, pair, opt.signing_schemes orelse libssl_schemes, theirs)) return 1;
+    if (c.SSL_version(ssl) < c.TLS1_3_VERSION and !certificateTypeRequested(ssl.?, pair.key.key_type)) return 1;
     setCertificate(conn, pair) catch |err| {
         conn.callback_error = err;
         return 0;
@@ -1260,6 +1264,7 @@ fn selectSuiteCallback(hello: ?*const c.SSL_CLIENT_HELLO) callconv(.c) c.enum_ss
     const h = hello.?;
     const conn = connectionOf(h.ssl);
     const offered: []const u8 = if (h.cipher_suites_len == 0) &.{} else h.cipher_suites[0..h.cipher_suites_len];
+    conn.legacy_auth = .of(h.ssl.?, offered);
     // With none in common, libssl finds none either and says so.
     const suite = policy.chooseSuite(conn.options.server.cipher_suites, offered, crypto.aead.hasAesHardware()) orelse return c.ssl_select_cert_success;
     setCipherSuites(h.ssl.?, &.{suite}) catch |err| {
@@ -1287,6 +1292,52 @@ fn serverNameCallback(ssl: ?*c.SSL, alert: ?*c_int, arg: ?*anyopaque) callconv(.
     return c.SSL_TLSEXT_ERR_NOACK;
 }
 
+/// Which certificates the suites before TLS 1.3 that both sides offer can
+/// go with. In TLS 1.2 an Ed25519 key goes with ECDSA suites (RFC 8422).
+const LegacyAuth = packed struct(u3) {
+    rsa: bool = false,
+    /// An RSA suite with ECDHE or DHE, which a signer's key can serve: it
+    /// signs, where RSA key exchange decrypts.
+    rsa_signed: bool = false,
+    ecdsa: bool = false,
+
+    fn of(ssl: *c.SSL, offered: []const u8) LegacyAuth {
+        var auth: LegacyAuth = .{};
+        const ours = c.SSL_get_ciphers(ssl) orelse return auth;
+        for (0..c.sk_SSL_CIPHER_num(ours)) |i| {
+            const cipher = c.sk_SSL_CIPHER_value(ours, i);
+            if (c.SSL_CIPHER_get_min_version(cipher) >= c.TLS1_3_VERSION) continue;
+            const id = c.SSL_CIPHER_get_protocol_id(cipher);
+            var j: usize = 0;
+            const theirs = while (j + 2 <= offered.len) : (j += 2) {
+                if (std.mem.readInt(u16, offered[j..][0..2], .big) == id) break true;
+            } else false;
+            if (!theirs) continue;
+            switch (c.SSL_CIPHER_get_auth_nid(cipher)) {
+                c.NID_auth_rsa => {
+                    auth.rsa = true;
+                    if (c.SSL_CIPHER_get_kx_nid(cipher) != c.NID_kx_rsa) auth.rsa_signed = true;
+                },
+                c.NID_auth_ecdsa => auth.ecdsa = true,
+                else => {},
+            }
+        }
+        return auth;
+    }
+
+    fn takesKey(auth: LegacyAuth, key_type: crypto.sig.KeyType) bool {
+        return switch (key_type) {
+            .rsa => auth.rsa,
+            .ecdsa, .ed25519 => auth.ecdsa,
+        };
+    }
+
+    fn takes(auth: LegacyAuth, pair: *const config.CertKeyPair) bool {
+        if (pair.signer != null and pair.key.key_type == .rsa) return auth.rsa_signed;
+        return auth.takesKey(pair.key.key_type);
+    }
+};
+
 fn selectCertificate(conn: *Connection) HandshakeError!void {
     const opt = conn.options.server;
     const ssl = conn.ssl;
@@ -1298,10 +1349,12 @@ fn selectCertificate(conn: *Connection) HandshakeError!void {
         if (opt.select_certificate) |select| {
             const info: config.SelectCertificate.Hello = .{
                 .server_name = server_name,
-                .accepts = if (schemeRules(ssl)) |version| switch (version) {
-                    .tls13 => acceptsKey(.tls13),
-                    .tls12 => acceptsKey(.tls12),
-                } else acceptsKeyLegacy,
+                .accepts = switch (conn.legacy_auth) {
+                    inline else => |auth| if (schemeRules(ssl)) |version| switch (version) {
+                        .tls13 => acceptsKey(.tls13, .{}),
+                        .tls12 => acceptsKey(.tls12, auth),
+                    } else acceptsKey(null, auth),
+                },
                 .schemes = schemes,
                 .signing_schemes = signing,
             };
@@ -1309,6 +1362,7 @@ fn selectCertificate(conn: *Connection) HandshakeError!void {
         }
         for (opt.certificates) |pair| {
             if (!pairSigns(ssl, pair, signing, schemes)) continue;
+            if (c.SSL_version(ssl) < c.TLS1_3_VERSION and !conn.legacy_auth.takes(pair)) continue;
             if (server_name) |name| {
                 if (!pair.leaf.matchesHost(name)) continue;
             }
@@ -1341,21 +1395,34 @@ fn pairSigns(ssl: *const c.SSL, pair: *const config.CertKeyPair, ours: []const p
     return policy.selectScheme(ours, pair.key.key_type, theirs, version) != null;
 }
 
+/// Whether a CertificateRequest before TLS 1.3 asks for a key of this
+/// type, as the native client checks: rsa_sign, or ecdsa_sign, which in
+/// TLS 1.2 takes Ed25519 too (RFC 8422 §5.5).
+fn certificateTypeRequested(ssl: *const c.SSL, key_type: crypto.sig.KeyType) bool {
+    var types: [*c]const u8 = null;
+    const len = c.SSL_get0_certificate_types(ssl, &types);
+    if (len == 0) return false;
+    const wanted: u8 = switch (key_type) {
+        .rsa => 1,
+        .ecdsa, .ed25519 => 64,
+    };
+    return std.mem.indexOfScalar(u8, types[0..len], wanted) != null;
+}
+
 fn legacyKey(key_type: crypto.sig.KeyType) bool {
     return key_type == .rsa or key_type == .ecdsa;
 }
 
-fn acceptsKey(comptime version: policy.Version) *const fn (hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
+/// `Hello.accepts` under `version`'s rules, null before TLS 1.2; before
+/// TLS 1.3 a key also needs a suite both sides offer that it can serve.
+fn acceptsKey(comptime version: ?policy.Version, comptime auth: LegacyAuth) *const fn (hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
     return struct {
         fn accepts(hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
-            return policy.selectScheme(hello.signing_schemes, key_type, hello.schemes, version) != null;
+            const v = version orelse return legacyKey(key_type) and auth.takesKey(key_type);
+            if (v == .tls12 and !auth.takesKey(key_type)) return false;
+            return policy.selectScheme(hello.signing_schemes, key_type, hello.schemes, v) != null;
         }
     }.accepts;
-}
-
-fn acceptsKeyLegacy(hello: *const config.SelectCertificate.Hello, key_type: crypto.sig.KeyType) bool {
-    _ = hello;
-    return legacyKey(key_type);
 }
 
 /// The schemes for a null `signing_schemes` or `verify_schemes`: the
