@@ -758,6 +758,10 @@ pub const Connection = struct {
             .tls12 => return,
         };
         if (c.write.key_updates >= max_key_updates) return;
+        // Room for both records first: a transport failure must come
+        // before the state below changes, or the peer's request would be
+        // lost, or ours marked awaited without having gone out.
+        try c.reserve(2 * key_update_record_len);
         // Set before the request goes out, so the answer cannot be
         // read before it is.
         const awaited = c.shared.key_update_awaited.swap(true, .monotonic);
@@ -765,14 +769,8 @@ pub const Connection = struct {
         // A request of the peer's is answered with update_not_requested
         // (§4.6.3), not folded into a request of ours. With ours still
         // unanswered, that answer is all that goes out.
-        if (owed or awaited) {
-            try c.reserve(key_update_record_len);
-            c.sendKeyUpdate(.update_not_requested, tls13) catch |err| return c.failWrite(err);
-        }
-        if (!awaited and c.write.key_updates < max_key_updates) {
-            try c.reserve(key_update_record_len);
-            c.sendKeyUpdate(.update_requested, tls13) catch |err| return c.failWrite(err);
-        }
+        if (owed or awaited) c.sendKeyUpdate(.update_not_requested, tls13) catch |err| return c.failWrite(err);
+        if (!awaited and c.write.key_updates < max_key_updates) c.sendKeyUpdate(.update_requested, tls13) catch |err| return c.failWrite(err);
         c.output.flush() catch return error.WriteFailed;
     }
 
@@ -1542,6 +1540,33 @@ const TestSink = struct {
         return r.interface.allocRemaining(testing.allocator, .unlimited);
     }
 };
+
+test "a KeyUpdate request that cannot make room changes nothing" {
+    const ks = key_schedule.KeySchedule.init(cipher.suiteHash(.aes_128_gcm_sha256).?);
+    const secret = ks.trafficSecret(.client_application, "retry");
+    var input_buffer: [input_buffer_len]u8 = undefined;
+    var input: Io.Reader = .fixed(&input_buffer);
+    input.end = 0;
+    var output_buffer: [output_buffer_len]u8 = undefined;
+    var sink: TestSink = .init(&output_buffer);
+    var conn = Connection.init(&input, &sink.writer, .client);
+    defer conn.deinit();
+    conn.write.keys = try cipher.Keys.init(.aes_128_gcm_sha256, secret);
+    // The peer asked for an update, and the transport's buffer is too
+    // full for the answer and ours.
+    conn.shared.key_update_requested.store(true, .monotonic);
+    @memset(&output_buffer, 0);
+    sink.writer.end = output_buffer.len - key_update_record_len;
+    try testing.expectError(error.WriteFailed, conn.requestKeyUpdate());
+    try testing.expect(conn.shared.key_update_requested.load(.monotonic));
+    try testing.expect(!conn.shared.key_update_awaited.load(.monotonic));
+    try testing.expectEqual(0, conn.write.key_updates);
+    // Once the transport works, both go out.
+    sink.failing = false;
+    try conn.requestKeyUpdate();
+    try testing.expectEqual(2, conn.write.key_updates);
+    try testing.expect(conn.shared.key_update_awaited.load(.monotonic));
+}
 
 test "after a transport failure, what was sealed goes out with the next flush" {
     const ks = key_schedule.KeySchedule.init(cipher.suiteHash(.aes_128_gcm_sha256).?);
