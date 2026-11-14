@@ -71,7 +71,7 @@ lock described above, and it needs a C++ runtime.
 ## Using it
 
 ```sh
-zig fetch --save "git+https://github.com/lalinsky/ztls#v0.2.0"
+zig fetch --save "git+https://github.com/lalinsky/ztls#v0.2.1"
 ```
 
 ```zig

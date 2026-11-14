@@ -1,6 +1,6 @@
 .{
     .name = .ztls,
-    .version = "0.2.0",
+    .version = "0.2.1",
     .fingerprint = 0x767a5b45ceae7391,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

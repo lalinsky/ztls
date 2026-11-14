@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-14
+
 - A certificate without DNS subject alternative names is now matched against the host by its subject common name, as OpenSSL and libpq do. Self-signed certificates made with only a common name, such as those in PostgreSQL's documentation, are accepted. A certificate that has DNS names is still matched against those only.
 
 ## [0.2.0] - 2026-11-14
