@@ -3,7 +3,9 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const use_asm = b.option(bool, "asm", "Build AWS-LC's assembly; false builds its portable C code, without NASM on x86_64 Windows (default: true)") orelse true;
+    // x86_64 Windows's assembly needs NASM, which is opt-in.
+    const needs_nasm = target.result.os.tag == .windows and target.result.cpu.arch == .x86_64;
+    const use_asm = b.option(bool, "asm", "Build AWS-LC's assembly; false builds its portable C code. On x86_64 Windows the assembly needs NASM (default: false there, true elsewhere)") orelse !needs_nasm;
     const impl = b.option(Impl, "impl", "native: the protocol in Zig on AWS-LC's libcrypto; libssl: AWS-LC's libssl, which is C++ (default: native)") orelse .native;
     const options = b.addOptions();
     options.addOption(bool, "libssl", impl == .libssl);
@@ -72,7 +74,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("bogo-shim", "Build the BoGo shim").dependOn(&b.addInstallArtifact(shim, .{}).step);
-
 
     // One ztls connection to a public server; see tools/survey/run.sh.
     const probe = b.addExecutable(.{

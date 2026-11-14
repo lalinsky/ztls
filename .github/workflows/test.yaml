@@ -13,17 +13,18 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         zig: [0.16.0, 0.17.0]
         include:
-          # Without AWS-LC's assembly, which needs NASM there: fetching
-          # the nasm package keeps failing in CI; see #45.
+          # With AWS-LC's assembly, which needs NASM there and is off by
+          # default; 0.16 tests the default.
           - os: windows-latest
-            build_flags: -Dasm=false
+            zig: 0.17.0
+            build_flags: -Dasm=true
           # The other targets AWS-LC's assembly is built for.
           - os: macos-15-intel
             zig: 0.17.0
           - os: windows-11-arm
             zig: 0.17.0
     runs-on: ${{ matrix.os }}
-    name: Test (${{ matrix.os }}, zig ${{ matrix.zig }})
+    name: Test (${{ matrix.os }}, zig ${{ matrix.zig }}${{ matrix.build_flags && ', ' }}${{ matrix.build_flags }})
     steps:
       # Test data is embedded byte for byte; CRLF checkouts would change it.
       - run: git config --global core.autocrlf false
