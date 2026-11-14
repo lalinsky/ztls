@@ -4,12 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- The `tls12` build option is gone; the TLS 1.2 client is always built in.
-- `config.Client` and `config.Server` take an `io`, which the libssl engine waits with; there, reads, writes and handshakes may fail with `Canceled`.
-- `now` is optional in `config.Client` and `config.Server`; by default the real clock is read through `io` when a certificate is checked.
-- `config.Client` and `config.Server` take `min_version` and `max_version`, and `cipher_suites` is optional; null leaves each to the engine. The libssl engine now speaks whatever AWS-LC does: TLS 1.0 to 1.3 on both sides, with AWS-LC's suites, CBC and RSA key exchange among them. The native engine refuses a suite it does not implement, and a range without a version it speaks.
-- The `asm` build option defaults to false on x86_64 Windows, so building there doesn't need NASM; `-Dasm=true` builds AWS-LC's assembly.
-- `verify_schemes` and `signing_schemes` are optional too, and TLS 1.2's SHA-1 schemes, `ecdsa_sha1` and `rsa_pkcs1_sha1`, are supported. The libssl engine takes them by default, the native one when they are listed. `config.known_signature_schemes` lists every scheme ztls implements.
+## [0.2.0] - 2026-11-14
+
+This release adds an optional engine based on AWS-LC's libssl. Build with `-Dimpl=libssl` to use it with the same ztls API. It supports TLS 1.0 through 1.3 as both client and server, including CBC suites and RSA key exchange. The native engine remains the default and is faster; the libssl engine provides broader compatibility and requires a C++ runtime.
+
+- `config.Client` and `config.Server` now require `io`. The libssl engine uses it to wait for its connection lock without blocking a thread. With this engine, reads, writes and handshakes can return `Canceled`.
+- `now` is optional. When omitted, certificate verification reads the current time through `io`.
+- Added `min_version` and `max_version` to the client and server options. These and `cipher_suites` can be left as null to use the engine's defaults. The native engine rejects unsupported cipher suites and version ranges.
+- `verify_schemes` and `signing_schemes` are now optional and use the engine's defaults. Added the TLS 1.2 schemes `ecdsa_sha1` and `rsa_pkcs1_sha1`: libssl enables them by default, while the native engine requires them to be explicitly listed. `config.known_signature_schemes` lists all supported schemes.
+- Added `Connection.keyUpdatesSent` and `Connection.keyUpdatesReceived` to count KeyUpdate messages.
+- Removed the `tls12` build option. The native TLS 1.2 client is now always included.
+- On x86_64 Windows, `asm` now defaults to false, so builds no longer need NASM. Use `-Dasm=true` to enable AWS-LC's assembly.
+- Invalid configurations are rejected before the handshake starts, including group lists with no usable key exchange group and native server configurations with no TLS 1.3 cipher suite.
+- Fixed the native client advertising secp521r1 for key exchange, which it does not implement. TLS 1.2 connections can still use P-521 certificates when secp521r1 is listed.
+- The native engine now accepts empty handshake records after the handshake. It also handles `close_notify` or transport EOF during a post-handshake message as a clean shutdown, unless `strict_close_notify` requires a truncation error. NewSessionTicket messages larger than the greater of 16 KiB and `max_handshake_message_len` are rejected with `illegal_parameter`.
+- Fixed KeyUpdate handling in the native engine. If a peer's update request is pending when `requestKeyUpdate` is called, both updates are sent as required by RFC 8446 §4.6.3. A transport failure during `requestKeyUpdate` no longer discards the pending request.
+
+Interoperability tests, API tests and tlsfuzzer now run against both engines. BoGo and TLS-Anvil continue to test the native engine.
 
 ## [0.1.0] - 2026-11-11
 
