@@ -68,12 +68,13 @@ pub const Certificate = struct {
     }
 
     /// Whether the certificate is for `host`: a DNS subject alternative
-    /// name matches it (wildcards included); the subject common name is
-    /// never consulted.
+    /// name matches it (wildcards included). A certificate without DNS
+    /// names is matched by its subject common name, as OpenSSL and libpq
+    /// do.
     pub fn matchesHost(self: *const Certificate, host: []const u8) bool {
         // A zero length tells AWS-LC to call strlen instead.
         if (host.len == 0) return false;
-        const r = c.X509_check_host(self.x509, host.ptr, host.len, c.X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, null);
+        const r = c.X509_check_host(self.x509, host.ptr, host.len, 0, null);
         if (r == 1) return true;
         _ = err.take();
         return false;
@@ -403,8 +404,8 @@ pub const VerifyOptions = struct {
     /// The time to validate at, in seconds since the Unix epoch.
     now: i64,
     purpose: Purpose,
-    /// Checked against the leaf's DNS subject alternative names; the
-    /// subject common name is never used.
+    /// Checked against the leaf's DNS subject alternative names, or its
+    /// subject common name when it has none.
     host: ?[]const u8 = null,
     /// A 4- or 16-byte address, checked against the leaf's IP subject
     /// alternative names.
@@ -451,7 +452,6 @@ pub fn verify(store: *const TrustStore, chain: []const Certificate, options: Ver
         // A zero length tells AWS-LC to call strlen and then, finding
         // nothing, to check no name at all.
         std.debug.assert(host.len != 0);
-        c.X509_VERIFY_PARAM_set_hostflags(param, c.X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
         if (c.X509_VERIFY_PARAM_set1_host(param, host.ptr, host.len) != 1) return err.fail();
     }
     if (options.ip) |ip| {
@@ -541,6 +541,8 @@ const pki = struct {
     const intermediate = @embedFile("../testdata/pki/intermediate.pem");
     const server_ec = @embedFile("../testdata/pki/server-ec.pem");
     const server_ec_key = @embedFile("../testdata/pki/server-ec.key");
+    const server_cn = @embedFile("../testdata/pki/server-cn.pem");
+    const server_cn_san = @embedFile("../testdata/pki/server-cn-san.pem");
     const server_rsa = @embedFile("../testdata/pki/server-rsa.pem");
     const server_ed25519 = @embedFile("../testdata/pki/server-ed25519.pem");
     const server_chain = @embedFile("../testdata/pki/server-chain.pem");
@@ -820,6 +822,25 @@ test "matching a certificate's names" {
     try testing.expect(!cert.matchesHost("example.test"));
     try testing.expect(!cert.matchesHost("localhost.example.com"));
     try testing.expect(!cert.matchesHost(""));
+}
+
+test "the common name is matched only without DNS names" {
+    var cn_only = try Certificate.parsePem(testing.allocator, pki.server_cn);
+    defer cn_only.deinit();
+    try testing.expect(cn_only.matchesHost("cn.example.org"));
+    try testing.expect(!cn_only.matchesHost("localhost"));
+
+    var with_san = try Certificate.parsePem(testing.allocator, pki.server_cn_san);
+    defer with_san.deinit();
+    try testing.expect(with_san.matchesHost("localhost"));
+    try testing.expect(!with_san.matchesHost("cn.example.org"));
+
+    var store = try trustTestCa();
+    defer store.deinit();
+    try verify(&store, &.{cn_only}, .{ .now = valid_now, .purpose = .server, .host = "cn.example.org" });
+    try testing.expectError(error.HostnameMismatch, verify(&store, &.{cn_only}, .{ .now = valid_now, .purpose = .server, .host = "localhost" }));
+    try verify(&store, &.{with_san}, .{ .now = valid_now, .purpose = .server, .host = "localhost" });
+    try testing.expectError(error.HostnameMismatch, verify(&store, &.{with_san}, .{ .now = valid_now, .purpose = .server, .host = "cn.example.org" }));
 }
 
 test "the error queue is left empty" {

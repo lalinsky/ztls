@@ -65,4 +65,12 @@ for h in sha1 sha256; do
     -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest -extfile server.ext -out server-pss-$h.pem
 done
 
+# Leaves named cn.example.org in the subject common name only: one without
+# subject alternative names, which is matched by it, and one whose DNS names
+# leave it unused.
+printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n' > server-cn.ext
+openssl req -new -key server-ec.key -subj "/CN=cn.example.org" -out server-cn.csr
+openssl x509 -req -in server-cn.csr -CA ca.pem -CAkey ca.key -set_serial 8 -days $days -extfile server-cn.ext -out server-cn.pem
+openssl x509 -req -in server-cn.csr -CA ca.pem -CAkey ca.key -set_serial 9 -days $days -extfile server.ext -out server-cn-san.pem
+
 rm -f *.csr *.ext server-chain-leaf.pem

@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- A certificate without DNS subject alternative names is now matched against the host by its subject common name, as OpenSSL and libpq do. Self-signed certificates made with only a common name, such as those in PostgreSQL's documentation, are accepted. A certificate that has DNS names is still matched against those only.
+
 ## [0.2.0] - 2026-11-14
 
 This release adds an optional engine based on AWS-LC's libssl. Build with `-Dimpl=libssl` to use it with the same ztls API. It supports TLS 1.0 through 1.3 as both client and server, including CBC suites and RSA key exchange. The native engine remains the default and is faster; the libssl engine provides broader compatibility and requires a C++ runtime.
