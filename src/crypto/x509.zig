@@ -72,8 +72,9 @@ pub const Certificate = struct {
     /// names is matched by its subject common name, as OpenSSL and libpq
     /// do.
     pub fn matchesHost(self: *const Certificate, host: []const u8) bool {
-        // A zero length tells AWS-LC to call strlen instead.
-        if (host.len == 0) return false;
+        // A zero length tells AWS-LC to call strlen instead, and a leading
+        // dot makes it match any subdomain; neither is a host name.
+        if (host.len == 0 or host[0] == '.') return false;
         const r = c.X509_check_host(self.x509, host.ptr, host.len, 0, null);
         if (r == 1) return true;
         _ = err.take();
@@ -822,6 +823,7 @@ test "matching a certificate's names" {
     try testing.expect(!cert.matchesHost("example.test"));
     try testing.expect(!cert.matchesHost("localhost.example.com"));
     try testing.expect(!cert.matchesHost(""));
+    try testing.expect(!cert.matchesHost(".example.test"));
 }
 
 test "the common name is matched only without DNS names" {
@@ -829,6 +831,7 @@ test "the common name is matched only without DNS names" {
     defer cn_only.deinit();
     try testing.expect(cn_only.matchesHost("cn.example.org"));
     try testing.expect(!cn_only.matchesHost("localhost"));
+    try testing.expect(!cn_only.matchesHost(".example.org"));
 
     var with_san = try Certificate.parsePem(testing.allocator, pki.server_cn_san);
     defer with_san.deinit();
