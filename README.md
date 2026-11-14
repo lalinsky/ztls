@@ -226,7 +226,9 @@ engine. Format with Zig 0.16's `zig fmt`,
 because 0.17's renames builtins that 0.16 doesn't accept.
 
 `-Dasm=false` builds AWS-LC's portable C code instead of its assembly. It
-builds faster the first time, and on x86_64 Windows it doesn't need NASM.
+builds faster the first time. It's the default on x86_64 Windows, where the
+assembly needs NASM; `-Dasm=true` builds it there, fetching and building
+NASM too.
 
 `vendor/aws-lc` builds AWS-LC. After an upgrade, run `gen_sources.py`
 there to regenerate the file lists from upstream's CMake build.
