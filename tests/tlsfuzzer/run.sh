@@ -45,8 +45,31 @@ clients=$root/tests/tlsfuzzer
 pki=$root/src/testdata/pki
 # What the server takes in a client's CertificateVerify.
 sigalgs='ecdsa_secp256r1_sha256 ecdsa_secp384r1_sha384 ecdsa_secp521r1_sha512 ed25519 rsa_pss_rsae_sha256 rsa_pss_rsae_sha384 rsa_pss_rsae_sha512 rsa_pkcs1_sha256 rsa_pkcs1_sha384 rsa_pkcs1_sha512'
-# libssl's default takes TLS 1.2's SHA-1 ones too.
-if [ "$IMPL" = libssl ]; then sigalgs+=' ecdsa_sha1 rsa_pkcs1_sha1'; fi
+
+# Prints an -e for each probe named on stdin, one per line.
+excluding() {
+    local probe
+    while IFS= read -r probe; do
+        [ -n "$probe" ] && printf " -e '%s'" "$probe"
+    done
+}
+
+# Every probe of test-tls13-symetric-ciphers.py for a CCM suite.
+ccm_probes() {
+    local suite n val pos what
+    for suite in TLS_AES_128_CCM_SHA256:17 TLS_AES_128_CCM_8_SHA256:9; do
+        n=${suite#*:}
+        suite=${suite%:*}
+        echo "check connection with $suite"
+        for val in 1 2 4 8 16 32 64 128; do
+            for ((pos = -1; pos > -n; pos--)); do
+                for what in 'application data' 'finished message'; do
+                    echo "check connection with $suite - fuzz tag on $what with $val on pos $pos"
+                done
+            done
+        done
+    done
+}
 
 # Every probe of test-tls13-obsolete-curves.py with a key share for an
 # obsolete group that supported_groups does not list.
@@ -57,34 +80,22 @@ inconsistent_share_probes() {
         sect163k1 sect163r1 sect163r2 sect193r1 sect193r2 sect233k1 sect233r1 sect239k1 \
         sect283k1 sect283r1 sect409k1 sect409r1 sect571k1 sect571r1 \
         'unknown (65281)' 'unknown (65282)'; do
-        printf " -e '%s in key_share and secp256r1 in supported_groups (inconsistent extensions)'" "$group"
+        echo "$group in key_share and secp256r1 in supported_groups (inconsistent extensions)"
     done
 }
 
-# Every probe of test-tls13-symetric-ciphers.py for a CCM suite.
-ccm_probes() {
-    local suite n val pos what
-    for suite in TLS_AES_128_CCM_SHA256:17 TLS_AES_128_CCM_8_SHA256:9; do
-        n=${suite#*:}
-        suite=${suite%:*}
-        printf " -e 'check connection with %s'" "$suite"
-        for val in 1 2 4 8 16 32 64 128; do
-            for ((pos = -1; pos > -n; pos--)); do
-                for what in 'application data' 'finished message'; do
-                    printf " -e 'check connection with %s - fuzz tag on %s with %d on pos %d'" "$suite" "$what" "$val" "$pos"
-                done
-            done
-        done
-    done
-}
+# What each engine does differently, in native.sh and libssl.sh: by
+# script name, arguments added to the script's entry below.
+declare -A engine_args
+source "$clients/$IMPL.sh"
 
 # One script per entry: its name and arguments, split as the shell would.
-# -e leaves a probe out, and each one says why:
-#   unsupported  a feature ztls does not have
-#   alert        ztls refuses as it should, with a different alert
-#   limit        ztls refuses a ClientHello past its limits: handshake
-#                messages other than certificates are held to 16 KiB
-#   BUG          ztls is wrong; see the comment
+# These hold for both engines. -e leaves a probe out, and each one says
+# why:
+#   unsupported  a feature neither engine has
+#   alert        both refuse as they should, with a different alert
+#   limit        both refuse a handshake message over 16 KiB, with
+#                illegal_parameter
 #
 # Scripts left out altogether:
 #   test-tls13-0rtt-garbage.py, -psk_dhe_ke.py, -psk_ke.py,
@@ -113,117 +124,127 @@ ccm_probes() {
 tests=(
     "test-tls13-conversation.py"
     "test-tls13-ccs.py"
-    "test-tls13-connection-abort.py
-        -e 'After NewSessionTicket'"                # unsupported: no tickets
+    "test-tls13-connection-abort.py $(excluding <<< 'After NewSessionTicket')"
+        # unsupported: no tickets
     "test-tls13-count-tickets.py -t 0"
-    "test-tls13-crfg-curves.py
-        -e 'sanity x448 with compression ansiX962_compressed_char2'
-        -e 'sanity x448 with compression ansiX962_compressed_prime'
-        -e 'sanity x448 with compression uncompressed'
-        -e 'all zero x448 key share'
-        -e 'empty x448 key share'
-        -e 'too big x448 key share'
-        -e 'too small x448 key share'
-        -e 'x448 key share of \"1\"'"               # unsupported: x448
-    "test-tls13-ecdhe-curves.py
-        -e 'sanity - secp521r1'
-        -e 'secp521r1 - key share from other curve'
-        -e 'secp521r1 - point at infinity'
-        -e 'secp521r1 - point outside curve'
-        -e 'secp521r1 - right 0-padded key_share'
-        -e 'secp521r1 - right-truncated key_share'
-        -e 'secp521r1 - x=0, y=0'
-        -e 'sanity - x448'
-        -e 'x448 - key share from other curve'
-        -e 'x448 - point at infinity'
-        -e 'x448 - right 0-padded key_share'
-        -e 'x448 - right-truncated key_share'"      # unsupported: secp521r1, x448
-    "test-tls13-dhe-shared-secret-padding.py
-        -e 'TLS 1.3 with secp521r1'
-        -e 'TLS 1.3 with x448'
-        -e 'TLS 1.3 with ffdhe2048'
-        -e 'TLS 1.3 with ffdhe3072'"                # unsupported groups
-    "test-tls13-serverhello-random.py
-        -e 'TLS 1.3 with secp521r1'
-        -e 'TLS 1.3 with x448'
-        -e 'TLS 1.3 with ffdhe2048'
-        -e 'TLS 1.3 with ffdhe3072'"                # unsupported groups
-    "test-tls13-obsolete-curves.py
-        --relaxed -a handshake_failure
-        -e 'secp521r1 in supported_groups and key_share'
-        -e 'x448 in supported_groups and key_share'
-        $(inconsistent_share_probes)"
+    "test-tls13-crfg-curves.py $(excluding <<'PROBES'
+sanity x448 with compression ansiX962_compressed_char2
+sanity x448 with compression ansiX962_compressed_prime
+sanity x448 with compression uncompressed
+all zero x448 key share
+empty x448 key share
+too big x448 key share
+too small x448 key share
+x448 key share of "1"
+PROBES
+)"
+        # unsupported: x448
+    "test-tls13-ecdhe-curves.py $(excluding <<'PROBES'
+sanity - secp521r1
+secp521r1 - key share from other curve
+secp521r1 - point at infinity
+secp521r1 - point outside curve
+secp521r1 - right 0-padded key_share
+secp521r1 - right-truncated key_share
+secp521r1 - x=0, y=0
+sanity - x448
+x448 - key share from other curve
+x448 - point at infinity
+x448 - right 0-padded key_share
+x448 - right-truncated key_share
+PROBES
+)"
+        # unsupported: secp521r1, x448
+    "test-tls13-dhe-shared-secret-padding.py $(excluding <<'PROBES'
+TLS 1.3 with secp521r1
+TLS 1.3 with x448
+TLS 1.3 with ffdhe2048
+TLS 1.3 with ffdhe3072
+PROBES
+)"
+        # unsupported groups
+    "test-tls13-serverhello-random.py $(excluding <<'PROBES'
+TLS 1.3 with secp521r1
+TLS 1.3 with x448
+TLS 1.3 with ffdhe2048
+TLS 1.3 with ffdhe3072
+PROBES
+)"
+        # unsupported groups
+    "test-tls13-obsolete-curves.py --relaxed -a handshake_failure $(excluding <<'PROBES'
+secp521r1 in supported_groups and key_share
+x448 in supported_groups and key_share
+PROBES
+)$(inconsistent_share_probes | excluding)"
         # --relaxed: obsolete groups next to a supported one are ignored,
         # not refused, which RFC 9846 does not ask for. -a: with nothing
-        # else, no common group is handshake_failure. unsupported: secp521r1, x448.
-        # A share for a group we do not support is ignored, as Go does,
-        # even if supported_groups does not list it (§4.2.8 allows it).
-    "test-tls13-mlkem.py --kems x25519mlkem768"     # the hybrid ztls has
+        # else, no common group is handshake_failure. unsupported:
+        # secp521r1, x448. A share for a group we do not support is
+        # ignored, as Go does, even if supported_groups does not list it
+        # (§4.2.8 allows it).
+    "test-tls13-mlkem.py --kems x25519mlkem768"     # the hybrid both have
     "test-tls13-no-unknown-groups.py
         --groups x25519mlkem768,x25519,secp256r1,secp384r1"
         # --groups: ours, in our order, as the retry picks our favourite.
-    "test-tls13-unrecognised-groups.py
-        -e 'known group secp256r1 and unknown groups from EC range, key_share of size 128'
-        -e 'known group secp256r1 and unknown groups from EC range, key_share of size 256'
-        -e 'known group secp256r1 and unknown groups from FFDHE range, key_share of size 64'
-        -e 'known group secp256r1 and unknown groups from FFDHE range, key_share of size 128'
-        -e 'known group secp256r1 and unknown groups from FFDHE range, key_share of size 256'
-        -e 'known group ffdhe2048 and unknown groups from EC range, key_share of size 64'
-        -e 'known group ffdhe2048 and unknown groups from EC range, key_share of size 128'
-        -e 'known group ffdhe2048 and unknown groups from EC range, key_share of size 256'
-        -e 'known group ffdhe2048 and unknown groups from FFDHE range, key_share of size 64'
-        -e 'known group ffdhe2048 and unknown groups from FFDHE range, key_share of size 128'
-        -e 'known group ffdhe2048 and unknown groups from FFDHE range, key_share of size 256'
-        -e 'only unknown key_share from EC range, key_share of size 64 + ffdhe2048 in supported_groups'
-        -e 'only unknown key_share from EC range, key_share of size 128 + ffdhe2048 in supported_groups'
-        -e 'only unknown key_share from EC range, key_share of size 256 + ffdhe2048 in supported_groups'
-        -e 'only unknown key_share from FFDHE range, key_share of size 64 + ffdhe2048 in supported_groups'
-        -e 'only unknown key_share from FFDHE range, key_share of size 128 + ffdhe2048 in supported_groups'
-        -e 'only unknown key_share from FFDHE range, key_share of size 256 + ffdhe2048 in supported_groups'
-        -e 'only unknown key_share from EC range, key_share of size 128 + secp256r1 in supported_groups'
-        -e 'only unknown key_share from EC range, key_share of size 256 + secp256r1 in supported_groups'
-        -e 'only unknown key_share from FFDHE range, key_share of size 64 + secp256r1 in supported_groups'
-        -e 'only unknown key_share from FFDHE range, key_share of size 128 + secp256r1 in supported_groups'
-        -e 'only unknown key_share from FFDHE range, key_share of size 256 + secp256r1 in supported_groups'
-        -e 'only unknown supported_groups from EC range, key_share of size 128'
-        -e 'only unknown supported_groups from EC range, key_share of size 256'
-        -e 'only unknown supported_groups from FFDHE range, key_share of size 64'
-        -e 'only unknown supported_groups from FFDHE range, key_share of size 128'
-        -e 'only unknown supported_groups from FFDHE range, key_share of size 256'"
-        # The ffdhe2048 ones are unsupported; the rest are limit (over 16 KiB).
-    "test-tls13-signature-algorithms.py
-        -e '8130 invalid schemes'
-        -e 'duplicated 8130 non-rsa schemes'
-        -e 'tolerance 8130 methods'
-        -e '23752 invalid schemes'
-        -e 'duplicated 23752 non-rsa schemes'
-        -e 'tolerance 23752 methods'
-        -e '32715 invalid schemes'
-        -e 'duplicated 32715 non-rsa schemes'
-        -e 'tolerance 32715 methods'
-        -e 'tolerance 32715 methods with sig_alg_cert'"
+    "test-tls13-unrecognised-groups.py $(excluding <<'PROBES'
+known group ffdhe2048 and unknown groups from EC range, key_share of size 64
+known group ffdhe2048 and unknown groups from EC range, key_share of size 128
+known group ffdhe2048 and unknown groups from EC range, key_share of size 256
+known group ffdhe2048 and unknown groups from FFDHE range, key_share of size 64
+known group ffdhe2048 and unknown groups from FFDHE range, key_share of size 128
+known group ffdhe2048 and unknown groups from FFDHE range, key_share of size 256
+only unknown key_share from EC range, key_share of size 64 + ffdhe2048 in supported_groups
+only unknown key_share from EC range, key_share of size 128 + ffdhe2048 in supported_groups
+only unknown key_share from EC range, key_share of size 256 + ffdhe2048 in supported_groups
+only unknown key_share from FFDHE range, key_share of size 64 + ffdhe2048 in supported_groups
+only unknown key_share from FFDHE range, key_share of size 128 + ffdhe2048 in supported_groups
+only unknown key_share from FFDHE range, key_share of size 256 + ffdhe2048 in supported_groups
+known group secp256r1 and unknown groups from EC range, key_share of size 128
+known group secp256r1 and unknown groups from EC range, key_share of size 256
+known group secp256r1 and unknown groups from FFDHE range, key_share of size 64
+known group secp256r1 and unknown groups from FFDHE range, key_share of size 128
+known group secp256r1 and unknown groups from FFDHE range, key_share of size 256
+only unknown key_share from EC range, key_share of size 128 + secp256r1 in supported_groups
+only unknown key_share from EC range, key_share of size 256 + secp256r1 in supported_groups
+only unknown key_share from FFDHE range, key_share of size 64 + secp256r1 in supported_groups
+only unknown key_share from FFDHE range, key_share of size 128 + secp256r1 in supported_groups
+only unknown key_share from FFDHE range, key_share of size 256 + secp256r1 in supported_groups
+only unknown supported_groups from EC range, key_share of size 128
+only unknown supported_groups from EC range, key_share of size 256
+only unknown supported_groups from FFDHE range, key_share of size 64
+only unknown supported_groups from FFDHE range, key_share of size 128
+only unknown supported_groups from FFDHE range, key_share of size 256
+PROBES
+)"
+        # The ffdhe2048 ones are unsupported; the rest are limit.
+    "test-tls13-signature-algorithms.py $(excluding <<'PROBES'
+8130 invalid schemes
+duplicated 8130 non-rsa schemes
+tolerance 8130 methods
+23752 invalid schemes
+duplicated 23752 non-rsa schemes
+tolerance 23752 methods
+32715 invalid schemes
+duplicated 32715 non-rsa schemes
+tolerance 32715 methods
+tolerance 32715 methods with sig_alg_cert
+PROBES
+)"
         # limit: the bigger lists make the ClientHello over 16 KiB.
     "test-tls13-legacy-version.py"
-    "test-tls13-version-negotiation.py
-        sanity
-        'tls 1.8 only'
-        'SSL 3.0 in supported version'
-        'tls 1.3 negotiation with SSL 3.0 in record layer'
-        'tls 1.3 negotiation with SSL 3.1 in record layer'
-        'tls 1.3 negotiation with SSL 3.2 in record layer'
-        'tls 1.3 negotiation with SSL 3.3 in record layer'
-        'SSL 2.0 ClientHello with TLS 1.3 version and TLS 1.3 only ciphersuites'"
-        # Only these: the rest expect a fall back to TLS 1.2, which the
-        # server does not speak.
+    "test-tls13-version-negotiation.py"
     "test-tls13-hrr.py"
-    "test-tls13-finished.py
-        -e 'padding - cipher TLS_AES_128_GCM_SHA256, pad_byte 0, pad_left 0, pad_right 131072'
-        -e 'padding - cipher TLS_AES_128_GCM_SHA256, pad_byte 0, pad_left 0, pad_right 196608'
-        -e 'padding - cipher TLS_AES_128_GCM_SHA256, pad_byte 0, pad_left 0, pad_right 16777183'
-        -e 'padding - cipher TLS_AES_256_GCM_SHA384, pad_byte 0, pad_left 0, pad_right 131072'
-        -e 'padding - cipher TLS_AES_256_GCM_SHA384, pad_byte 0, pad_left 0, pad_right 196608'
-        -e 'padding - cipher TLS_AES_256_GCM_SHA384, pad_byte 0, pad_left 0, pad_right 16777167'"
-        # limit: a Finished over 16 KiB gets illegal_parameter, not decode_error
+    "test-tls13-finished.py $(excluding <<'PROBES'
+padding - cipher TLS_AES_128_GCM_SHA256, pad_byte 0, pad_left 0, pad_right 131072
+padding - cipher TLS_AES_128_GCM_SHA256, pad_byte 0, pad_left 0, pad_right 196608
+padding - cipher TLS_AES_128_GCM_SHA256, pad_byte 0, pad_left 0, pad_right 16777183
+padding - cipher TLS_AES_256_GCM_SHA384, pad_byte 0, pad_left 0, pad_right 131072
+padding - cipher TLS_AES_256_GCM_SHA384, pad_byte 0, pad_left 0, pad_right 196608
+padding - cipher TLS_AES_256_GCM_SHA384, pad_byte 0, pad_left 0, pad_right 16777167
+PROBES
+)"
+        # limit: a Finished over 16 KiB, which the script wants refused
+        # with decode_error
     "test-tls13-finished-plaintext.py"
     "test-tls13-invalid-ciphers.py"
     "test-tls13-nociphers.py"
@@ -232,54 +253,50 @@ tests=(
     "test-tls13-record-padding.py"
     "test-tls13-zero-content-type.py"
     "test-tls13-zero-length-data.py"
-    "test-tls13-empty-alert.py
-        -e 'empty alert with no padding using handshake keys'
-        -e 'empty alert with 2 bytes of padding using handshake keys'
-        -e 'empty alert with 5 bytes of padding using handshake keys'
-        -e 'empty alert with 30 bytes of padding using handshake keys'
-        -e 'empty alert with no padding using application keys'
-        -e 'empty alert with 2 bytes of padding using application keys'
-        -e 'empty alert with 5 bytes of padding using application keys'
-        -e 'empty alert with 30 bytes of padding using application keys'"
+    "test-tls13-empty-alert.py $(
+        for keys in handshake application; do
+            for pad in 'no padding' '2 bytes of padding' '5 bytes of padding' '30 bytes of padding'; do
+                echo "empty alert with $pad using $keys keys"
+            done
+        done | excluding
+    )"
         # alert: decode_error for an empty alert record, not unexpected_message
-    "test-tls13-unencrypted-alert.py
-        -e 'unencrypted Alert'"
+    "test-tls13-unencrypted-alert.py $(excluding <<< 'unencrypted Alert')"
         # alert: a plaintext alert after the server's flight is answered
-        # with unexpected_message before closing, not just closed
-    "test-tls13-multiple-ccs-messages.py
-        -e 'second CCS before client finished'
-        -e 'multiple CCS Messages in one TCP packet'
-        -e 'CH and multiple CCS Messages in one TCP packet'"
-        # More than one change_cipher_spec is dropped like the first, as
-        # RFC 9846 §5 has it ("at any time ... before the peer's Finished").
+        # with unexpected_message (native) or bad_record_mac (libssl)
+        # before closing, not just closed
+    "test-tls13-multiple-ccs-messages.py"
     "test-tls13-keyupdate.py --coalescing
-        -e 'app data split, conversation with KeyUpdate msg'"
+        $(excluding <<< 'app data split, conversation with KeyUpdate msg')"
         # --coalescing: all the requests read before a write are answered
         # by one KeyUpdate, as RFC 9846 §4.6.3 says of a peer that receives
-        # several while it is silent. The split one expects that KeyUpdate before the
-        # server has anything to write; RFC 9846 asks for it before the next
-        # application data, which is when ztls sends it.
+        # several while it is silent. The split one expects that KeyUpdate
+        # before the server has anything to write; RFC 9846 asks for it
+        # before the next application data, which is when both send it.
     "test-tls13-keyupdate-from-server.py"
     "test-tls13-pkcs-signature.py"
     "test-tls13-rsa-signatures.py"
-    "test-tls13-symetric-ciphers.py $(ccm_probes)"   # unsupported: CCM suites
+    "test-tls13-symetric-ciphers.py $(ccm_probes | excluding)"   # unsupported: CCM suites
     "test-tls13-lengths.py -p 4435 -n 100"
-    "test-tls13-ecdsa-support.py -p 4436
-        -e 'Test with ecdsa_secp384r1_sha384'
-        -e 'Test with ecdsa_secp521r1_sha512'
-        -e 'Test with ecdsa_brainpoolP256r1tls13_sha256'
-        -e 'Test with ecdsa_brainpoolP384r1tls13_sha384'
-        -e 'Test with ecdsa_brainpoolP512r1tls13_sha512'"
+    "test-tls13-ecdsa-support.py -p 4436 $(excluding <<'PROBES'
+Test with ecdsa_secp384r1_sha384
+Test with ecdsa_secp521r1_sha512
+Test with ecdsa_brainpoolP256r1tls13_sha256
+Test with ecdsa_brainpoolP384r1tls13_sha384
+Test with ecdsa_brainpoolP512r1tls13_sha512
+PROBES
+)"
         # a P-256 key signs with ecdsa_secp256r1_sha256 only; brainpool unsupported
-    "test-tls13-ecdsa-support.py -p 4438
-        -e 'Test with ecdsa_secp256r1_sha256'
-        -e 'Test with ecdsa_secp521r1_sha512'
-        -e 'Test with ecdsa_brainpoolP256r1tls13_sha256'
-        -e 'Test with ecdsa_brainpoolP384r1tls13_sha384'
-        -e 'Test with ecdsa_brainpoolP512r1tls13_sha512'"
+    "test-tls13-ecdsa-support.py -p 4438 $(excluding <<'PROBES'
+Test with ecdsa_secp256r1_sha256
+Test with ecdsa_secp521r1_sha512
+Test with ecdsa_brainpoolP256r1tls13_sha256
+Test with ecdsa_brainpoolP384r1tls13_sha384
+Test with ecdsa_brainpoolP512r1tls13_sha512
+PROBES
+)"
         # the same for a P-384 key
-    "test-tls13-eddsa.py -p 4437
-        -e 'ed448 only'"                            # unsupported: Ed448
+    "test-tls13-eddsa.py -p 4437 $(excluding <<< 'ed448 only')"  # unsupported: Ed448
     "test-tls13-certificate-request.py -p 4434 -s '$sigalgs'
         -c '$clients/client-rsa.pem' -k '$clients/client-rsa.key'"
     "test-tls13-certificate-verify.py -p 4434 -s '$sigalgs'
@@ -289,6 +306,10 @@ tests=(
     "test-tls13-eddsa-in-certificate-verify.py -p 4434 -s '$sigalgs'
         -c '$clients/client-ed25519.pem' -k '$clients/client-ed25519.key'"
 )
+for i in "${!tests[@]}"; do
+    name=${tests[$i]%%[[:space:]]*}
+    tests[$i]+=${engine_args[$name]:-}
+done
 
 out=$root/.tlsfuzzer/out
 rm -rf "$out"
@@ -320,16 +341,6 @@ run() {
 export -f run
 export TLSFUZZER root out
 export python=$root/$venv/bin/python
-
-# What the libssl engine does differently; see libssl.sh.
-if [ "$IMPL" = libssl ]; then
-    source "$clients/libssl.sh"
-    for i in "${!tests[@]}"; do
-        name=${tests[$i]%%[[:space:]]*}
-        if [ -n "${libssl_replace[$name]:-}" ]; then tests[$i]=$name; fi
-        tests[$i]+=${libssl_args[$name]:-}
-    done
-fi
 
 selected=()
 for t in "${tests[@]}"; do

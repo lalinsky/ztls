@@ -191,8 +191,8 @@ signature algorithms, or with a `select_certificate` callback.
   Go's `crypto/tls`, as client and server, for both engines.
 - [tlsfuzzer](https://github.com/tlsfuzzer/tlsfuzzer)'s TLS 1.3 scripts, as
   server, for both engines. Skipped scripts and probes are listed in
-  `tests/tlsfuzzer/run.sh`, and where the libssl engine differs, in
-  `tests/tlsfuzzer/libssl.sh`.
+  `tests/tlsfuzzer/run.sh`, and what one engine skips beyond those, in
+  `native.sh` and `libssl.sh` next to it.
 
 The native engine is also tested with:
 

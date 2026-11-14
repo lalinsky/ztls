@@ -1,35 +1,27 @@
-# Sourced by run.sh with IMPL=libssl: what tlsfuzzer probes of AWS-LC's
-# libssl that the native server does differently. In `libssl_args`, by
-# script name, are arguments added to the script's entry in `tests`, or
-# in place of the entry's own when `libssl_replace` says so. -e leaves a
-# probe out, and each one says why:
+# Sourced by run.sh with IMPL=libssl: what AWS-LC's libssl does that
+# tlsfuzzer does not expect. In `engine_args`, by script name, are
+# arguments added to the script's entry in `tests`. -e leaves a probe
+# out, and each one says why:
 #   alert    AWS-LC refuses as it should, with a different alert
 #   lenient  AWS-LC takes what the script wants refused, as RFC 8446
 #            allows
 #   strict   AWS-LC refuses what the script wants taken
 
-declare -A libssl_args libssl_replace
-
-# Prints an -e for each probe named on stdin, one per line.
-excluding() {
-    local probe
-    while IFS= read -r probe; do
-        [ -n "$probe" ] && printf " -e '%s'" "$probe"
-    done
-}
+# libssl's default takes TLS 1.2's SHA-1 schemes too.
+sigalgs+=' ecdsa_sha1 rsa_pkcs1_sha1'
 
 # alert: bad_record_mac, not unexpected_message, for a change_cipher_spec
 # after Finished or a plaintext Finished: AWS-LC expects a record under
 # the handshake keys.
-libssl_args[test-tls13-ccs.py]=$(excluding <<< 'CCS message after Finished message')
-libssl_args[test-tls13-finished-plaintext.py]=$(excluding <<< 'Unencrypted Finished message')
+engine_args[test-tls13-ccs.py]=$(excluding <<< 'CCS message after Finished message')
+engine_args[test-tls13-finished-plaintext.py]=$(excluding <<< 'Unencrypted Finished message')
 
 # alert: decode_error, not illegal_parameter, for an empty key share.
-libssl_args[test-tls13-crfg-curves.py]=$(excluding <<< 'empty x25519 key share')
+engine_args[test-tls13-crfg-curves.py]=$(excluding <<< 'empty x25519 key share')
 
 # lenient: a legacy_version below TLS 1.2 next to supported_versions with
 # TLS 1.3 is ignored (RFC 8446 §4.2.1), not refused with protocol_version.
-libssl_args[test-tls13-legacy-version.py]=$(excluding <<'PROBES'
+engine_args[test-tls13-legacy-version.py]=$(excluding <<'PROBES'
 version (0, 0)
 version (0, 1)
 version (0, 2)
@@ -44,7 +36,7 @@ PROBES
 # alert: internal_error, not illegal_parameter, for an ML-KEM share
 # whose coefficients are out of range, and decode_error for a padded one.
 # --no-fuzz leaves out the 384 like it that vary every coefficient.
-libssl_args[test-tls13-mlkem.py]=" --no-fuzz$(excluding <<'PROBES'
+engine_args[test-tls13-mlkem.py]=" --no-fuzz$(excluding <<'PROBES'
 x25519mlkem768: malformed pqc part, variable 0
 x25519mlkem768: malformed pqc part, variable 1
 x25519mlkem768: malformed pqc part, variable 2
@@ -55,7 +47,7 @@ PROBES
 
 # alert: decrypt_error, not unexpected_message, for a record of content
 # type zero.
-libssl_args[test-tls13-zero-content-type.py]=$(excluding <<'PROBES'
+engine_args[test-tls13-zero-content-type.py]=$(excluding <<'PROBES'
 zero content type after handshake
 zero content type and padding during application data
 zero content type during application data
@@ -68,17 +60,20 @@ PROBES
 # strict: tlsfuzzer sends the change_cipher_spec that follows a ClientHello
 # with the ClientHello's record version, 0x0300, which AWS-LC refuses with
 # protocol_version once it has picked TLS 1.3; RFC 8446 §5.1 says to
-# ignore it. alert: protocol_version, not unexpected_message, for two in
-# one record.
-libssl_args[test-tls13-multiple-ccs-messages.py]=$(excluding <<'PROBES'
+# ignore it. This one is refused, then, as are those with more than one.
+# alert: protocol_version, not unexpected_message, for two in one record.
+engine_args[test-tls13-multiple-ccs-messages.py]=$(excluding <<'PROBES'
 sanity with one CCS message
+second CCS before client finished
+multiple CCS Messages in one TCP packet
+CH and multiple CCS Messages in one TCP packet
 multiple CCS Messages in one TLS record
 PROBES
 )
 
 # alert: decrypt_error, not decode_error, for a Finished of the wrong
 # length: AWS-LC compares it with what it expects before its length.
-libssl_args[test-tls13-finished.py]=$(excluding <<'PROBES'
+engine_args[test-tls13-finished.py]=$(excluding <<'PROBES'
 empty - cipher TLS_AES_128_GCM_SHA256
 empty - cipher TLS_AES_256_GCM_SHA384
 padding - cipher TLS_AES_128_GCM_SHA256, pad_byte 0, pad_left 0, pad_right 1
@@ -150,12 +145,12 @@ PROBES
 
 # alert: decode_error, not illegal_parameter, for a KeyUpdate whose
 # request_update is not 0 or 1.
-libssl_args[test-tls13-keyupdate.py]=$(for type in $(seq 2 255); do echo "invalid message_type - $type, in KeyUpdate msg"; done | excluding)
+engine_args[test-tls13-keyupdate.py]=$(for type in $(seq 2 255); do echo "invalid message_type - $type, in KeyUpdate msg"; done | excluding)
 
 # alert: bad_record_mac, not record_overflow, for a ciphertext over the
 # limit with a bad tag: AWS-LC checks the tag first. decrypt_error, not
 # decode_error, for a Finished padded to the record limit.
-libssl_args[test-tls13-record-layer-limits.py]=$(
+engine_args[test-tls13-record-layer-limits.py]=$(
     for val in 1 2 4 8 16 32 64 128; do
         for pos in $(seq -1 -1 -16); do
             echo "too big ciphertext with size 2**14 + 256 andfuzzed tag with $val on pos $pos"
@@ -169,26 +164,23 @@ PROBES
 
 # alert: decrypt_error, not illegal_parameter, for a CertificateVerify
 # under a scheme the client's key or TLS 1.3 does not allow.
-libssl_args[test-tls13-certificate-verify.py]=$(excluding <<'PROBES'
+engine_args[test-tls13-certificate-verify.py]=$(excluding <<'PROBES'
 check rsa_pkcs1_sha1 signature is refused
 check rsa_pkcs1_sha256 signature is refused
 check rsa_pkcs1_sha384 signature is refused
 check rsa_pkcs1_sha512 signature is refused
 PROBES
 )
-libssl_args[test-tls13-ecdsa-in-certificate-verify.py]=$(excluding <<'PROBES'
+engine_args[test-tls13-ecdsa-in-certificate-verify.py]=$(excluding <<'PROBES'
 check ecdsa_secp384r1_sha384 signature is refused
 check ecdsa_secp521r1_sha512 signature is refused
 check ecdsa_sha1 signature is refused
 PROBES
 )
-libssl_args[test-tls13-eddsa-in-certificate-verify.py]=$(excluding <<'PROBES'
+engine_args[test-tls13-eddsa-in-certificate-verify.py]=$(excluding <<'PROBES'
 check ecdsa_secp256r1_sha256 signature is refused
 check ecdsa_secp384r1_sha384 signature is refused
 check ecdsa_secp521r1_sha512 signature is refused
 check ecdsa_sha1 signature is refused
 PROBES
 )
-
-# libssl speaks TLS 1.2 too, so every probe runs, the fallbacks included.
-libssl_replace[test-tls13-version-negotiation.py]=1
