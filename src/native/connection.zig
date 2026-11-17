@@ -1602,13 +1602,13 @@ const TestSink = struct {
         self.len += bytes.len;
     }
 
-    /// Decrypts what was sent, up to close_notify.
+    /// Decrypts what was sent, which must end in close_notify.
     fn received(self: *TestSink, secret: anytype) ![]u8 {
         return self.receivedWith(try cipher.Keys.init(.aes_128_gcm_sha256, secret));
     }
 
-    /// Decrypts what was sent with `keys`, which it takes, up to
-    /// close_notify.
+    /// Decrypts what was sent with `keys`, which it takes. What was sent
+    /// must end in close_notify.
     fn receivedWith(self: *TestSink, keys: cipher.Keys) ![]u8 {
         var input: Io.Reader = .fixed(&self.sent);
         input.end = self.len;
@@ -1617,6 +1617,7 @@ const TestSink = struct {
         var peer = Connection.init(&input, &output, .server);
         defer peer.deinit();
         peer.read.keys = keys;
+        peer.strict_close_notify = true;
         var rbuf: [64]u8 = undefined;
         var r = peer.reader(&rbuf);
         return r.interface.allocRemaining(testing.allocator, .unlimited);
