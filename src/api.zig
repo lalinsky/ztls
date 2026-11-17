@@ -64,8 +64,11 @@ pub const input_buffer_len: usize = header_len + max_plaintext_len + 256;
 /// TLS 1.3, the KeyUpdate that may have to go out ahead of it. A TLS 1.3
 /// record adds its content type and a 16-byte tag; the KeyUpdate is a
 /// record of its own around a 5-byte message. TLS 1.2 adds less: an 8-byte
-/// explicit nonce and the tag.
+/// explicit nonce and the tag. On top of that, the native in-place writer
+/// keeps room to move what it holds past a record it seals ahead of it,
+/// even when the transport fails: that record's content type and tag, a
+/// KeyUpdate, and the next record's header.
 pub const output_buffer_len: usize = @max(
     (header_len + max_plaintext_len + 1 + 16) + (header_len + 5 + 1 + 16),
     header_len + max_plaintext_len + 8 + 16,
-);
+) + (1 + 16) + (header_len + 5 + 1 + 16) + header_len;
