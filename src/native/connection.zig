@@ -25,10 +25,13 @@ pub const output_buffer_len = api.output_buffer_len;
 // The public sizes, worked out from the record layer's own.
 comptime {
     assert(input_buffer_len == cipher.max_record_len);
-    assert(output_buffer_len == @max(
+    assert(output_buffer_len == rebase_shift + @max(
         cipher.Keys.sealedLenTls13(cipher.max_plaintext_len) + key_update_record_len,
         cipher.max_sealed_record_len,
     ));
+    // A TLS 1.2 record moves the kept bytes less: its tag, then the next
+    // record's header and explicit nonce.
+    assert(cipher.max_seal_overhead + cipher.header_len <= rebase_shift);
 }
 
 const key_update_msg_len = 4 + 1;
@@ -40,6 +43,13 @@ const key_update_record_len = cipher.Keys.sealedLenTls13(key_update_msg_len);
 /// aside by `rebaseInPlace`. A TLS 1.2 record writes only its 16-byte tag
 /// past `head` (the explicit nonce goes before the window), well within.
 const seal_spill = cipher.seal_overhead + key_update_record_len;
+/// How far the bytes `rebaseInPlace` keeps move up when it seals the
+/// window's head ahead of them: past that record's content type and tag,
+/// a KeyUpdate moved in ahead of it, and the next record's header. The
+/// in-place window leaves this much free at its end, so that the kept
+/// bytes fit past the sealed record even when the flush that should make
+/// room fails.
+const rebase_shift = cipher.seal_overhead + key_update_record_len + cipher.header_len;
 /// Records carrying no application data (empty ones, post-handshake
 /// messages) a peer may send in a row before it is cut off.
 const max_idle_records = 32;
@@ -810,21 +820,58 @@ pub const Connection = struct {
         return err;
     }
 
-    /// Where the next in-place record's plaintext goes: inside `output`'s
-    /// unused capacity, after the header (and TLS 1.2 AES-GCM's explicit
-    /// nonce), with room left for the trailer and, in TLS 1.3, for a
-    /// KeyUpdate ahead of it. Empty when `output` needs flushing.
-    fn payloadWindow(c: *Connection) []u8 {
-        @setRuntimeSafety(true);
-        const keys = &c.write.keys.?;
-        const unused = c.output.unusedCapacitySlice();
-        const offset = keys.payloadOffset();
-        const reserved = offset + switch (keys.version) {
+    /// What sealing a window writes past its end: the trailer and, in TLS
+    /// 1.3, a KeyUpdate moved in ahead of it.
+    fn sealReserve(keys: *const cipher.Keys) usize {
+        return switch (keys.version) {
             .tls13 => seal_spill,
             .tls12 => keys.trailerLen(),
         };
-        if (unused.len <= reserved) return unused[0..0];
-        return unused[offset..][0..@min(cipher.max_plaintext_len, unused.len - reserved)];
+    }
+
+    /// How long the window is when `output` has `unused` bytes free: after
+    /// the header (and TLS 1.2 AES-GCM's explicit nonce), with room left
+    /// past it for sealing and for `rebase_shift`.
+    fn windowLen(c: *const Connection, unused: usize) usize {
+        const keys = &c.write.keys.?;
+        const reserved = keys.payloadOffset() + sealReserve(keys) + rebase_shift;
+        if (unused <= reserved) return 0;
+        return @min(cipher.max_plaintext_len, unused - reserved);
+    }
+
+    /// Where the next in-place record's plaintext goes: inside `output`'s
+    /// unused capacity, `windowLen` long. Empty when `output` needs
+    /// flushing.
+    fn payloadWindow(c: *Connection) []u8 {
+        @setRuntimeSafety(true);
+        const unused = c.output.unusedCapacitySlice();
+        const len = c.windowLen(unused.len);
+        if (len == 0) return unused[0..0];
+        return unused[c.write.keys.?.payloadOffset()..][0..len];
+    }
+
+    /// `payloadWindow()`, or longer when it must hold `held` bytes the
+    /// in-place writer kept through a failed flush. Those may reach into
+    /// the window's `rebase_shift`, but never into the room sealing needs.
+    fn anchoredWindow(c: *Connection, held: usize) []u8 {
+        @setRuntimeSafety(true);
+        const window = c.payloadWindow();
+        if (window.len >= held) return window;
+        const keys = &c.write.keys.?;
+        const unused = c.output.unusedCapacitySlice();
+        assert(keys.payloadOffset() + held + sealReserve(keys) <= unused.len);
+        return unused[keys.payloadOffset()..][0..held];
+    }
+
+    /// Whether sealing the window's first `head` bytes leaves the next
+    /// window `need` bytes long without a flush, even with a KeyUpdate
+    /// going out ahead of them.
+    fn roomAfterSeal(c: *const Connection, head: usize, need: usize) bool {
+        const keys = &c.write.keys.?;
+        const update: usize = if (keys.version == .tls13) key_update_record_len else 0;
+        const sealed = keys.sealedLen(head) + update;
+        const unused = c.output.unusedCapacityLen();
+        return unused >= sealed and c.windowLen(unused - sealed) >= need;
     }
 
     /// Seals the first `len` bytes of `payloadWindow()` where they are, as
@@ -916,9 +963,9 @@ pub const Connection = struct {
         /// Why the last write failed: a `Failure` of the connection, the
         /// read side's included since its alert goes out this way, or
         /// `WriteFailed` when the transport writer failed and its own
-        /// error says how. That one does not end the connection: what was
-        /// sealed stays in the transport's buffer for the next flush, and
-        /// what the in-place writer held unsealed is dropped.
+        /// error says how. That one does not end the connection and loses
+        /// nothing: what was sealed stays in the transport's buffer for
+        /// the next flush, and what was not stays in this writer.
         err: ?WriteError = null,
 
         fn init(c: *Connection, buffer: []u8) Writer {
@@ -952,14 +999,30 @@ pub const Connection = struct {
 
         fn fail(self: *Writer, err: WriteError) Io.Writer.Error {
             self.err = err;
-            if (self.interface.vtable.drain == drainInPlace) {
-                // A transport write may have moved what is left in
-                // `output`, and the window with it; what was in the window
-                // and not yet sealed is dropped.
-                self.interface.buffer = self.conn.payloadWindow();
-                self.interface.end = 0;
-            }
+            if (self.interface.vtable.drain == drainInPlace) switch (err) {
+                // The transport's failure: what the window holds stays.
+                // (`Canceled` comes only from the libssl engine; here a
+                // cancellation is the transport writer's `WriteFailed`.)
+                error.WriteFailed, error.Canceled => self.reanchor(),
+                // The direction is over; nothing it holds goes out.
+                else => {
+                    self.interface.buffer = self.conn.payloadWindow();
+                    self.interface.end = 0;
+                },
+            };
             return error.WriteFailed;
+        }
+
+        /// Moves what the in-place window holds to where the window is
+        /// now. A transport write, even one that fails, may have moved
+        /// what is left in `output` down, and the window with it; the
+        /// transport leaves `output`'s unused capacity alone, so what the
+        /// window held is still where it was.
+        fn reanchor(self: *Writer) void {
+            const w = &self.interface;
+            const fresh = self.conn.anchoredWindow(w.end);
+            @memmove(fresh[0..w.end], w.buffer[0..w.end]);
+            w.buffer = fresh;
         }
 
         /// A window for a whole record, flushing `output` when it has no
@@ -1016,7 +1079,8 @@ pub const Connection = struct {
         /// The default rebase would drain with the preserved bytes hidden,
         /// which seals the record ahead of them over their start. This
         /// saves them, seals, and moves them to the front of the next
-        /// window.
+        /// window. A transport failure loses none of them: the error is
+        /// returned with them still buffered.
         fn rebaseInPlace(w: *Io.Writer, preserve: usize, minimum_len: usize) Io.Writer.Error!void {
             @setRuntimeSafety(true);
             const self: *Writer = @fieldParentPtr("interface", w);
@@ -1024,27 +1088,36 @@ pub const Connection = struct {
             while (w.buffer.len - w.end < minimum_len) {
                 const keep = @min(preserve, w.end);
                 const head = w.end - keep;
-                if (head == 0) {
-                    // Nothing to seal: the window is short because `output`
-                    // holds earlier records. Send those and move what is
-                    // buffered to the front of the full window that frees.
-                    const tail = w.buffer[0..w.end];
+                if (head == 0 or (c.output.end > 0 and !c.roomAfterSeal(head, keep + minimum_len))) {
+                    // Send the records `output` holds ahead of the window
+                    // first. Nothing is sealed yet, so the window only
+                    // moves down, after a failed flush too, and keeps what
+                    // it holds.
+                    if (c.output.end == 0) return self.fail(error.TlsInternalError);
                     c.flushWrite() catch |err| return self.fail(err);
-                    const fresh = c.payloadWindow();
-                    if (fresh.len - w.end < minimum_len) return self.fail(error.TlsInternalError);
-                    @memmove(fresh[0..tail.len], tail);
-                    w.buffer = fresh;
+                    self.reanchor();
                     continue;
                 }
+                // `output` is empty, or has room for the next window as it
+                // is. Either way, if the flush below fails, the kept bytes
+                // still fit past the sealed record, in the window's
+                // `rebase_shift`.
                 const tail = w.buffer[head..w.end];
                 var spill: [seal_spill]u8 = undefined;
                 const saved = @min(keep, spill.len);
                 @memcpy(spill[0..saved], tail[0..saved]);
-                try self.seal(head);
-                if (w.buffer.len < keep) return self.fail(error.TlsInternalError);
-                @memmove(w.buffer[saved..keep], tail[saved..]);
-                @memcpy(w.buffer[0..saved], spill[0..saved]);
+                c.sealWindow(head) catch |err| return self.fail(err);
+                // `flushOutput`, not `flushWrite`: `sealWindow` has just
+                // checked the write side, and a read-side failure found now
+                // would put its alert on top of the kept bytes. The next
+                // call reports it.
+                const flushed = if (c.windowLen(c.output.unusedCapacityLen()) < keep + minimum_len) c.flushOutput() else {};
+                const fresh = c.anchoredWindow(keep);
+                @memmove(fresh[saved..keep], tail[saved..]);
+                @memcpy(fresh[0..saved], spill[0..saved]);
+                w.buffer = fresh;
                 w.end = keep;
+                flushed catch |err| return self.fail(err);
             }
         }
 
@@ -1109,9 +1182,10 @@ pub const Connection = struct {
     /// While it is in use nothing else may write to `output`: close it
     /// with `Writer.close`, not `Connection.close`.
     /// The transport writer must leave `output`'s unused capacity alone
-    /// while draining (std's and zio's socket writers do). Its buffer moves
-    /// with each record and must not be replaced. One per connection, for
-    /// the writing task.
+    /// while draining, also when the drain fails (std's and zio's socket
+    /// writers do): what this writer holds through a failed flush stays
+    /// there. Its buffer moves with each record and must not be replaced.
+    /// One per connection, for the writing task.
     pub fn writerInPlace(c: *Connection) Writer {
         assert(c.write.keys != null);
         return Writer.initInPlace(c);
@@ -1494,6 +1568,8 @@ test "a header that rules a record out is refused without its body" {
 /// buffered before each failure.
 const TestSink = struct {
     failing: bool = true,
+    /// How much a failing drain sends before it fails.
+    take: usize = 7,
     sent: [4 * output_buffer_len]u8 = undefined,
     len: usize = 0,
     writer: Io.Writer,
@@ -1505,7 +1581,7 @@ const TestSink = struct {
     fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
         const self: *TestSink = @fieldParentPtr("writer", w);
         if (self.failing) {
-            const some = @min(w.end, 7);
+            const some = @min(w.end, self.take);
             self.put(w.buffered()[0..some]);
             _ = w.consume(some);
             return error.WriteFailed;
@@ -1526,15 +1602,22 @@ const TestSink = struct {
         self.len += bytes.len;
     }
 
-    /// Decrypts what was sent, up to close_notify.
+    /// Decrypts what was sent, which must end in close_notify.
     fn received(self: *TestSink, secret: anytype) ![]u8 {
+        return self.receivedWith(try cipher.Keys.init(.aes_128_gcm_sha256, secret));
+    }
+
+    /// Decrypts what was sent with `keys`, which it takes. What was sent
+    /// must end in close_notify.
+    fn receivedWith(self: *TestSink, keys: cipher.Keys) ![]u8 {
         var input: Io.Reader = .fixed(&self.sent);
         input.end = self.len;
         var output_buffer: [output_buffer_len]u8 = undefined;
         var output: Io.Writer = .fixed(&output_buffer);
         var peer = Connection.init(&input, &output, .server);
         defer peer.deinit();
-        peer.read.keys = try cipher.Keys.init(.aes_128_gcm_sha256, secret);
+        peer.read.keys = keys;
+        peer.strict_close_notify = true;
         var rbuf: [64]u8 = undefined;
         var r = peer.reader(&rbuf);
         return r.interface.allocRemaining(testing.allocator, .unlimited);
@@ -1643,6 +1726,117 @@ test "an in-place write that fills a record counts it as written when the flush 
     const got = try sink.received(secret);
     defer testing.allocator.free(got);
     try testing.expectEqualSlices(u8, &data, got);
+}
+
+test "an in-place rebase keeps what it holds through a failed flush, for close to send" {
+    const Case = enum {
+        /// The window's head is sealed, and the flush that should make
+        /// room after it fails.
+        seal_then_flush,
+        /// All of the window is kept, so the record ahead of it must go
+        /// first, and that flush fails.
+        flush_ahead_all_kept,
+        /// Part of the window is kept, but sealing the rest leaves no
+        /// room, so the record ahead must go first.
+        flush_ahead_no_room,
+    };
+    const Protection = enum {
+        tls13,
+        /// A KeyUpdate goes out ahead of the sealed head, which moves the
+        /// kept bytes furthest.
+        tls13_key_update,
+        tls13_chacha,
+        tls12_gcm,
+        tls12_chacha,
+
+        /// The same keys each time, a context of their own each.
+        fn keys(p: @This()) !cipher.Keys {
+            const key: [32]u8 = @splat(0x3c);
+            const iv: [12]u8 = @splat(0x5a);
+            const ks = key_schedule.KeySchedule.init(.sha256);
+            const secret = ks.trafficSecret(.client_application, "rebase");
+            return switch (p) {
+                .tls13, .tls13_key_update => cipher.Keys.init(.aes_128_gcm_sha256, secret),
+                .tls13_chacha => cipher.Keys.init(.chacha20_poly1305_sha256, secret),
+                .tls12_gcm => cipher.Keys.initTls12(.aes_128_gcm, key[0..16], iv[0..cipher.tls12FixedIvLen(.aes_128_gcm)]),
+                .tls12_chacha => cipher.Keys.initTls12(.chacha20_poly1305, &key, iv[0..cipher.tls12FixedIvLen(.chacha20_poly1305)]),
+            };
+        }
+    };
+    // What the application does once the transport works again.
+    const Recovery = enum {
+        /// Asks for room again, writes a little more, then closes.
+        write_then_close,
+        /// Closes at once, as a `defer` after a canceled write does.
+        close,
+        /// Fails once more first, closing, then closes.
+        fail_again_then_close,
+    };
+    var data: [2 * cipher.max_plaintext_len]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 251);
+
+    for (std.enums.values(Case)) |case| for (std.enums.values(Protection)) |protection| {
+        // The record ahead is set up the same way in any protection.
+        if (case != .seal_then_flush and protection != .tls13) continue;
+        for (std.enums.values(Recovery)) |recovery| for ([_]usize{ 0, 7 }) |take| {
+            var input_buffer: [input_buffer_len]u8 = undefined;
+            var input: Io.Reader = .fixed(&input_buffer);
+            input.end = 0;
+            var output_buffer: [output_buffer_len]u8 = undefined;
+            var sink: TestSink = .init(&output_buffer);
+            sink.failing = false;
+            sink.take = take;
+            var conn = Connection.init(&input, &sink.writer, .client);
+            defer conn.deinit();
+            conn.write.keys = try protection.keys();
+
+            // What goes out before the in-place writer starts, if anything.
+            var sent: usize = 0;
+            if (case != .seal_then_flush) {
+                try conn.writeRecord(.application_data, data[0..1000]);
+                sent = 1000;
+            }
+            var w = conn.writerInPlace();
+            const window_len = w.interface.buffer.len;
+            // How much goes into the window, how much of it is kept, and
+            // how much more room is asked for. A full window leaves the
+            // least slack.
+            const fill: usize, const keep: usize, const minimum: usize = switch (case) {
+                .seal_then_flush => .{ window_len, 100, 200 },
+                .flush_ahead_all_kept => .{ 50, 50, window_len - 50 + 1 },
+                .flush_ahead_no_room => .{ window_len - 300, 100, 1000 },
+            };
+            try w.interface.writeAll(data[sent..][0..fill]);
+            if (protection == .tls13_key_update) conn.shared.key_update_requested.store(true, .monotonic);
+
+            sink.failing = true;
+            try testing.expectError(error.WriteFailed, w.interface.writableSliceGreedyPreserve(keep, minimum));
+            try testing.expectEqual(error.WriteFailed, w.err.?);
+            const kept = if (case == .seal_then_flush) keep else fill;
+            try testing.expectEqualSlices(u8, data[sent + fill - kept ..][0..kept], w.interface.buffered());
+
+            var more: usize = 0;
+            switch (recovery) {
+                .write_then_close => {
+                    sink.failing = false;
+                    const slice = try w.interface.writableSliceGreedyPreserve(keep, 10);
+                    @memcpy(slice[0..10], data[sent + fill ..][0..10]);
+                    w.interface.advance(10);
+                    more = 10;
+                },
+                .close => sink.failing = false,
+                .fail_again_then_close => {
+                    try testing.expectError(error.WriteFailed, w.close());
+                    sink.failing = false;
+                },
+            }
+            try w.close();
+
+            const got = try sink.receivedWith(try protection.keys());
+            defer testing.allocator.free(got);
+            try testing.expectEqualSlices(u8, data[0 .. sent + fill + more], got);
+        };
+    };
 }
 
 test "post-handshake messages split across records and sharing them" {

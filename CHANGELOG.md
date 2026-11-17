@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- `output_buffer_len` is 49 bytes larger, 16,482 bytes, for both engines. A transport writer buffer smaller than that is refused when the connection is created, as before.
+- Fixed the in-place writer losing buffered data when a flush failed during a rebase (`writableSliceGreedyPreserve` and similar). The data stays buffered, so a write that was cancelled can still be followed by `close`, which sends it with close_notify.
+
 ## [0.2.1] - 2026-11-14
 
 - A certificate without DNS subject alternative names is now matched against the host by its subject common name, as OpenSSL and libpq do. Self-signed certificates made with only a common name, such as those in PostgreSQL's documentation, are accepted. A certificate that has DNS names is still matched against those only.

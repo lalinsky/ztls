@@ -596,7 +596,8 @@ pub const Connection = struct {
     /// transport, and then nothing was done.
     fn writeOp(conn: *Connection, op: Op, bytes: []const u8) WriteError!void {
         if (bytes.len > max_plaintext_len) @panic("ztls: more than a record's worth given to one write");
-        // The sealed record, and a KeyUpdate reply that may go ahead of it.
+        // The sealed record, and a KeyUpdate reply that may go ahead of it:
+        // `output_buffer_len` holds both, with room to spare.
         const room = bytes.len + (output_buffer_len - max_plaintext_len);
         while (true) {
             try conn.lock();
