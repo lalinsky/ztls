@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .upstream = .{
-            .url = "https://github.com/aws/aws-lc/archive/refs/tags/v1.73.0.tar.gz",
-            .hash = "N-V-__8AAPn2-hESh6mmxkzlCabk3bJSM8oCoDJeAnlx99_D",
+            .url = "https://github.com/aws/aws-lc/archive/refs/tags/v5.15.0.tar.gz",
+            .hash = "N-V-__8AAE0N8hJ-yPwU2dYxwjVeQQ_kykYVjkm_BxpoLzF2",
         },
         .nasm = .{
             .url = "https://github.com/allyourcodebase/nasm/archive/f11aa6ed5a7eb339259b3439b3e47d58dba998cc.tar.gz",

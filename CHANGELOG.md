@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 - `output_buffer_len` is 49 bytes larger, 16,482 bytes, for both engines. A transport writer buffer smaller than that is refused when the connection is created, as before.
 - Fixed the in-place writer losing buffered data when a flush failed during a rebase (`writableSliceGreedyPreserve` and similar). The data stays buffered, so a write that was cancelled can still be followed by `close`, which sends it with close_notify.
+- Upgraded AWS-LC from 1.73.0 to 5.15.0, the current mainline release. AWS-LC 5.x is the continuation of the 1.x line under its new versioning scheme. It brings fixes to X.509 name constraints and libssl, and assembly for ML-DSA.
 
 ## [0.2.1] - 2026-11-14
 
