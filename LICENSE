@@ -20,3 +20,15 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+Third-party code
+
+ztls compiles AWS-LC into every program that uses it. AWS-LC is not covered by
+the license above; its code is under the Apache-2.0, ISC and MIT licenses. When
+you distribute a program built with ztls, also include AWS-LC's LICENSE and the
+text of its NOTICE file:
+
+https://github.com/aws/aws-lc/blob/v5.15.0/LICENSE
+https://github.com/aws/aws-lc/blob/v5.15.0/NOTICE
