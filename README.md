@@ -248,8 +248,8 @@ When you distribute a program built with ztls, include ztls's
 [LICENSE](https://github.com/aws/aws-lc/blob/v5.15.0/LICENSE) and the
 text of its [NOTICE](https://github.com/aws/aws-lc/blob/v5.15.0/NOTICE),
 for example in a third-party licenses file or an about screen. That is
-all, unless you change AWS-LC's code. You don't have to publish your own
-source.
+all, unless you change AWS-LC's code. Neither ztls nor AWS-LC requires
+you to publish your own source.
 
 You can use ztls in proprietary programs and in open-source ones under
 most licenses, including GPLv3. The exception is GPLv2-only, because
