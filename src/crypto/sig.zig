@@ -1,11 +1,12 @@
 //! Private and public keys for CertificateVerify and the TLS 1.2
 //! ServerKeyExchange: ECDSA, RSA-PSS, RSA PKCS#1 v1.5 and Ed25519 through
-//! AWS-LC's EVP interface, with each signature algorithm tied to the kind
-//! of key it is defined for.
+//! the library's EVP interface, with each signature algorithm tied to the
+//! kind of key it is defined for.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
+const openssl = @import("build_options").openssl;
 const err = @import("err.zig");
 const pem = @import("pem.zig");
 
@@ -130,6 +131,12 @@ pub const PrivateKey = struct {
     }
 
     pub fn parseDer(format: Format, der: []const u8) ParseError!PrivateKey {
+        const pkey = if (openssl) try parseDerOpenssl(format, der) else try parseDerAwsLc(format, der);
+        errdefer c.EVP_PKEY_free(pkey);
+        return .{ .pkey = pkey, .key_type = try keyTypeOf(pkey) };
+    }
+
+    fn parseDerAwsLc(format: Format, der: []const u8) ParseError!*c.EVP_PKEY {
         var cbs: c.CBS = undefined;
         c.CBS_init(&cbs, der.ptr, der.len);
         const pkey: *c.EVP_PKEY = switch (format) {
@@ -161,9 +168,32 @@ pub const PrivateKey = struct {
                 break :blk pkey;
             },
         };
-        errdefer c.EVP_PKEY_free(pkey);
-        if (c.CBS_len(&cbs) != 0) return error.InvalidKey;
-        return .{ .pkey = pkey, .key_type = try keyTypeOf(pkey) };
+        if (c.CBS_len(&cbs) != 0) {
+            c.EVP_PKEY_free(pkey);
+            return error.InvalidKey;
+        }
+        return pkey;
+    }
+
+    /// OpenSSL's decoders take what follows the key too; that is checked
+    /// here, as AWS-LC's parsers check it.
+    fn parseDerOpenssl(format: Format, der: []const u8) ParseError!*c.EVP_PKEY {
+        var p: [*c]const u8 = der.ptr;
+        const len: c_long = std.math.cast(c_long, der.len) orelse return error.InvalidKey;
+        const pkey: *c.EVP_PKEY = switch (format) {
+            .pkcs8 => blk: {
+                const info = c.d2i_PKCS8_PRIV_KEY_INFO(null, &p, len) orelse return invalid();
+                defer c.PKCS8_PRIV_KEY_INFO_free(info);
+                break :blk c.EVP_PKCS82PKEY(info) orelse return invalid();
+            },
+            .sec1 => c.d2i_PrivateKey(c.EVP_PKEY_EC, null, &p, len) orelse return invalid(),
+            .pkcs1 => c.d2i_PrivateKey(c.EVP_PKEY_RSA, null, &p, len) orelse return invalid(),
+        };
+        if (p != der.ptr + der.len) {
+            c.EVP_PKEY_free(pkey);
+            return error.InvalidKey;
+        }
+        return pkey;
     }
 
     fn invalid() ParseError {
@@ -186,14 +216,13 @@ pub const PrivateKey = struct {
     /// `AlgorithmMismatch` unless `algorithm.suits(self.key_type)`.
     pub fn sign(self: *const PrivateKey, algorithm: Algorithm, message: []const u8, out: []u8) error{ AlgorithmMismatch, CryptoFailed }![]u8 {
         if (!algorithm.suits(self.key_type)) return error.AlgorithmMismatch;
-        var md_ctx: c.EVP_MD_CTX = undefined;
-        c.EVP_MD_CTX_init(&md_ctx);
-        defer _ = c.EVP_MD_CTX_cleanup(&md_ctx);
+        var md_ctx: MdCtx = try .init();
+        defer md_ctx.deinit();
         var pctx: ?*c.EVP_PKEY_CTX = null;
-        if (c.EVP_DigestSignInit(&md_ctx, &pctx, algorithm.md(), null, self.pkey) != 1) return err.fail();
+        if (c.EVP_DigestSignInit(md_ctx.ptr(), &pctx, algorithm.md(), null, self.pkey) != 1) return err.fail();
         try setPss(pctx, algorithm);
         var sig_len: usize = out.len;
-        if (c.EVP_DigestSign(&md_ctx, out.ptr, &sig_len, message.ptr, message.len) != 1) return err.fail();
+        if (c.EVP_DigestSign(md_ctx.ptr(), out.ptr, &sig_len, message.ptr, message.len) != 1) return err.fail();
         return out[0..sig_len];
     }
 };
@@ -216,16 +245,49 @@ pub const PublicKey = struct {
     /// Fails with `AlgorithmMismatch` unless `algorithm.suits(self.key_type)`.
     pub fn verify(self: *const PublicKey, algorithm: Algorithm, message: []const u8, signature: []const u8) error{ SignatureInvalid, AlgorithmMismatch, CryptoFailed }!void {
         if (!algorithm.suits(self.key_type)) return error.AlgorithmMismatch;
-        var md_ctx: c.EVP_MD_CTX = undefined;
-        c.EVP_MD_CTX_init(&md_ctx);
-        defer _ = c.EVP_MD_CTX_cleanup(&md_ctx);
+        var md_ctx: MdCtx = try .init();
+        defer md_ctx.deinit();
         var pctx: ?*c.EVP_PKEY_CTX = null;
-        if (c.EVP_DigestVerifyInit(&md_ctx, &pctx, algorithm.md(), null, self.pkey) != 1) return err.fail();
+        if (c.EVP_DigestVerifyInit(md_ctx.ptr(), &pctx, algorithm.md(), null, self.pkey) != 1) return err.fail();
         try setPss(pctx, algorithm);
-        if (c.EVP_DigestVerify(&md_ctx, signature.ptr, signature.len, message.ptr, message.len) != 1) {
+        if (c.EVP_DigestVerify(md_ctx.ptr(), signature.ptr, signature.len, message.ptr, message.len) != 1) {
             _ = err.take();
             return error.SignatureInvalid;
         }
+    }
+};
+
+/// An EVP_MD_CTX: on the stack in AWS-LC, allocated in OpenSSL, where the
+/// struct is opaque.
+const MdCtx = if (openssl) struct {
+    ctx: *c.EVP_MD_CTX,
+
+    fn init() err.Error!@This() {
+        return .{ .ctx = c.EVP_MD_CTX_new() orelse return err.fail() };
+    }
+
+    fn ptr(self: *@This()) *c.EVP_MD_CTX {
+        return self.ctx;
+    }
+
+    fn deinit(self: *@This()) void {
+        c.EVP_MD_CTX_free(self.ctx);
+    }
+} else struct {
+    ctx: c.EVP_MD_CTX,
+
+    fn init() err.Error!@This() {
+        var self: @This() = undefined;
+        c.EVP_MD_CTX_init(&self.ctx);
+        return self;
+    }
+
+    fn ptr(self: *@This()) *c.EVP_MD_CTX {
+        return &self.ctx;
+    }
+
+    fn deinit(self: *@This()) void {
+        _ = c.EVP_MD_CTX_cleanup(&self.ctx);
     }
 };
 
@@ -256,7 +318,8 @@ fn publicOf(key: *const PrivateKey) !PublicKey {
     var der: [*c]u8 = null;
     const len = c.i2d_PUBKEY(key.pkey, &der);
     if (len <= 0) return error.CryptoFailed;
-    defer c.OPENSSL_free(der);
+    // OpenSSL's OPENSSL_free is a macro that names the caller's file.
+    defer if (openssl) c.CRYPTO_free(der, "", 0) else c.OPENSSL_free(der);
     var p: [*c]const u8 = der;
     const pkey = c.d2i_PUBKEY(null, &p, len) orelse return error.CryptoFailed;
     return PublicKey.fromPkey(pkey);

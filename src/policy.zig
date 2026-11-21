@@ -146,6 +146,13 @@ pub fn checkServer(opt: config.Server) error{TlsInternalError}!void {
         if (groupKnown(group)) break;
     } else return error.TlsInternalError;
     try checkVersions(opt.min_version, opt.max_version);
+    // A server speaks TLS 1.2 and newer only, in every implementation;
+    // older versions are a client's fallback.
+    for ([_]?proto.Version{ opt.min_version, opt.max_version }) |bound| {
+        if (bound) |v| {
+            if (@intFromEnum(v) < @intFromEnum(proto.Version.tls_1_2)) return error.TlsInternalError;
+        }
+    }
     if (!schemesSupported(opt.verify_schemes) or !schemesSupported(opt.signing_schemes)) return error.TlsInternalError;
 }
 

@@ -27,7 +27,8 @@ pub const Signer = struct {
     /// their algorithm, and a server presenting one does no RSA key
     /// exchange, which decrypts with the key: under `-Dimpl=libssl` such a
     /// pair is passed over before TLS 1.2, and RSA key exchange is not
-    /// offered with it.
+    /// offered with it. `-Dimpl=openssl` has no signers: a pair with one
+    /// fails the handshake with internal_error before anything is sent.
     sign: *const fn (context: ?*anyopaque, key: *const PrivateKey, algorithm: crypto.sig.Algorithm, message: []const u8, out: []u8) anyerror![]u8,
 };
 
@@ -252,10 +253,10 @@ pub const default_signature_schemes = [_]proto.SignatureScheme{
 pub const known_signature_schemes = default_signature_schemes ++ [_]proto.SignatureScheme{ .ecdsa_sha1, .rsa_pkcs1_sha1 };
 
 pub const Client = struct {
-    /// What the connection waits with: under `-Dimpl=libssl`, the reading
-    /// and the writing task take turns at libssl's state under a lock that
-    /// parks the waiting task rather than its thread. The native engine
-    /// does not use it.
+    /// What the connection waits with: under `-Dimpl=libssl` and
+    /// `-Dimpl=openssl`, the reading and the writing task take turns at
+    /// libssl's state under a lock that parks the waiting task rather than
+    /// its thread. The native engine does not use it.
     io: std.Io,
     /// For the handshake's working memory, such as the peer's messages
     /// while they are reassembled. Nothing is kept after the handshake unless
@@ -274,10 +275,11 @@ pub const Client = struct {
     insecure_skip_verify: bool = false,
     /// A certificate to present if the server asks for one.
     auth: ?*const CertKeyPair = null,
-    /// The lowest and highest versions offered. Null is the
-    /// implementation's own bound: the native one speaks TLS 1.2 and 1.3,
-    /// and refuses a range without either; under `-Dimpl=libssl`, AWS-LC
-    /// speaks TLS 1.0 to 1.3.
+    /// The lowest and highest versions offered. Null is TLS 1.2 and TLS
+    /// 1.3 respectively. The native implementation speaks only those two,
+    /// and refuses a range without either; under `-Dimpl=libssl` and
+    /// `-Dimpl=openssl`, a `min_version` of TLS 1.0 or 1.1 offers those
+    /// too, as a fallback for servers that have nothing newer.
     min_version: ?proto.Version = null,
     max_version: ?proto.Version = null,
     /// Offered in this order. A version is offered only when it is in
@@ -289,7 +291,7 @@ pub const Client = struct {
     /// for a list equal to it; it refuses a suite it does not implement.
     /// Under `-Dimpl=libssl` it is AWS-LC's, which includes CBC and RSA
     /// key exchange suites for older servers, and a list may name any
-    /// suite AWS-LC knows.
+    /// suite AWS-LC knows; likewise OpenSSL's under `-Dimpl=openssl`.
     cipher_suites: ?[]const proto.CipherSuite = null,
     /// In preference order, with at least one group ztls knows. Groups
     /// the implementation has no key exchange for are not offered: the
@@ -303,7 +305,9 @@ pub const Client = struct {
     /// Not used under `-Dimpl=libssl`, where AWS-LC picks the shares: one
     /// for the first of `named_groups`, and one for the first group after
     /// it of the other kind, post-quantum or classical. With the default
-    /// `named_groups`, those are the default key shares. The rules above
+    /// `named_groups`, those are the default key shares. Under
+    /// `-Dimpl=openssl` they are used from OpenSSL 3.5; before, OpenSSL
+    /// sends one share, for the first of `named_groups`. The rules above
     /// are checked all the same.
     key_shares: []const proto.NamedGroup = &default_key_shares,
     /// Sent as signature_algorithms, and the only schemes the server may
@@ -314,16 +318,15 @@ pub const Client = struct {
     /// leaving out rsa_pkcs1_* may make it pick another certificate or
     /// fail. Not empty, and each one of `known_signature_schemes`.
     ///
-    /// Null is the implementation's default: `default_signature_schemes`
-    /// for the native one, and under `-Dimpl=libssl`
-    /// `known_signature_schemes`, which adds TLS 1.2's SHA-1 ones.
+    /// Null is `default_signature_schemes`, without TLS 1.2's SHA-1 ones,
+    /// which a server that takes nothing else needs listed.
     verify_schemes: ?[]const proto.SignatureScheme = null,
     /// What a client certificate's key signs with, in preference order:
     /// the first the server accepts that suits the key. Each must be one
     /// of `known_signature_schemes`. Empty never presents `auth`. Before
     /// TLS 1.2, which has no schemes, any RSA or ECDSA key signs.
     ///
-    /// Null is the implementation's default, as for `verify_schemes`.
+    /// Null is `default_signature_schemes`, as for `verify_schemes`.
     signing_schemes: ?[]const proto.SignatureScheme = null,
     /// Offered through ALPN, in preference order. Empty sends no ALPN.
     alpn_protocols: []const []const u8 = &.{},
@@ -338,7 +341,8 @@ pub const Client = struct {
     /// this if it is less.
     ///
     /// Under `-Dimpl=libssl` every handshake message is held to this, but
-    /// to no less than 16 KiB.
+    /// to no less than 16 KiB. Under `-Dimpl=openssl` it holds the
+    /// Certificate message, to no less than 16 KiB.
     max_handshake_message_len: usize = 64 * 1024,
     /// Keep a copy of the server's certificate chain in
     /// `Connection.peer_certificates`, allocated through `gpa`.
@@ -346,10 +350,10 @@ pub const Client = struct {
 };
 
 pub const Server = struct {
-    /// What the connection waits with: under `-Dimpl=libssl`, the reading
-    /// and the writing task take turns at libssl's state under a lock that
-    /// parks the waiting task rather than its thread. The native engine
-    /// does not use it.
+    /// What the connection waits with: under `-Dimpl=libssl` and
+    /// `-Dimpl=openssl`, the reading and the writing task take turns at
+    /// libssl's state under a lock that parks the waiting task rather than
+    /// its thread. The native engine does not use it.
     io: std.Io,
     /// For the handshake's working memory, such as the peer's messages
     /// while they are reassembled. Nothing is kept after the handshake unless
@@ -366,13 +370,15 @@ pub const Server = struct {
     /// no server name, the first whose key the client can verify.
     certificates: []const *const CertKeyPair = &.{},
     /// Picks the certificate for a connection, before `certificates` and
-    /// `auth` are tried. Null leaves the choice to them.
+    /// `auth` are tried. Null leaves the choice to them. `-Dimpl=openssl`
+    /// has none, and fails the handshake with internal_error when it is
+    /// set.
     select_certificate: ?SelectCertificate = null,
     client_auth: ?ClientAuth = null,
-    /// The lowest and highest versions spoken. Null is the
-    /// implementation's own bound: the native server speaks TLS 1.3 only,
-    /// and refuses a range without it; under `-Dimpl=libssl`, AWS-LC
-    /// speaks TLS 1.0 to 1.3.
+    /// The lowest and highest versions spoken, each TLS 1.2 or newer: a
+    /// server does not fall back to older ones, and a bound below TLS 1.2
+    /// is refused. Null is TLS 1.2 and TLS 1.3 respectively. The native
+    /// server speaks TLS 1.3 only, and refuses a range without it.
     min_version: ?proto.Version = null,
     max_version: ?proto.Version = null,
     /// In preference order, followed over the client's. A version is
@@ -383,8 +389,9 @@ pub const Server = struct {
     /// this machine, or a client that lists it first; so does a list
     /// equal to `CipherSuite.all`, and any other is followed as given. The
     /// native server skips TLS 1.2 suites, and needs a TLS 1.3 one. Under
-    /// `-Dimpl=libssl` the default for older versions is AWS-LC's, and a
-    /// list may name any suite AWS-LC knows.
+    /// `-Dimpl=libssl` the default for TLS 1.2 is AWS-LC's, and a list may
+    /// name any suite AWS-LC knows; likewise OpenSSL's under
+    /// `-Dimpl=openssl`.
     cipher_suites: ?[]const proto.CipherSuite = null,
     /// In preference order, followed over the client's, with at least one
     /// group ztls knows. Groups the implementation has no key exchange for
@@ -393,7 +400,8 @@ pub const Server = struct {
     /// share for, and asks for another with a HelloRetryRequest only when
     /// it can use none of them. Under `-Dimpl=libssl`, AWS-LC takes its
     /// favourite of all the groups the client supports, asking for that
-    /// one's share when it was not sent.
+    /// one's share when it was not sent. Under `-Dimpl=openssl`, OpenSSL
+    /// before 3.5 takes the first share the client sent that it supports.
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
     /// Sent in a CertificateRequest, and the only schemes a client
     /// certificate's key may sign with. Signatures inside the chain are
@@ -401,9 +409,7 @@ pub const Server = struct {
     /// 1.3 the list also tells the client which chain signatures we take.
     /// Not empty, and each one of `known_signature_schemes`.
     ///
-    /// Null is the implementation's default: `default_signature_schemes`
-    /// for the native one, and under `-Dimpl=libssl`
-    /// `known_signature_schemes`, which adds TLS 1.2's SHA-1 ones.
+    /// Null is `default_signature_schemes`, without TLS 1.2's SHA-1 ones.
     verify_schemes: ?[]const proto.SignatureScheme = null,
     /// What the server signs with, in preference order: the first the
     /// client accepts that suits the certificate's key. A certificate
@@ -411,7 +417,7 @@ pub const Server = struct {
     /// schemes, one with a key other than RSA or ECDSA is. Not empty, and
     /// each one of `known_signature_schemes`.
     ///
-    /// Null is the implementation's default, as for `verify_schemes`.
+    /// Null is `default_signature_schemes`, as for `verify_schemes`.
     signing_schemes: ?[]const proto.SignatureScheme = null,
     /// Supported, in preference order. A client whose offer shares none
     /// is refused with no_application_protocol; one that offers none
@@ -427,6 +433,8 @@ pub const Server = struct {
     ///
     /// Under `-Dimpl=libssl`, with `client_auth` every handshake message is
     /// held to this, but to no less than 16 KiB; without it, to 16 KiB.
+    /// Under `-Dimpl=openssl` it holds the Certificate message, to no less
+    /// than 16 KiB.
     max_handshake_message_len: usize = 64 * 1024,
     /// Keep a copy of the client's certificate chain, if it sent one, in
     /// `Connection.peer_certificates`, allocated through `gpa`.

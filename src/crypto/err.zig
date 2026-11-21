@@ -1,4 +1,4 @@
-//! AWS-LC's error queue. It is thread-local, so it must be read right after
+//! The library's error queue. It is thread-local, so it must be read right after
 //! the failing call, before anything that could move the fiber to another
 //! thread. Every wrapper in this directory does that and leaves the queue
 //! empty.
@@ -8,9 +8,12 @@ const c = @import("c");
 
 pub const Error = error{CryptoFailed};
 
-/// The first error AWS-LC queued on this thread (the root cause; later
+/// A packed error: 32 bits in AWS-LC, an unsigned long in OpenSSL.
+pub const Code = @TypeOf(c.ERR_peek_error());
+
+/// The first error the library queued on this thread (the root cause; later
 /// entries wrap it), or 0 if none. Clears the queue.
-pub fn take() u32 {
+pub fn take() Code {
     const code = c.ERR_peek_error();
     c.ERR_clear_error();
     return code;
@@ -25,7 +28,7 @@ pub fn fail() Error {
         while (true) {
             const code = c.ERR_get_error();
             if (code == 0) break;
-            std.log.scoped(.ztls).debug("AWS-LC: {s}", .{describe(code, &buf)});
+            std.log.scoped(.ztls).debug("libcrypto: {s}", .{describe(code, &buf)});
         }
     }
     c.ERR_clear_error();
@@ -33,7 +36,7 @@ pub fn fail() Error {
 }
 
 /// A description of `code` for logs.
-pub fn describe(code: u32, buf: []u8) []const u8 {
+pub fn describe(code: Code, buf: []u8) []const u8 {
     _ = c.ERR_error_string_n(code, buf.ptr, buf.len);
     return std.mem.sliceTo(buf, 0);
 }

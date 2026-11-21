@@ -4,16 +4,16 @@ A TLS library for Zig, built on [AWS-LC](https://github.com/aws/aws-lc).
 It works on top of any `std.Io.Reader` and `std.Io.Writer`, and gives you a
 cleartext reader and writer in return. It has a client and a server.
 
-There are two engines with the same API, and you pick one at build time.
+There are three engines with the same API, and you pick one at build time.
 The native engine implements the TLS protocol in Zig and uses AWS-LC's
 libcrypto for cryptography and certificate verification. The libssl engine
-wraps AWS-LC's libssl.
+wraps AWS-LC's libssl. The openssl engine wraps the system's OpenSSL.
 
 Requires Zig 0.16 or 0.17. AWS-LC is built by the Zig build system.
 
 ## Features
 
-Both engines have the same API:
+All engines have the same API:
 
 - A client and a server, over any `std.Io.Reader` and `std.Io.Writer`.
 - One task can read a connection while another writes to it.
@@ -21,10 +21,14 @@ Both engines have the same API:
   with a callback.
 - ALPN.
 - Client certificates.
-- Certificate verification with AWS-LC, against roots from PEM, DER, files
-  or the system store.
+- Certificate verification against roots from PEM, DER, files or the
+  system store.
 - KeyUpdate and close_notify.
 - Versions, cipher suites, groups and signature schemes can be chosen.
+
+The same policy applies in each: servers speak TLS 1.2 and 1.3, clients
+fall back to older versions only when asked to, and SHA-1 signatures are
+accepted only when listed.
 
 ## The native engine
 
@@ -61,12 +65,22 @@ This engine wraps libssl, AWS-LC's TLS implementation, which it shares with
 BoringSSL. It has much more real-world use behind it, and speaks the older
 versions and suites that some peers still need:
 
-- TLS 1.0 to 1.3, as client and server.
+- TLS 1.2 and 1.3 as client and server, and TLS 1.0 and 1.1 as a client's
+  fallback.
 - AWS-LC's cipher suites, CBC suites and RSA key exchange among them.
 - P-521 key exchange, besides the native engine's groups.
 
 It is a little slower than the native engine, because of the copies and the
 lock described above, and it needs a C++ runtime.
+
+## The openssl engine
+
+Build with `-Dimpl=openssl`, or pass `.impl = .openssl` to the dependency.
+This engine is the libssl engine on the system's OpenSSL 3, linked as a
+shared library, so nothing from AWS-LC is built into your program. It
+speaks what the libssl engine does, with OpenSSL's cipher suites, and
+X25519MLKEM768 from OpenSSL 3.5. It has no signer hooks and no certificate
+selection callback.
 
 ## Using it
 
@@ -186,13 +200,13 @@ signature algorithms, or with a `select_certificate` callback.
 ## Testing
 
 - Unit tests.
-- Client-server tests over loopback, for both engines.
+- Client-server tests over loopback, for all engines.
 - Interoperability tests with OpenSSL's `s_server` and `s_client` and with
-  Go's `crypto/tls`, as client and server, for both engines.
+  Go's `crypto/tls`, as client and server, for all engines.
 - [tlsfuzzer](https://github.com/tlsfuzzer/tlsfuzzer)'s TLS 1.3 scripts, as
-  server, for both engines. Skipped scripts and probes are listed in
-  `tests/tlsfuzzer/run.sh`, and what one engine skips beyond those, in
-  `native.sh` and `libssl.sh` next to it.
+  server, for the native and libssl engines. Skipped scripts and probes are
+  listed in `tests/tlsfuzzer/run.sh`, and what one engine skips beyond
+  those, in `native.sh` and `libssl.sh` next to it.
 
 The native engine is also tested with:
 
@@ -215,6 +229,7 @@ The native engine is also tested with:
 ```sh
 zig build test                                      # 0.17, or ~/.zvm/0.16.0/zig
 zig build test -Dimpl=libssl
+zig build test -Dimpl=openssl                       # needs OpenSSL 3's headers
 zig build test -fwine -Dtarget=x86_64-windows-gnu   # networking tests skip under wine
 zig build test -fqemu -Dtarget=aarch64-linux-musl
 ```
@@ -239,8 +254,11 @@ ztls is [MIT](LICENSE). The test keys and the example handshake in
 `src/testdata` come from [tls.zig](https://github.com/ianic/tls.zig), also
 MIT, so its author is named in the license too.
 
-AWS-LC is compiled into every binary that uses ztls. Its code is under
+AWS-LC is compiled into every binary that uses the native or the libssl
+engine. Its code is under
 Apache-2.0 or ISC. Parts that come from BoringSSL are ISC, and parts that
 come from OpenSSL are Apache-2.0 with the original SSLeay notice. See
 [its LICENSE](https://github.com/aws/aws-lc/blob/main/LICENSE) for
 details. A binary you ship must include those notices as well as ztls's.
+The openssl engine links the system's OpenSSL instead, which is
+Apache-2.0.

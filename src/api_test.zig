@@ -8,9 +8,12 @@ const testing = std.testing;
 const build_options = @import("build_options");
 
 const native = @import("root_native.zig");
-const libssl_build = build_options.libssl;
+/// The openssl engine is the libssl one on OpenSSL, less a few features:
+/// where the two agree, tests say libssl.
+const openssl_build = build_options.openssl;
+const libssl_build = build_options.libssl or openssl_build;
 /// The implementation under test.
-const lib = if (libssl_build) @import("root_libssl.zig") else native;
+const lib = if (openssl_build) @import("root_openssl.zig") else if (libssl_build) @import("root_libssl.zig") else native;
 
 const config = lib.config;
 const crypto = lib.crypto;
@@ -235,6 +238,7 @@ test "client and server handshake with every suite, group and certificate type" 
     const pairs = [_]*const CertKeyPair{ &pki.server_ec, &pki.server_rsa, &pki.server_ed25519, &pki.server_chain };
     for (proto.CipherSuite.all) |suite| {
         for (groups) |group| {
+            if (openssl_build and group == .x25519_ml_kem768 and !lib.hasX25519MlKem768()) continue;
             for (pairs) |pair| {
                 var run: Run(lib) = .{};
                 try run.start(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = pair, .alpn_protocols = &.{ "h2", "http/1.1" } });
@@ -335,7 +339,9 @@ test "the server follows its own group order over the client's" {
     });
     const outcome = try run.finish(io);
     try outcome.handshake;
-    try testing.expectEqual(proto.NamedGroup.secp256r1, seen.group.?);
+    // OpenSSL's server takes the first share the client sent that it
+    // supports, whatever its own order.
+    try testing.expectEqual(if (openssl_build) proto.NamedGroup.x25519 else .secp256r1, seen.group.?);
 }
 
 test "a group listed twice is offered once" {
@@ -416,6 +422,8 @@ test "client certificates: none, requested, required" {
 }
 
 test "a signer hook signs CertificateVerify, once per side that presents a certificate" {
+    // OpenSSL has no hook for a key held elsewhere.
+    if (openssl_build) return error.SkipZigTest;
     const io = testing.io;
     var pki = try Pki.init();
     defer pki.deinit();
@@ -637,7 +645,12 @@ test "a server without a group ztls knows, or with no version in range, is refus
     empty_range.max_version = .tls_1_2;
     var unknown_version = base;
     unknown_version.max_version = @enumFromInt(0x0305);
-    for ([_]config.Server{ no_groups, unknown_groups, empty_range, unknown_version }) |opt| {
+    // A server does not fall back to versions before TLS 1.2.
+    var old_min = base;
+    old_min.min_version = .tls_1_1;
+    var old_max = base;
+    old_max.max_version = .tls_1_1;
+    for ([_]config.Server{ no_groups, unknown_groups, empty_range, unknown_version, old_min, old_max }) |opt| {
         var input: Io.Reader = .fixed(&input_buffer);
         var discard: Io.Writer.Discarding = .init(&output_buffer);
         try testing.expectError(error.TlsInternalError, lib.server(&input, &discard.writer, opt));
@@ -785,14 +798,16 @@ test "the server picks its certificate by server name" {
         .{ .host = "www.example.test", .key_type = .{ .ecdsa = .p384 } }, // first of `certificates` for the name
         .{ .host = "nomatch.invalid", .key_type = .ed25519, .skip_verify = true }, // nothing fits: `auth`
     };
-    for (cases) |case| {
+    // The openssl engine has no select_certificate.
+    const tried = if (openssl_build) cases[1..] else &cases;
+    for (tried) |case| {
         var run: Run(lib) = .{};
         try run.start(io, .{
             .io = testing.io,
             .gpa = testing.allocator,
             .auth = &pki.server_ed25519,
             .certificates = &.{ &pki.server_chain, &pki.server_ec },
-            .select_certificate = .{ .context = &picker, .callback = Picker.pick },
+            .select_certificate = if (openssl_build) null else .{ .context = &picker, .callback = Picker.pick },
         });
         defer run.deinit(io);
         const seen = try clientOnce(lib, &run.loopback, .{
@@ -806,7 +821,7 @@ test "the server picks its certificate by server name" {
         const outcome = try run.finish(io);
         try outcome.handshake;
     }
-    try testing.expectEqual(cases.len, picker.calls);
+    try testing.expectEqual(if (openssl_build) 0 else cases.len, picker.calls);
 
     // With no fallback, an unknown name is refused.
     var run: Run(lib) = .{};
@@ -836,6 +851,8 @@ test "the server picks its certificate by server name" {
 }
 
 test "select_certificate sees the client's schemes that ztls knows, rsa_pkcs1 ones included" {
+    // The openssl engine has no select_certificate.
+    if (openssl_build) return error.SkipZigTest;
     const io = testing.io;
     var pki = try Pki.init();
     defer pki.deinit();
@@ -1050,10 +1067,11 @@ test "close_notify in place of the ClientHello is the end of the stream, with no
         t.setUp();
         try t.sendRaw(&.{ @intFromEnum(proto.ContentType.alert), 3, 3, 0, 2, 1, @intFromEnum(proto.Alert.close_notify) });
         t.stream.shutdown(io, .send) catch {};
-        try testing.expectEqual(0, try t.input.interface.discardRemaining());
+        // OpenSSL takes it as unexpected, and says so.
+        try testing.expectEqual(if (openssl_build) 7 else 0, try t.input.interface.discardRemaining());
     }
     const outcome = try run.finish(io);
-    try testing.expectError(error.EndOfStream, outcome.handshake);
+    try testing.expectError(if (openssl_build) error.TlsUnexpectedMessage else error.EndOfStream, outcome.handshake);
 }
 
 test "a large transfer with key updates both ways" {
@@ -1459,6 +1477,8 @@ fn refusedAs(native_err: api.Failure, libssl_err: api.Failure) Verdict {
 /// Runs the end under test as `side` against a native peer, which
 /// completes the handshake, sends `misdeeds`, then nothing more.
 fn expectVerdict(io: Io, pki: *const Pki, side: proto.Side, misdeeds: []const Misdeed, verdict: Verdict) !void {
+    // The peer is the native engine, which needs AWS-LC.
+    if (openssl_build) return error.SkipZigTest;
     const Peer = struct {
         fn run(loopback: *testu.Loopback, p: *const Pki, peer_side: proto.Side, m: []const Misdeed, v: Verdict) !void {
             var t: Transport = .{ .io = loopback.io, .stream = if (peer_side == .server) try loopback.accept() else try loopback.connect() };
@@ -1604,6 +1624,8 @@ test "records that cannot come after the handshake" {
 }
 
 test "a KeyUpdate request made while a reply is owed still reaches the peer" {
+    // The peer is the native engine, which needs AWS-LC.
+    if (openssl_build) return error.SkipZigTest;
     const io = testing.io;
     var pki = try Pki.init();
     defer pki.deinit();
@@ -1659,6 +1681,8 @@ test "a KeyUpdate request made while a reply is owed still reaches the peer" {
 }
 
 test "a flush with nothing written sends the KeyUpdate reply a read left owing" {
+    // The peer is the native engine, which needs AWS-LC.
+    if (openssl_build) return error.SkipZigTest;
     // Native answers only with the next record it writes.
     if (!libssl_build) return error.SkipZigTest;
     const io = testing.io;
@@ -1705,6 +1729,8 @@ test "a flush with nothing written sends the KeyUpdate reply a read left owing" 
 }
 
 test "a task canceled while the other holds the connection's lock may read again" {
+    // The peer is the native engine, which needs AWS-LC.
+    if (openssl_build) return error.SkipZigTest;
     // Only libssl's directions share a lock.
     if (!libssl_build) return error.SkipZigTest;
     const io = testing.io;
@@ -1758,6 +1784,8 @@ test "a task canceled while the other holds the connection's lock may read again
 }
 
 test "libssl and native talk to each other, each as client and as server" {
+    // The peer is the native engine, which needs AWS-LC.
+    if (openssl_build) return error.SkipZigTest;
     if (!libssl_build) return error.SkipZigTest;
     const io = testing.io;
     var pki = try Pki.init();

@@ -8,7 +8,8 @@ const proto = @import("protocol.zig");
 /// What a handshake can fail with. `EndOfStream` is the peer going away
 /// before it was done; `ReadFailed`/`WriteFailed` are the transport's,
 /// whose own error says why. `Canceled` is the task's cancellation while
-/// it waited for the connection's lock, under `-Dimpl=libssl`.
+/// it waited for the connection's lock, under `-Dimpl=libssl` and
+/// `-Dimpl=openssl`.
 pub const Error = proto.LocalError || proto.Alert.Error || error{
     ReadFailed,
     WriteFailed,
@@ -33,7 +34,8 @@ pub const Failure = error{
 } || proto.Alert.Error;
 /// What a read can fail with: the transport reader's failure or the
 /// task's cancellation, neither of which ends the connection, or a
-/// `Failure`, which does. `Canceled` comes only under `-Dimpl=libssl`, when
+/// `Failure`, which does. `Canceled` comes only under `-Dimpl=libssl` and
+/// `-Dimpl=openssl`, when
 /// the task was canceled while it waited for the writing task's turn at
 /// libssl; nothing was read, and the read may be retried.
 pub const ReadError = error{ ReadFailed, Canceled } || Failure;

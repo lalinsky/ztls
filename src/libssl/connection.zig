@@ -889,11 +889,11 @@ pub fn server(input: *Io.Reader, output: *Io.Writer, options: config.Server) Han
     return conn;
 }
 
-/// The versions in range, AWS-LC's TLS 1.0 to 1.3 for a null bound, and
+/// The versions in range, TLS 1.2 to 1.3 for a null bound, and
 /// with a list of `suites`, only those it has a suite for: TLS 1.3's are
 /// its own, every other is for the versions before it.
 fn setVersions(ssl: *c.SSL, min: ?proto.Version, max: ?proto.Version, suites: ?[]const proto.CipherSuite) error{TlsInternalError}!void {
-    var low: u16 = if (min) |v| @intFromEnum(v) else c.TLS1_VERSION;
+    var low: u16 = if (min) |v| @intFromEnum(v) else c.TLS1_2_VERSION;
     var high: u16 = if (max) |v| @intFromEnum(v) else c.TLS1_3_VERSION;
     if (suites) |list| {
         var tls13 = false;
@@ -1427,10 +1427,11 @@ fn acceptsKey(comptime version: ?policy.Version, comptime auth: LegacyAuth) *con
 }
 
 /// The schemes for a null `signing_schemes` or `verify_schemes`: the
-/// native defaults, then TLS 1.2's SHA-1 ones, which AWS-LC takes too.
-const libssl_schemes = &config.known_signature_schemes;
+/// native defaults. TLS 1.2's SHA-1 ones only when listed.
+const libssl_schemes = &config.default_signature_schemes;
 
-const all_schemes = libssl_schemes;
+/// Every scheme ztls knows, for collecting the peer's.
+const all_schemes = &config.known_signature_schemes;
 
 /// The client's signature_algorithms that ztls supports, in its order,
 /// each once, as the native server collects them. A TLS 1.2 client that

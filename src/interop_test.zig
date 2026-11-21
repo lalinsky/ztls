@@ -9,9 +9,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const build_options = @import("build_options");
-const libssl_build = build_options.libssl;
+const openssl_build = build_options.openssl;
+/// The openssl engine is the libssl one on OpenSSL: where the two agree,
+/// tests say libssl.
+const libssl_build = build_options.libssl or openssl_build;
 /// The implementation under test.
-const ztls = if (libssl_build) @import("root_libssl.zig") else @import("root_native.zig");
+const ztls = if (openssl_build) @import("root_openssl.zig") else if (libssl_build) @import("root_libssl.zig") else @import("root_native.zig");
 const config = ztls.config;
 const proto = ztls.protocol;
 const testu = @import("testu.zig");
@@ -631,9 +634,15 @@ test "our client against a legacy openssl s_server: libssl connects, native refu
     defer trust.deinit();
     try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     const options: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &trust };
+    // Versions before TLS 1.2 only when asked for.
+    var fallback = options;
+    fallback.min_version = .tls_1_0;
 
     for (legacy_cases) |case| {
-        const result = sServerOnce(io, case.cert, &.{ case.flag, "-cipher", case.cipher }, options);
+        if (case.version != .tls_1_2) {
+            try testing.expectError(error.TlsAlertProtocolVersion, sServerOnce(io, case.cert, &.{ case.flag, "-cipher", case.cipher }, options));
+        }
+        const result = sServerOnce(io, case.cert, &.{ case.flag, "-cipher", case.cipher }, fallback);
         if (!libssl_build) {
             try testing.expectError(case.native_err, result);
             continue;
@@ -644,7 +653,7 @@ test "our client against a legacy openssl s_server: libssl connects, native refu
     }
 }
 
-test "a TLS 1.2 server that signs with SHA-1 only: libssl takes it by default, native when asked" {
+test "a TLS 1.2 server that signs with SHA-1 only is taken when asked" {
     const io = testing.io;
     _ = try requireOpenSsl(io);
     var trust = try ztls.TrustStore.init();
@@ -652,12 +661,7 @@ test "a TLS 1.2 server that signs with SHA-1 only: libssl takes it by default, n
     try trust.addPem(testing.allocator, @embedFile("testdata/pki/ca.pem"));
     const args: []const []const u8 = &.{ "-tls1_2", "-sigalgs", "RSA+SHA1", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256:@SECLEVEL=0" };
     var options: config.Client = .{ .io = testing.io, .gpa = testing.allocator, .host = "localhost", .root_ca = &trust };
-    if (libssl_build) {
-        const seen = try sServerOnce(io, "server-rsa", args, options);
-        try testing.expectEqual(proto.SignatureScheme.rsa_pkcs1_sha1, seen.peer_signature_scheme.?);
-    } else {
-        try testing.expect(std.meta.isError(sServerOnce(io, "server-rsa", args, options)));
-    }
+    try testing.expect(std.meta.isError(sServerOnce(io, "server-rsa", args, options)));
     options.verify_schemes = &config.known_signature_schemes;
     const seen = try sServerOnce(io, "server-rsa", args, options);
     try testing.expectEqual(proto.SignatureScheme.rsa_pkcs1_sha1, seen.peer_signature_scheme.?);
@@ -682,11 +686,12 @@ test "the libssl client: a version range, and an Ed25519 certificate it cannot s
     var ed = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ed25519.pem"), @embedFile("testdata/pki/server-ed25519.key"));
     defer ed.deinit(testing.allocator);
     options.auth = &ed;
+    options.min_version = .tls_1_0;
     const seen = try sServerOnce(io, "server-rsa", &.{ "-tls1_1", "-cipher", "ECDHE-RSA-AES128-SHA:@SECLEVEL=0", "-verify", "1", "-CAfile", pki ++ "ca.pem" }, options);
     try testing.expectEqual(proto.Version.tls_1_1, seen.version);
 }
 
-test "a legacy openssl s_client against our libssl server" {
+test "a legacy openssl s_client against our libssl server: TLS 1.2's older suites, and nothing before TLS 1.2" {
     if (!libssl_build) return error.SkipZigTest;
     const io = testing.io;
     _ = try requireOpenSsl(io);
@@ -702,6 +707,10 @@ test "a legacy openssl s_client against our libssl server" {
             .auth = if (std.mem.eql(u8, case.cert, "server-ec")) &ec else &rsa,
         };
         const result = try sClientOnce(io, options, &.{ case.flag, "-cipher", case.cipher, "-verify_return_error" });
+        if (case.version != .tls_1_2) {
+            try testing.expectError(error.TlsProtocolVersion, result.outcome.handshake);
+            continue;
+        }
         try result.outcome.handshake;
         try result.outcome.echo;
         try testing.expect(result.echoed);
@@ -728,10 +737,10 @@ test "the libssl server: version ranges, suite lists, client certificates and SH
     try result.outcome.handshake;
     try testing.expectEqual(proto.Version.tls_1_2, result.outcome.version.?);
 
-    // Held to TLS 1.2 at least, against a TLS 1.1 client.
+    // Held to TLS 1.3, against a TLS 1.2 client.
     var floor = base;
-    floor.min_version = .tls_1_2;
-    result = try sClientOnce(io, floor, &.{ "-tls1_1", "-cipher", "ECDHE-RSA-AES128-SHA:@SECLEVEL=0" });
+    floor.min_version = .tls_1_3;
+    result = try sClientOnce(io, floor, &.{"-tls1_2"});
     try testing.expectError(error.TlsProtocolVersion, result.outcome.handshake);
 
     // A list with one legacy suite is followed strictly.
@@ -750,8 +759,14 @@ test "the libssl server: version ranges, suite lists, client certificates and SH
     try result.outcome.handshake;
     try testing.expectEqual(ztls.crypto.sig.KeyType{ .ecdsa = .p256 }, result.outcome.peer_key_type.?);
 
-    // A TLS 1.2 client that takes SHA-1 signatures only.
-    result = try sClientOnce(io, base, &.{ "-tls1_2", "-sigalgs", "RSA+SHA1", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256:@SECLEVEL=0" });
+    // A TLS 1.2 client that takes SHA-1 signatures only: served when
+    // they are listed.
+    const sha1_client: []const []const u8 = &.{ "-tls1_2", "-sigalgs", "RSA+SHA1", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256:@SECLEVEL=0" };
+    result = try sClientOnce(io, base, sha1_client);
+    try testing.expectError(error.TlsHandshakeFailure, result.outcome.handshake);
+    var sha1 = base;
+    sha1.signing_schemes = &config.known_signature_schemes;
+    result = try sClientOnce(io, sha1, sha1_client);
     try result.outcome.handshake;
     try testing.expect(result.echoed);
 }
@@ -767,8 +782,9 @@ const CountingSigner = struct {
     }
 };
 
-test "the libssl server picks a certificate older clients can use, and keeps a signer from RSA key exchange" {
-    if (!libssl_build) return error.SkipZigTest;
+test "the libssl server picks a certificate a TLS 1.2 client can use, and keeps a signer from RSA key exchange" {
+    // The openssl engine has neither signers nor select_certificate.
+    if (!libssl_build or openssl_build) return error.SkipZigTest;
     const io = testing.io;
     _ = try requireOpenSsl(io);
     var rsa = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
@@ -779,18 +795,14 @@ test "the libssl server picks a certificate older clients can use, and keeps a s
     defer signed.deinit(testing.allocator);
     var signer: CountingSigner = .{};
     signed.signer = .{ .context = &signer, .sign = CountingSigner.sign };
-    const tls11: []const []const u8 = &.{ "-tls1_1", "-cipher", "ECDHE-RSA-AES128-SHA:@SECLEVEL=0" };
+    const rsa_suites: []const []const u8 = &.{ "-tls1_2", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256" };
 
     var ec = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-ec.pem"), @embedFile("testdata/pki/server-ec.key"));
     defer ec.deinit(testing.allocator);
 
-    // Before TLS 1.2: not the Ed25519 certificate, nor one with a signer,
-    // nor an ECDSA one for a client that offers RSA suites only.
-    var result = try sClientOnce(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .certificates = &.{ &ed, &signed, &ec, &rsa } }, tls11);
-    try result.outcome.handshake;
-    try testing.expectEqual(0, signer.calls);
-    // So in TLS 1.2, for a client that takes ECDSA signatures.
-    result = try sClientOnce(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .certificates = &.{ &ec, &rsa } }, &.{ "-tls1_2", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256" });
+    // For a client that offers RSA suites only: not the Ed25519 or the
+    // ECDSA certificate, though the client takes ECDSA signatures.
+    var result = try sClientOnce(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .certificates = &.{ &ed, &ec, &rsa } }, rsa_suites);
     try result.outcome.handshake;
     try testing.expectEqual(proto.CipherSuite.ecdhe_rsa_with_aes_128_gcm_sha256, result.outcome.suite.?);
 
@@ -807,7 +819,7 @@ test "the libssl server picks a certificate older clients can use, and keeps a s
     };
     var picker: Picker = .{ .offered = &.{ &ed, &ec, &rsa } };
     const picking: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .select_certificate = .{ .context = &picker, .callback = Picker.pick } };
-    result = try sClientOnce(io, picking, tls11);
+    result = try sClientOnce(io, picking, rsa_suites);
     try result.outcome.handshake;
     // In TLS 1.2, PKCS#1 v1.5 signs too.
     result = try sClientOnce(io, picking, &.{ "-tls1_2", "-sigalgs", "RSA+SHA256" });
@@ -826,6 +838,16 @@ test "the libssl server picks a certificate older clients can use, and keeps a s
 }
 
 const go_echo = "tests/go/echo/main.go";
+
+/// Whether the engine has a group in `groups`: the openssl one lacks
+/// X25519MLKEM768 before OpenSSL 3.5.
+fn anyGroupAvailable(groups: []const proto.NamedGroup) bool {
+    if (!openssl_build or ztls.hasX25519MlKem768()) return true;
+    for (groups) |group| {
+        if (group != .x25519_ml_kem768) return true;
+    }
+    return false;
+}
 
 test "our client against Go's crypto/tls, with X25519MLKEM768" {
     const io = testing.io;
@@ -851,6 +873,7 @@ test "our client against Go's crypto/tls, with X25519MLKEM768" {
         .{ .groups = &.{.secp256r1}, .transfer = 1 << 20 },
     };
     for (cases) |case| {
+        if (!anyGroupAvailable(case.groups)) continue;
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(testing.allocator);
         try argv.appendSlice(testing.allocator, &.{
@@ -929,6 +952,7 @@ test "Go's crypto/tls against our server, with X25519MLKEM768" {
         .{ .groups = &.{.secp256r1}, .transfer = 1 << 20 }, // Go shares X25519MLKEM768 and X25519 first: a retry
     };
     for (cases) |case| {
+        if (!anyGroupAvailable(case.groups)) continue;
         var loopback = try testu.Loopback.init(io);
         defer loopback.deinit();
         var outcome: Outcome = .{};

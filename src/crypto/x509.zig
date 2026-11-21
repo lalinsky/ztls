@@ -183,7 +183,7 @@ pub const TrustStore = struct {
     /// built: it reads the store without its lock, so not on one already
     /// shared with connections that verify against it.
     pub fn count(self: *const TrustStore) usize {
-        return c.sk_X509_OBJECT_num(c.X509_STORE_get0_objects(self.store));
+        return @intCast(c.sk_X509_OBJECT_num(c.X509_STORE_get0_objects(self.store)));
     }
 
     pub const AddPemFileError = std.Io.Dir.ReadFileAllocError || AddPemError;
@@ -435,7 +435,9 @@ pub fn verify(store: *const TrustStore, chain: []const Certificate, options: Ver
     const ctx = c.X509_STORE_CTX_new() orelse return err.fail();
     defer c.X509_STORE_CTX_free(ctx);
 
-    const untrusted = c.sk_X509_new_null() orelse return err.fail();
+    // OpenSSL's sk_X509_new_null is a macro translate-c cannot carry over.
+    const new_stack: ?*c.struct_stack_st_X509 = if (@import("build_options").openssl) @ptrCast(c.OPENSSL_sk_new_null()) else c.sk_X509_new_null();
+    const untrusted = new_stack orelse return err.fail();
     defer c.sk_X509_free(untrusted); // holds no references of its own
     for (chain[1..]) |cert| {
         if (c.sk_X509_push(untrusted, cert.x509) == 0) return err.fail();
@@ -443,7 +445,11 @@ pub fn verify(store: *const TrustStore, chain: []const Certificate, options: Ver
 
     if (c.X509_STORE_CTX_init(ctx, store.store, chain[0].x509, untrusted) != 1) return err.fail();
     const param = c.X509_STORE_CTX_get0_param(ctx);
-    c.X509_VERIFY_PARAM_set_time_posix(param, options.now);
+    if (@import("build_options").openssl) {
+        c.X509_VERIFY_PARAM_set_time(param, std.math.cast(c.time_t, options.now) orelse return error.BadCertificate);
+    } else {
+        c.X509_VERIFY_PARAM_set_time_posix(param, options.now);
+    }
     const purpose: c_int = switch (options.purpose) {
         .server => c.X509_PURPOSE_SSL_SERVER,
         .client => c.X509_PURPOSE_SSL_CLIENT,
@@ -493,13 +499,20 @@ pub fn verify(store: *const TrustStore, chain: []const Certificate, options: Ver
 /// path it built but the last, usually the trust anchor.
 fn checkSignatureDigests(ctx: *c.X509_STORE_CTX) VerifyError!void {
     const path = c.X509_STORE_CTX_get0_chain(ctx);
-    const n: usize = c.sk_X509_num(path);
+    const n: usize = @intCast(c.sk_X509_num(path));
     for (0..n -| 1) |i| {
-        if (signatureDigest(c.sk_X509_value(path, i).?) == c.NID_sha1) {
+        if (signatureDigest(chainAt(path, i)) == c.NID_sha1) {
             log.debug("certificate verification failed at depth {d}: signed with SHA-1", .{i});
             return error.BadCertificate;
         }
     }
+}
+
+/// A certificate on a verified path. OpenSSL's sk_X509_value is a macro
+/// translate-c cannot carry over.
+fn chainAt(path: anytype, i: usize) *c.X509 {
+    if (@import("build_options").openssl) return @ptrCast(c.OPENSSL_sk_value(@ptrCast(path), @intCast(i)).?);
+    return c.sk_X509_value(path, i).?;
 }
 
 /// The hash a certificate was signed with, or `NID_undef` for a signature

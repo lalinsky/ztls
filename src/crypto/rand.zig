@@ -1,12 +1,13 @@
-//! Random bytes from AWS-LC's DRBG, which seeds itself from the OS.
+//! Random bytes from the library's DRBG, which seeds itself from the OS.
 
 const std = @import("std");
 const c = @import("c");
 
 pub fn bytes(buf: []u8) void {
     if (buf.len == 0) return;
-    // AWS-LC aborts rather than return failure here.
-    const ok = c.RAND_bytes(buf.ptr, buf.len);
+    // AWS-LC aborts rather than return failure here; OpenSSL fails only
+    // when it cannot seed, and takes an int.
+    const ok = c.RAND_bytes(buf.ptr, @intCast(buf.len));
     if (ok != 1) @panic("RAND_bytes failed");
 }
 
