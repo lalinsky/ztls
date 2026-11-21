@@ -291,7 +291,8 @@ pub const Client = struct {
     /// for a list equal to it; it refuses a suite it does not implement.
     /// Under `-Dimpl=libssl` it is AWS-LC's, which includes CBC and RSA
     /// key exchange suites for older servers, and a list may name any
-    /// suite AWS-LC knows; likewise OpenSSL's under `-Dimpl=openssl`.
+    /// suite AWS-LC knows; likewise OpenSSL's under `-Dimpl=openssl`,
+    /// which offers a list as given, AES instructions or not.
     cipher_suites: ?[]const proto.CipherSuite = null,
     /// In preference order, with at least one group ztls knows. Groups
     /// the implementation has no key exchange for are not offered: the
@@ -368,6 +369,9 @@ pub const Server = struct {
     /// for and by the signature algorithms it accepts: the first whose
     /// leaf is for that name and whose key the client can verify. With
     /// no server name, the first whose key the client can verify.
+    /// `-Dimpl=openssl` gives OpenSSL the first for the name with each
+    /// type of key, and `auth` for a type none of those has, and OpenSSL
+    /// presents the one the client can verify.
     certificates: []const *const CertKeyPair = &.{},
     /// Picks the certificate for a connection, before `certificates` and
     /// `auth` are tried. Null leaves the choice to them. `-Dimpl=openssl`
@@ -391,7 +395,9 @@ pub const Server = struct {
     /// native server skips TLS 1.2 suites, and needs a TLS 1.3 one. Under
     /// `-Dimpl=libssl` the default for TLS 1.2 is AWS-LC's, and a list may
     /// name any suite AWS-LC knows; likewise OpenSSL's under
-    /// `-Dimpl=openssl`.
+    /// `-Dimpl=openssl`, which takes ChaCha20-Poly1305 only for a client
+    /// that lists it first, with any list, and takes this machine to have
+    /// AES instructions.
     cipher_suites: ?[]const proto.CipherSuite = null,
     /// In preference order, followed over the client's, with at least one
     /// group ztls knows. Groups the implementation has no key exchange for

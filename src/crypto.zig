@@ -28,7 +28,7 @@ pub const hash = if (openssl) struct {} else @import("crypto/hash.zig");
 pub const hkdf = if (openssl) struct {} else @import("crypto/hkdf.zig");
 pub const prf = if (openssl) struct {} else @import("crypto/prf.zig");
 pub const kx = if (openssl) struct {} else @import("crypto/kx.zig");
-pub const aead = if (openssl) @import("crypto/aes_hardware.zig") else @import("crypto/aead.zig");
+pub const aead = if (openssl) struct {} else @import("crypto/aead.zig");
 
 test {
     std.testing.refAllDecls(@This());

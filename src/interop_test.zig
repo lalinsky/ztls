@@ -783,8 +783,7 @@ const CountingSigner = struct {
 };
 
 test "the libssl server picks a certificate a TLS 1.2 client can use, and keeps a signer from RSA key exchange" {
-    // The openssl engine has neither signers nor select_certificate.
-    if (!libssl_build or openssl_build) return error.SkipZigTest;
+    if (!libssl_build) return error.SkipZigTest;
     const io = testing.io;
     _ = try requireOpenSsl(io);
     var rsa = try ztls.CertKeyPair.fromSlice(testing.allocator, @embedFile("testdata/pki/server-rsa.pem"), @embedFile("testdata/pki/server-rsa.key"));
@@ -805,6 +804,8 @@ test "the libssl server picks a certificate a TLS 1.2 client can use, and keeps 
     var result = try sClientOnce(io, .{ .io = testing.io, .gpa = testing.allocator, .auth = null, .certificates = &.{ &ed, &ec, &rsa } }, rsa_suites);
     try result.outcome.handshake;
     try testing.expectEqual(proto.CipherSuite.ecdhe_rsa_with_aes_128_gcm_sha256, result.outcome.suite.?);
+    // The openssl engine has neither select_certificate nor signers.
+    if (openssl_build) return;
 
     // The application's choice, told what the client can verify.
     const Picker = struct {
