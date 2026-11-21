@@ -235,12 +235,22 @@ there to regenerate the file lists from upstream's CMake build.
 
 ## License
 
-ztls is [MIT](LICENSE). The test keys and the example handshake in
-`src/testdata` come from [tls.zig](https://github.com/ianic/tls.zig), also
-MIT, so its author is named in the license too.
+ztls is released under the [MIT License](LICENSE). Some of its code
+comes from [tls.zig](https://github.com/ianic/tls.zig), which is also
+MIT-licensed, so its author is listed in the license as well.
 
-AWS-LC is compiled into every binary that uses ztls. Its code is under
-Apache-2.0 or ISC. Parts that come from BoringSSL are ISC, and parts that
-come from OpenSSL are Apache-2.0 with the original SSLeay notice. See
-[its LICENSE](https://github.com/aws/aws-lc/blob/main/LICENSE) for
-details. A binary you ship must include those notices as well as ztls's.
+AWS-LC is compiled into every program that uses ztls. Its code is under
+permissive licenses (Apache-2.0, ISC and MIT); the full breakdown is in
+[its LICENSE](https://github.com/aws/aws-lc/blob/v5.15.0/LICENSE).
+
+When you distribute a program built with ztls, include ztls's
+[LICENSE](LICENSE), AWS-LC's
+[LICENSE](https://github.com/aws/aws-lc/blob/v5.15.0/LICENSE) and the
+text of its [NOTICE](https://github.com/aws/aws-lc/blob/v5.15.0/NOTICE),
+for example in a third-party licenses file or an about screen. That is
+all, unless you change AWS-LC's code. You don't have to publish your own
+source.
+
+You can use ztls in proprietary programs and in open-source ones under
+most licenses, including GPLv3. The exception is GPLv2-only, because
+Apache-2.0 is incompatible with it. This is a summary, not legal advice.
