@@ -253,7 +253,9 @@ pub const Handshake = struct {
         @setRuntimeSafety(true);
         while (true) {
             if (h.pending.len >= 4) {
-                const len = std.mem.readInt(u24, h.pending[1..4], .big);
+                // In usize: 4 + len overflows a u24 near its top, which
+                // a `max_message_len` that large lets through.
+                const len: usize = std.mem.readInt(u24, h.pending[1..4], .big);
                 // Bigger than we take; the peer's doing, so it hears so.
                 if (len > h.maxMessageLen(h.pending[0])) return error.TlsIllegalParameter;
                 if (h.pending.len >= 4 + len) {
@@ -1157,6 +1159,22 @@ test "only certificate messages may be large, and are not reserved before they a
             try testing.expectError(error.TlsIllegalParameter, h.nextMessage());
         }
     }
+}
+
+test "a length at the top of a u24 is no overflow, however large the limit" {
+    var message: [4 + 100]u8 = @splat(0);
+    message[0] = @intFromEnum(proto.HandshakeType.certificate);
+    std.mem.writeInt(u24, message[1..4], std.math.maxInt(u24), .big);
+    var wire: [128]u8 = undefined;
+    var input: Io.Reader = .fixed(try testFragments(&wire, &message, message.len));
+    var input_buffer: [@import("connection.zig").input_buffer_len]u8 = undefined;
+    var limited = input.limited(.unlimited, &input_buffer);
+    var output_buffer: [@import("connection.zig").output_buffer_len]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_buffer);
+    var conn = Connection.init(&limited.interface, &output, .client);
+    var h = Handshake.init(&conn, testing.allocator, std.math.maxInt(usize));
+    defer h.deinit();
+    try testing.expectError(error.EndOfStream, h.nextMessage());
 }
 
 test "a large message in small records is reallocated only a few times" {
