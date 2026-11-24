@@ -45,6 +45,7 @@
 //! which then fails with the same error.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const c = @import("c");
 
@@ -72,6 +73,8 @@ pub const output_buffer_len = api.output_buffer_len;
 const max_plaintext_len = api.max_plaintext_len;
 /// The most copies of a short repeated pattern gathered into one record.
 const splat_buffer_len = 1024;
+/// Same limit as native TLS 1.3, below the AES-GCM bound in RFC 9846 §5.5.
+const aes_gcm_record_limit = 1 << 24;
 
 /// The configuration, while the handshake runs, for the callbacks.
 const Options = union(enum) {
@@ -157,6 +160,8 @@ pub const Connection = struct {
     tracker: RecordTracker = .{},
     /// The writing task's.
     write_state: WriteState = .open,
+    /// Lets tests reach the key update boundary with a few records.
+    write_record_limit_for_test: if (builtin.is_test) u64 else void = if (builtin.is_test) aes_gcm_record_limit else {},
 
     // What the handshake settled, as in the native `Connection`.
 
@@ -225,9 +230,9 @@ pub const Connection = struct {
         return if (conn.server_name_len == 0) null else conn.server_name_buf[0..conn.server_name_len];
     }
 
-    /// KeyUpdates sent so far, our requests and our answers alike. An
-    /// answer counts once libssl queues it, which may be before the
-    /// writing task sends it.
+    /// KeyUpdates sent so far, including automatic updates. An update
+    /// counts once libssl queues it, which may be before the writing
+    /// task sends it.
     pub fn keyUpdatesSent(conn: *const Connection) u64 {
         return conn.key_updates_sent.load(.monotonic);
     }
@@ -276,7 +281,7 @@ pub const Connection = struct {
         const rc: c_int = switch (op) {
             .handshake => c.SSL_do_handshake(ssl),
             .read => c.SSL_read(ssl, @constCast(buf.ptr), len),
-            .write => c.SSL_write(ssl, buf.ptr, len),
+            .write => conn.writeApplication(buf),
             .shutdown => c.SSL_shutdown(ssl),
             .key_update => keyUpdate(ssl),
         };
@@ -303,6 +308,18 @@ pub const Connection = struct {
         // this thread.
         c.ERR_clear_error();
         return result;
+    }
+
+    fn writeApplication(conn: *Connection, bytes: []const u8) c_int {
+        const aes_gcm = conn.suite == .aes_128_gcm_sha256 or conn.suite == .aes_256_gcm_sha384;
+        const limit = if (builtin.is_test) conn.write_record_limit_for_test else aes_gcm_record_limit;
+        if (bytes.len != 0 and aes_gcm and c.SSL_get_write_sequence(conn.ssl) >= limit) {
+            // libssl seals the update with the old key and flushes it
+            // before the application record. A reply already queued
+            // by a read has already rotated the sending key.
+            if (c.SSL_key_update(conn.ssl, c.SSL_KEY_UPDATE_NOT_REQUESTED) != 1) return -1;
+        }
+        return c.SSL_write(conn.ssl, bytes.ptr, @intCast(bytes.len));
     }
 
     /// Points the callbacks and the BIO at this connection, which may have
@@ -596,7 +613,7 @@ pub const Connection = struct {
     /// transport, and then nothing was done.
     fn writeOp(conn: *Connection, op: Op, bytes: []const u8) WriteError!void {
         if (bytes.len > max_plaintext_len) @panic("ztls: more than a record's worth given to one write");
-        // The sealed record, and a KeyUpdate reply that may go ahead of it:
+        // The sealed record, and a KeyUpdate that may go ahead of it:
         // `output_buffer_len` holds both, with room to spare.
         const room = bytes.len + (output_buffer_len - max_plaintext_len);
         while (true) {

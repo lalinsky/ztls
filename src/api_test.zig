@@ -1224,6 +1224,57 @@ const Flaky = struct {
     }
 };
 
+test "libssl automatically updates TLS 1.3 AES-GCM sending keys at the record limit" {
+    if (!libssl_build) return error.SkipZigTest;
+    const io = testing.io;
+    var pki = try Pki.init();
+    defer pki.deinit();
+
+    for (proto.CipherSuite.all) |suite| {
+        var run: Run(native) = .{};
+        try run.start(io, .{ .io = io, .gpa = testing.allocator, .auth = &pki.server_ec, .cipher_suites = &.{suite} });
+        defer run.deinit(io);
+
+        var t: Transport = .{ .io = io, .stream = try run.loopback.connect() };
+        defer t.deinit();
+        t.setUp();
+        var flaky_buffer: [lib.output_buffer_len]u8 = undefined;
+        var flaky: Flaky = .init(&t.output.interface, &flaky_buffer);
+        var conn = try lib.client(&t.input.interface, &flaky.interface, .{ .io = io, .gpa = testing.allocator, .host = "localhost", .root_ca = &pki.ca });
+        defer conn.deinit();
+        conn.write_record_limit_for_test = 2;
+
+        var rbuf: [64]u8 = undefined;
+        var wbuf: [64]u8 = undefined;
+        var r = conn.reader(&rbuf);
+        var w = conn.writer(&wbuf);
+        const aes_gcm = suite != .chacha20_poly1305_sha256;
+        for (0..5) |i| {
+            try w.interface.print("record {d}\n", .{i});
+            const updates: u64 = if (aes_gcm) i / 2 else 0;
+            if (i == 2) {
+                // Fail after libssl has encrypted the update and record.
+                flaky.fail_every = 1;
+                try testing.expectError(error.WriteFailed, w.interface.flush());
+                try testing.expectEqual(error.WriteFailed, w.err.?);
+                try testing.expectEqual(updates, conn.keyUpdatesSent());
+                flaky.fail_every = 0;
+            }
+            try w.interface.flush();
+            try testing.expectEqual(updates, conn.keyUpdatesSent());
+            var expected: [32]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "echo: record {d}", .{i}), (try r.interface.takeDelimiter('\n')).?);
+            // The peer wrote its echo without having to update its keys.
+            try testing.expectEqual(0, conn.keyUpdatesReceived());
+        }
+        try w.close();
+        try testing.expectEqual(null, try r.interface.takeDelimiter('\n'));
+        const outcome = try run.finish(io);
+        try outcome.handshake;
+        try outcome.echo;
+    }
+}
+
 test "writes, flushes, key updates and close may be retried after the transport fails" {
     const io = testing.io;
     var pki = try Pki.init();
