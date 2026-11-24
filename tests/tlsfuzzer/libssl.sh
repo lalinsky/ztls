@@ -9,6 +9,7 @@
 
 # libssl's default takes TLS 1.2's SHA-1 schemes too.
 sigalgs+=' ecdsa_sha1 rsa_pkcs1_sha1'
+server_groups+=,secp521r1
 
 # alert: bad_record_mac, not unexpected_message, for a change_cipher_spec
 # after Finished or a plaintext Finished: AWS-LC expects a record under

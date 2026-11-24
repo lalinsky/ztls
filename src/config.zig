@@ -2,6 +2,7 @@
 //! it trusts, and the options of `client` and `server`.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const crypto = @import("crypto.zig");
 const proto = @import("protocol.zig");
@@ -224,7 +225,10 @@ pub const default_cipher_suites_chacha_first = [_]proto.CipherSuite{
 pub const default_server_cipher_suites_chacha_first = default_cipher_suites_chacha_first[0..proto.CipherSuite.all.len].*;
 /// The groups a client supports, in preference order.
 pub const default_named_groups = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1 };
-pub const default_server_named_groups = default_named_groups;
+pub const default_server_named_groups = if (build_options.libssl)
+    default_named_groups ++ [_]proto.NamedGroup{.secp521r1}
+else
+    default_named_groups;
 /// The groups a client sends key shares for in its first ClientHello:
 /// the ones a server is likely to pick, so a HelloRetryRequest is rare.
 pub const default_key_shares = [_]proto.NamedGroup{ .x25519_ml_kem768, .x25519 };
@@ -393,7 +397,8 @@ pub const Server = struct {
     /// share for, and asks for another with a HelloRetryRequest only when
     /// it can use none of them. Under `-Dimpl=libssl`, AWS-LC takes its
     /// favourite of all the groups the client supports, asking for that
-    /// one's share when it was not sent.
+    /// one's share when it was not sent. The libssl server also includes
+    /// secp521r1 at the end of its default list.
     named_groups: []const proto.NamedGroup = &default_server_named_groups,
     /// Sent in a CertificateRequest, and the only schemes a client
     /// certificate's key may sign with. Signatures inside the chain are
