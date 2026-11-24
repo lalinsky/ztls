@@ -45,6 +45,7 @@ clients=$root/tests/tlsfuzzer
 pki=$root/src/testdata/pki
 # What the server takes in a client's CertificateVerify.
 sigalgs='ecdsa_secp256r1_sha256 ecdsa_secp384r1_sha384 ecdsa_secp521r1_sha512 ed25519 rsa_pss_rsae_sha256 rsa_pss_rsae_sha384 rsa_pss_rsae_sha512 rsa_pkcs1_sha256 rsa_pkcs1_sha384 rsa_pkcs1_sha512'
+server_groups=x25519mlkem768,x25519,secp256r1,secp384r1
 
 # Prints an -e for each probe named on stdin, one per line.
 excluding() {
@@ -140,13 +141,6 @@ PROBES
 )"
         # unsupported: x448
     "test-tls13-ecdhe-curves.py $(excluding <<'PROBES'
-sanity - secp521r1
-secp521r1 - key share from other curve
-secp521r1 - point at infinity
-secp521r1 - point outside curve
-secp521r1 - right 0-padded key_share
-secp521r1 - right-truncated key_share
-secp521r1 - x=0, y=0
 sanity - x448
 x448 - key share from other curve
 x448 - point at infinity
@@ -154,9 +148,8 @@ x448 - right 0-padded key_share
 x448 - right-truncated key_share
 PROBES
 )"
-        # unsupported: secp521r1, x448
+        # unsupported: x448
     "test-tls13-dhe-shared-secret-padding.py $(excluding <<'PROBES'
-TLS 1.3 with secp521r1
 TLS 1.3 with x448
 TLS 1.3 with ffdhe2048
 TLS 1.3 with ffdhe3072
@@ -164,7 +157,6 @@ PROBES
 )"
         # unsupported groups
     "test-tls13-serverhello-random.py $(excluding <<'PROBES'
-TLS 1.3 with secp521r1
 TLS 1.3 with x448
 TLS 1.3 with ffdhe2048
 TLS 1.3 with ffdhe3072
@@ -172,19 +164,18 @@ PROBES
 )"
         # unsupported groups
     "test-tls13-obsolete-curves.py --relaxed -a handshake_failure $(excluding <<'PROBES'
-secp521r1 in supported_groups and key_share
 x448 in supported_groups and key_share
 PROBES
 )$(inconsistent_share_probes | excluding)"
         # --relaxed: obsolete groups next to a supported one are ignored,
         # not refused, which RFC 9846 does not ask for. -a: with nothing
-        # else, no common group is handshake_failure. unsupported:
-        # secp521r1, x448. A share for a group we do not support is
+        # else, no common group is handshake_failure. x448 is unsupported.
+        # A share for a group we do not support is
         # ignored, as Go does, even if supported_groups does not list it
         # (§4.2.8 allows it).
     "test-tls13-mlkem.py --kems x25519mlkem768"     # the hybrid both have
     "test-tls13-no-unknown-groups.py
-        --groups x25519mlkem768,x25519,secp256r1,secp384r1"
+        --groups $server_groups"
         # --groups: ours, in our order, as the retry picks our favourite.
     "test-tls13-unrecognised-groups.py $(excluding <<'PROBES'
 known group ffdhe2048 and unknown groups from EC range, key_share of size 64

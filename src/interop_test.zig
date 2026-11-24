@@ -710,7 +710,7 @@ test "a legacy openssl s_client against our libssl server" {
     }
 }
 
-test "the libssl server: version ranges, suite lists, client certificates and SHA-1" {
+test "the libssl server: default groups, version ranges, suite lists, client certificates and SHA-1" {
     if (!libssl_build) return error.SkipZigTest;
     const io = testing.io;
     _ = try requireOpenSsl(io);
@@ -721,10 +721,14 @@ test "the libssl server: version ranges, suite lists, client certificates and SH
     defer rsa.deinit(testing.allocator);
     const base: config.Server = .{ .io = testing.io, .gpa = testing.allocator, .auth = &rsa };
 
+    var result = try sClientOnce(io, base, &.{ "-tls1_3", "-groups", "P-521" });
+    try result.outcome.handshake;
+    try testing.expect(result.echoed);
+
     // Held to TLS 1.2 at most, against a client that offers 1.3 too.
     var capped = base;
     capped.max_version = .tls_1_2;
-    var result = try sClientOnce(io, capped, &.{});
+    result = try sClientOnce(io, capped, &.{});
     try result.outcome.handshake;
     try testing.expectEqual(proto.Version.tls_1_2, result.outcome.version.?);
 

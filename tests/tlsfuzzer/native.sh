@@ -5,6 +5,21 @@
 #   lenient  ztls takes what the script wants refused, as RFC 9846
 #            allows
 
+# The native server has no secp521r1 key exchange.
+engine_args[test-tls13-ecdhe-curves.py]=$(excluding <<'PROBES'
+sanity - secp521r1
+secp521r1 - key share from other curve
+secp521r1 - point at infinity
+secp521r1 - point outside curve
+secp521r1 - right 0-padded key_share
+secp521r1 - right-truncated key_share
+secp521r1 - x=0, y=0
+PROBES
+)
+engine_args[test-tls13-dhe-shared-secret-padding.py]=$(excluding <<< 'TLS 1.3 with secp521r1')
+engine_args[test-tls13-serverhello-random.py]=$(excluding <<< 'TLS 1.3 with secp521r1')
+engine_args[test-tls13-obsolete-curves.py]=$(excluding <<< 'secp521r1 in supported_groups and key_share')
+
 # Only these probes: the rest expect a fall back to TLS 1.2, which the
 # server does not speak.
 engine_args[test-tls13-version-negotiation.py]=" sanity 'tls 1.8 only' 'SSL 3.0 in supported version'
