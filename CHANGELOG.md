@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-25
+
+- Fixed a panic in the native engine on a handshake message whose declared length is near 16 MiB. With `max_handshake_message_len` raised to 16 MiB or more, a peer could crash the process by sending a 4-byte Certificate header, even in ReleaseFast. The default limit of 64 KiB was not affected.
+- The libssl server now offers secp521r1 by default, after the other groups. The native engine's defaults are unchanged.
 - `output_buffer_len` is 49 bytes larger, 16,482 bytes, for both engines. A transport writer buffer smaller than that is refused when the connection is created, as before.
 - Fixed the in-place writer losing buffered data when a flush failed during a rebase (`writableSliceGreedyPreserve` and similar). The data stays buffered, so a write that was cancelled can still be followed by `close`, which sends it with close_notify.
 - Upgraded AWS-LC from 1.73.0 to 5.15.0, the current mainline release. AWS-LC 5.x is the continuation of the 1.x line under its new versioning scheme. It brings fixes to X.509 name constraints and libssl, and assembly for ML-DSA.
