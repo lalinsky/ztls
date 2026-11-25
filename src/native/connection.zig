@@ -193,8 +193,8 @@ pub const Connection = struct {
     };
 
     pub fn init(input: *Io.Reader, output: *Io.Writer, side: proto.Side) Connection {
-        assert(input.buffer.len >= input_buffer_len);
-        assert(output.buffer.len >= output_buffer_len);
+        if (input.buffer.len < input_buffer_len) @panic("ztls: the transport reader's buffer is shorter than input_buffer_len");
+        if (output.buffer.len < output_buffer_len) @panic("ztls: the transport writer's buffer is shorter than output_buffer_len");
         return .{ .input = input, .output = output, .side = side, .read = .{}, .write = .{}, .shared = .{} };
     }
 
